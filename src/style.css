@@ -1,0 +1,348 @@
+:root {
+  font-family:
+    "Segoe UI Variable", "Microsoft JhengHei UI", "Microsoft JhengHei", sans-serif;
+  color: #f3f4f6;
+  background: #111317;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+button {
+  color: inherit;
+  font: inherit;
+}
+
+button:focus-visible {
+  outline: 2px solid #8bc6ff;
+  outline-offset: 2px;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-rows: 52px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  background:
+    radial-gradient(circle at 50% 34%, rgb(45 49 57 / 55%), transparent 52%),
+    #17191e;
+  user-select: none;
+}
+
+.toolbar {
+  z-index: 10;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding: 7px 12px;
+  border-bottom: 1px solid #30333a;
+  background: rgb(24 26 31 / 96%);
+  box-shadow: 0 2px 14px rgb(0 0 0 / 24%);
+}
+
+.toolbar button,
+.empty-state button,
+.zoom-controls button {
+  border: 1px solid #444851;
+  border-radius: 7px;
+  background: #2b2e35;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.toolbar button:hover,
+.empty-state button:hover,
+.zoom-controls button:hover {
+  border-color: #626873;
+  background: #383c44;
+}
+
+.open-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 13px;
+  cursor: pointer;
+}
+
+.open-button svg {
+  width: 18px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.file-summary {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: center;
+  gap: 10px;
+}
+
+.file-summary strong {
+  overflow: hidden;
+  color: #f7f7f8;
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-summary span {
+  flex: none;
+  color: #a9adb6;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.animation-badge {
+  padding: 3px 7px;
+  border: 1px solid #486077;
+  border-radius: 999px;
+  color: #b7dcff;
+  background: #233342;
+  font-size: 11px;
+}
+
+.viewer-area,
+.image-viewport {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.image-viewport {
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+.image-viewport.is-pannable {
+  cursor: grab;
+}
+
+.image-viewport.is-dragging {
+  cursor: grabbing;
+}
+
+.viewer-image {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: block;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+  transform-origin: center center;
+  image-orientation: from-image;
+  image-rendering: auto;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.state-panel {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  width: min(520px, calc(100% - 120px));
+  transform: translate(-50%, -50%);
+  align-items: center;
+  flex-direction: column;
+  color: #bbc0c9;
+  text-align: center;
+}
+
+.switching-indicator {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  display: flex;
+  min-height: 28px;
+  padding: 5px 10px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #435262;
+  border-radius: 999px;
+  color: #c8d1da;
+  background: #151b21e6;
+  box-shadow: 0 3px 12px #0006;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.mini-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #617080;
+  border-top-color: #d4e6f7;
+  border-radius: 50%;
+  animation: spin 700ms linear infinite;
+}
+
+.state-panel h1,
+.state-panel h2 {
+  margin: 15px 0 4px;
+  color: #f2f3f5;
+  font-size: 21px;
+  font-weight: 600;
+}
+
+.state-panel p {
+  max-width: 100%;
+  margin: 6px 0;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.empty-state > svg {
+  width: 72px;
+  fill: none;
+  stroke: #737985;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.3;
+}
+
+.empty-state button {
+  margin-top: 18px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+.error-state > svg {
+  width: 42px;
+  fill: #4b372a;
+  stroke: #f2b27d;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.error-state small {
+  margin-top: 8px;
+  color: #858b95;
+}
+
+.spinner {
+  width: 29px;
+  height: 29px;
+  border: 3px solid #424751;
+  border-top-color: #a9d3ff;
+  border-radius: 50%;
+  animation: spin 700ms linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.nav-button {
+  position: absolute;
+  z-index: 5;
+  top: 50%;
+  width: 45px;
+  height: 72px;
+  transform: translateY(-50%);
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 8px;
+  color: #f2f4f7;
+  background: rgb(18 20 24 / 72%);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 22%);
+  font: 300 42px/1 "Segoe UI", sans-serif;
+  cursor: pointer;
+  opacity: 0.72;
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.nav-button:hover:not(:disabled) {
+  background: rgb(46 50 58 / 88%);
+  opacity: 1;
+}
+
+.nav-button:disabled {
+  cursor: default;
+  opacity: 0.12;
+}
+
+.nav-button.previous { left: 14px; }
+.nav-button.next { right: 14px; }
+
+.zoom-controls {
+  position: absolute;
+  z-index: 6;
+  bottom: 14px;
+  left: 50%;
+  display: flex;
+  height: 36px;
+  padding: 3px;
+  transform: translateX(-50%);
+  align-items: center;
+  gap: 3px;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 9px;
+  background: rgb(18 20 24 / 82%);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 25%);
+}
+
+.zoom-controls button {
+  height: 28px;
+  min-width: 30px;
+  padding: 0 8px;
+  border-color: transparent;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.zoom-controls button:first-child,
+.zoom-controls button:nth-child(3) {
+  font-size: 19px;
+}
+
+.zoom-controls output {
+  width: 54px;
+  color: #d5d8dd;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+@media (max-width: 700px) {
+  .app-shell { grid-template-rows: 48px minmax(0, 1fr); }
+  .toolbar { gap: 8px; padding: 6px 8px; }
+  .open-button { padding: 0 9px; }
+  .open-button svg { display: none; }
+  .animation-badge { display: none; }
+  .state-panel { width: calc(100% - 90px); }
+  .zoom-controls button:nth-last-child(-n + 2) { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

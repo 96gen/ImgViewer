@@ -1,0 +1,79 @@
+name: Portable Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-portable:
+    name: Build and verify Windows x64 ZIP
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: native-${{ hashFiles('vcpkg.json', 'vcpkg-overlays/ports/libheif/**') }}
+
+      - name: Cache vcpkg downloads and binary archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            .tools/vcpkg-downloads
+            ~/AppData/Local/vcpkg/archives
+          key: vcpkg-2026.05.25-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-overlays/ports/libheif/**') }}
+
+      - name: Validate release tag version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $version = (Get-Content ./src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $expected = "v$version"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Release tag $env:GITHUB_REF_NAME does not match Tauri version $expected"
+          }
+
+      - name: Build, test, collect licenses, and validate DLL closure
+        shell: pwsh
+        # GitHub-hosted Windows runners have no interactive desktop; the same
+        # script runs native GUI smoke by default on the release workstation.
+        run: ./scripts/build-portable.ps1 -SkipNativeSmoke
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImgViewer-windows-x64
+          path: release/ImgViewer-*-windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0

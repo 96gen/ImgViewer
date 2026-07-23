@@ -1,0 +1,28 @@
+# Frontend
+node_modules/
+.pnpm-store/
+dist/
+.vite/
+coverage/
+
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Local native toolchain and vcpkg outputs
+.tools/
+vcpkg_installed/
+
+# Portable release output
+release/
+
+# Native smoke and local diagnostics
+screenshots/
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

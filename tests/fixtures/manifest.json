@@ -1,0 +1,25 @@
+{
+  "naturalOrder": ["1.jpg", "2.jpg", "10.jpg"],
+  "animated": {
+    "animated.gif": { "frames": 3, "durationsMs": [80, 120, 160] },
+    "animated.webp": { "frames": 3, "durationsMs": [80, 120, 160] }
+  },
+  "tiff": {
+    "file": "two-page.tiff",
+    "pages": 2,
+    "expectedFirstSize": [5, 3]
+  },
+  "heif": {
+    "file": "primary-second.heic",
+    "images": 2,
+    "primaryIndex": 1,
+    "expectedPrimarySize": [3, 5]
+  },
+  "limits": {
+    "oversize-width.png": { "declaredSize": [32769, 1], "expectedError": "dimensions_exceeded" }
+  },
+  "invalid": {
+    "corrupt.jpg": "corrupt_image",
+    "disguised.jpg": "format_mismatch"
+  }
+}
