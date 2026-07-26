@@ -1,7 +1,11 @@
 {
   "name": "imgviewer",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/96gen/ImgViewer.git"
+  },
   "type": "module",
   "packageManager": "pnpm@11.9.0",
   "engines": {
@@ -11,7 +15,10 @@
     "dev": "vite",
     "build": "tsc -p tsconfig.app.json --noEmit && vite build",
     "preview": "vite preview",
+    "tauri": "tauri",
     "test": "vitest run",
+    "test:security": "vitest run tests/securityContract.spec.ts tests/snapshotProtocol.spec.ts",
+    "audit:production": "pnpm audit --prod --audit-level high",
     "test:watch": "vitest"
   },
   "dependencies": {

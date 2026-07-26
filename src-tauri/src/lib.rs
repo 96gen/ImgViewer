@@ -1,13 +1,22 @@
+#![deny(unsafe_code)]
+
 mod catalog;
 mod decode;
+mod error;
 mod model;
+mod navigation;
+mod policy;
+mod protocol;
 mod viewer;
 mod window;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub use model::{NavigationDirection, RenderDescriptor, ViewerError, ViewerSnapshot, ViewerStatus};
+pub use error::ViewerError;
+pub use protocol::{
+    NavigationDirection, PROTOCOL_VERSION, RenderDescriptor, ViewerSnapshot, ViewerStatus,
+};
 use tauri::{Emitter, Manager};
 use tauri_plugin_window_state::StateFlags;
 pub use viewer::ViewerController;
@@ -42,6 +51,7 @@ fn read_render(render_id: u64, state: tauri::State<'_, ViewerController>) -> tau
 
 pub fn run() {
     let controller = ViewerController::new();
+    let shutdown_controller = controller.clone();
     let builder = tauri::Builder::default()
         // The single-instance plugin must be registered first so another
         // process cannot race plugin initialization.
@@ -56,6 +66,14 @@ pub fn run() {
                 focus_main_window(app);
             },
         ))
+        // CSP governs subresources, while this hook is the cancellation
+        // boundary for top-level WebView navigation. Keep it before any
+        // plugin that may expose an IPC command.
+        .plugin(navigation::navigation_policy_plugin())
+        // tauri-plugin-window-state parses its persisted JSON during plugin
+        // setup even when initial restore is skipped. Bound and validate that
+        // untrusted file before the upstream setup hook runs.
+        .plugin(window::state_preflight_plugin())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(StateFlags::POSITION | StateFlags::SIZE | StateFlags::MAXIMIZED)
@@ -69,7 +87,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_dialog::init());
 
-    builder
+    let result = builder
         .manage(controller)
         .invoke_handler(tauri::generate_handler![
             open_path,
@@ -94,8 +112,11 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("ImgViewer encountered a fatal Tauri runtime error");
+        .run(tauri::generate_context!());
+    // The worker uses a soft in-process deadline, so explicitly join it after
+    // Tauri's event loop ends instead of relying on process teardown.
+    shutdown_controller.shutdown();
+    result.expect("ImgViewer encountered a fatal Tauri runtime error");
 }
 
 fn focus_main_window(app: &tauri::AppHandle) {

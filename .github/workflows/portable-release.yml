@@ -1,79 +1,523 @@
 name: Portable Windows release
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build a candidate, or promote an already-built draft after native UI verification
+        required: true
+        default: build-candidate
+        type: choice
+        options:
+          - build-candidate
+          - promote-draft
+      release_tag:
+        description: Tag to promote, for example v0.2.0 (promote-draft only)
+        required: false
+        type: string
+      verified_sha256:
+        description: SHA-256 observed for the exact ZIP that passed native UI smoke (promote-draft only)
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: portable-${{ github.ref }}
+  group: portable-${{ github.ref }}-${{ inputs.operation || 'tag-build' }}
   cancel-in-progress: false
 
 jobs:
   build-portable:
-    name: Build and verify Windows x64 ZIP
+    if: github.event_name == 'push' || inputs.operation == 'build-candidate'
+    name: Build and verify Windows x64 ZIP once
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+      source_commit: ${{ steps.package.outputs.source_commit }}
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
+      - name: Check out source and tags
+        # actions/checkout v4.3.0; tag SHA verified from the official repository.
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        # pnpm/action-setup v4.1.0.
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
         with:
           version: 11.9.0
           run_install: false
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        # actions/setup-node v4.4.0.
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: pnpm
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        # Reviewed full SHA from the action's durable master history.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache v2.8.1.
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1
         with:
           workspaces: src-tauri -> target
           key: native-${{ hashFiles('vcpkg.json', 'vcpkg-overlays/ports/libheif/**') }}
 
       - name: Cache vcpkg downloads and binary archives
-        uses: actions/cache@v4
+        # actions/cache v4.3.0.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             .tools/vcpkg-downloads
             ~/AppData/Local/vcpkg/archives
           key: vcpkg-2026.05.25-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-overlays/ports/libheif/**') }}
 
-      - name: Validate release tag version
-        if: github.ref_type == 'tag'
+      - name: Build package once
+        id: package
+        shell: pwsh
+        # Hosted Windows runners have no interactive desktop. This produces the
+        # one and only ZIP; promotion later proves the UI-tested digest is this ZIP.
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            ./scripts/build-portable.ps1 -SkipNativeSmoke -ReleaseMode -ExpectedTag $env:GITHUB_REF_NAME
+          } else {
+            ./scripts/build-portable.ps1 -SkipNativeSmoke
+          }
+
+      - name: Generate and validate CycloneDX SBOM
+        id: sbom
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content ./src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $artifactName = "ImgViewer-$version-windows-x64"
+          $baseSbom = "./release/$artifactName.base.cdx.json"
+          $finalSbom = "./release/$artifactName.cdx.json"
+          $toolDirectory = Join-Path $env:RUNNER_TEMP "cdxgen-v12.8.1"
+          New-Item -ItemType Directory -Path $toolDirectory -Force | Out-Null
+          gh release download v12.8.1 `
+            --repo CycloneDX/cdxgen `
+            --dir $toolDirectory `
+            --pattern "cdxgen-windows-amd64-slim.exe" `
+            --pattern "cdx-validate-windows-amd64.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download the pinned official CycloneDX tools."
+          }
+          $toolHashes = [ordered]@{
+            "cdxgen-windows-amd64-slim.exe" = "710d53f72089ec7dfdaac4fdb4a09e9b241e992d472fa2d17c0a3b9165cf6732"
+            "cdx-validate-windows-amd64.exe" = "63813d386682cac4dad07d725a192e3f103d44098612ee90ca624ee58f7e595f"
+          }
+          foreach ($entry in $toolHashes.GetEnumerator()) {
+            $toolPath = Join-Path $toolDirectory $entry.Key
+            $actual = (Get-FileHash -LiteralPath $toolPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $entry.Value) {
+              throw "CycloneDX tool digest mismatch: $($entry.Key)"
+            }
+          }
+          $generator = Join-Path $toolDirectory "cdxgen-windows-amd64-slim.exe"
+          $validator = Join-Path $toolDirectory "cdx-validate-windows-amd64.exe"
+          & $generator `
+            -t js -t rust `
+            --no-install-deps `
+            --fail-on-error `
+            --spec-version 1.6 `
+            --json-pretty `
+            -o $baseSbom .
+          if ($LASTEXITCODE -ne 0) {
+            throw "CycloneDX cdxgen failed."
+          }
+          ./scripts/add-native-sbom-components.ps1 `
+            -BaseSbomPath $baseSbom `
+            -ArtifactPath "./release/$artifactName.zip" `
+            -OutputPath $finalSbom
+          & $validator -i $finalSbom --strict --no-include-manual --fail-severity critical
+          if ($LASTEXITCODE -ne 0) {
+            throw "CycloneDX SBOM validation failed."
+          }
+          Remove-Item -LiteralPath $baseSbom -Force
+          $unexpectedChanges = git status --porcelain=v1 --untracked-files=all
+          if ($unexpectedChanges) {
+            throw "SBOM generation modified the source tree:`n$($unexpectedChanges -join "`n")"
+          }
+          "sbom_path=$finalSbom" | Add-Content $env:GITHUB_OUTPUT
+
+      - name: Re-verify archive, checksum, metadata, negative cases, and DLL closure
         shell: pwsh
         run: |
           $version = (Get-Content ./src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $expected = "v$version"
-          if ($env:GITHUB_REF_NAME -ne $expected) {
-            throw "Release tag $env:GITHUB_REF_NAME does not match Tauri version $expected"
+          $artifactName = "ImgViewer-$version-windows-x64"
+          $arguments = @{
+            ArtifactPath = "./release/$artifactName.zip"
+            ChecksumPath = "./release/$artifactName.zip.sha256"
+            MetadataPath = "./release/$artifactName.build.json"
+            ExpectedVersion = $version
+            RunNegativeTests = $true
           }
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $arguments.ExpectedCommit = $env:GITHUB_SHA.ToLowerInvariant()
+            $arguments.ExpectedTag = $env:GITHUB_REF_NAME
+            $arguments.RequireCleanSource = $true
+          }
+          ./scripts/verify-portable-release.ps1 @arguments
 
-      - name: Build, test, collect licenses, and validate DLL closure
-        shell: pwsh
-        # GitHub-hosted Windows runners have no interactive desktop; the same
-        # script runs native GUI smoke by default on the release workstation.
-        run: ./scripts/build-portable.ps1 -SkipNativeSmoke
-
-      - name: Upload portable ZIP
-        uses: actions/upload-artifact@v4
+      - name: Upload immutable release candidate
+        # actions/upload-artifact v4.6.2.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ImgViewer-windows-x64
-          path: release/ImgViewer-*-windows-x64.zip
+          path: |
+            release/${{ steps.package.outputs.artifact_name }}.zip
+            release/${{ steps.package.outputs.artifact_name }}.zip.sha256
+            release/${{ steps.package.outputs.artifact_name }}.build.json
+            release/${{ steps.package.outputs.artifact_name }}.cdx.json
           if-no-files-found: error
           compression-level: 0
+          retention-days: 30
+
+  attest-tag-artifacts:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build-portable
+    name: Attest the exact tag artifacts
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Download the exact build artifact
+        # actions/download-artifact v4.3.0.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ImgViewer-windows-x64
+          path: release
+
+      - name: Attest tag artifacts
+        # actions/attest-build-provenance v3.0.0.
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: |
+            release/${{ needs.build-portable.outputs.artifact_name }}.zip
+            release/${{ needs.build-portable.outputs.artifact_name }}.zip.sha256
+            release/${{ needs.build-portable.outputs.artifact_name }}.build.json
+            release/${{ needs.build-portable.outputs.artifact_name }}.cdx.json
+
+  create-draft-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs:
+      - build-portable
+      - attest-tag-artifacts
+    name: Create persistent draft GitHub Release
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the exact build artifact
+        # actions/download-artifact v4.3.0.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ImgViewer-windows-x64
+          path: release
+
+      - name: Create immutable draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA256: ${{ needs.build-portable.outputs.sha256 }}
+        run: |
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:RELEASE_TAG already exists. Published or draft releases are never replaced in place."
+          }
+          $notes = @"
+          ## ImgViewer $env:RELEASE_TAG
+
+          This release is a draft until the exact ZIP below passes native Windows UI Automation.
+
+          Source commit: $env:GITHUB_SHA
+          ZIP SHA-256: $env:RELEASE_SHA256
+
+          The ZIP was built once. Promotion does not rebuild or replace any asset.
+          See docs/release/README.md for the maintainer gate.
+          "@
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          [System.IO.File]::WriteAllText($notesPath, $notes, (New-Object System.Text.UTF8Encoding($false)))
+          $assets = @(Get-ChildItem -LiteralPath ./release -File | Sort-Object Name)
+          if ($assets.Count -ne 4) {
+            throw "Expected ZIP, checksum, build metadata, and CycloneDX SBOM; found $($assets.Count) files."
+          }
+          $zip = @($assets | Where-Object { $_.Name -like "*.zip" })
+          $manifest = @($assets | Where-Object { $_.Name -like "*.zip.sha256" })
+          if ($zip.Count -ne 1 -or $manifest.Count -ne 1) {
+            throw "Draft release inputs must contain exactly one ZIP and one checksum manifest."
+          }
+          $downloadedHash = (Get-FileHash -LiteralPath $zip[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifestLine = (Get-Content -LiteralPath $manifest[0].FullName -Raw).Trim()
+          if ($downloadedHash -cne $env:RELEASE_SHA256.ToLowerInvariant() -or
+              $manifestLine -cne "$downloadedHash  $($zip[0].Name)") {
+            throw "Downloaded workflow artifact does not match its build digest and checksum manifest."
+          }
+          $arguments = @(
+            "release", "create", $env:RELEASE_TAG,
+            "--repo", $env:GITHUB_REPOSITORY,
+            "--verify-tag",
+            "--draft",
+            "--title", "ImgViewer $env:RELEASE_TAG",
+            "--notes-file", $notesPath
+          )
+          $arguments += @($assets | ForEach-Object { $_.FullName })
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub draft release creation failed."
+          }
+
+  verify-draft:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.operation == 'promote-draft' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    name: Verify UI-tested draft with a read-only token
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+      zip_sha256: ${{ steps.verify.outputs.zip_sha256 }}
+      checksum_sha256: ${{ steps.verify.outputs.checksum_sha256 }}
+      metadata_sha256: ${{ steps.verify.outputs.metadata_sha256 }}
+      sbom_sha256: ${{ steps.verify.outputs.sbom_sha256 }}
+
+    steps:
+      - name: Validate promotion inputs
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERIFIED_SHA256: ${{ inputs.verified_sha256 }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "release_tag must be an exact semver tag such as v0.2.0."
+          }
+          if ($env:VERIFIED_SHA256 -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw "verified_sha256 must be the 64-character digest of the ZIP that passed native UI smoke."
+          }
+
+      - name: Check out the trusted default-branch verifier
+        # actions/checkout v4.3.0.
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the unchanged draft release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $artifactName = "ImgViewer-$version-windows-x64"
+          $expectedAssets = @(
+            "$artifactName.zip",
+            "$artifactName.zip.sha256",
+            "$artifactName.build.json",
+            "$artifactName.cdx.json"
+          ) | Sort-Object
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft,tagName,assets | ConvertFrom-Json
+          if (-not [bool]$release.isDraft -or [string]$release.tagName -cne $env:RELEASE_TAG) {
+            throw "The requested release is missing or is no longer a draft."
+          }
+          $actualAssets = @($release.assets | ForEach-Object { [string]$_.name }) | Sort-Object
+          $assetDifference = @(Compare-Object -ReferenceObject $expectedAssets -DifferenceObject $actualAssets)
+          if ($assetDifference.Count -gt 0) {
+            throw "Draft Release contains a missing or unexpected asset:`n$($assetDifference | Out-String)"
+          }
+          New-Item -ItemType Directory -Path ./release-assets -Force | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --dir ./release-assets `
+            --pattern "$artifactName.zip" `
+            --pattern "$artifactName.zip.sha256" `
+            --pattern "$artifactName.build.json" `
+            --pattern "$artifactName.cdx.json"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Draft release asset download failed."
+          }
+
+      - name: Verify exact UI-tested assets without write permission
+        id: verify
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERIFIED_SHA256: ${{ inputs.verified_sha256 }}
+        run: |
+          $zip = @(Get-ChildItem -LiteralPath ./release-assets -File -Filter "ImgViewer-*-windows-x64.zip")
+          if ($zip.Count -ne 1) {
+            throw "Expected exactly one portable ZIP in the draft release."
+          }
+          $version = $env:RELEASE_TAG.Substring(1)
+          $artifactName = "ImgViewer-$version-windows-x64"
+          $expectedCommit = (git rev-parse "$env:RELEASE_TAG^{commit}").Trim().ToLowerInvariant()
+          ./scripts/verify-portable-release.ps1 `
+            -ArtifactPath $zip[0].FullName `
+            -ChecksumPath "./release-assets/$artifactName.zip.sha256" `
+            -MetadataPath "./release-assets/$artifactName.build.json" `
+            -ExpectedVersion $version `
+            -ExpectedCommit $expectedCommit `
+            -ExpectedTag $env:RELEASE_TAG `
+            -ExpectedSha256 $env:VERIFIED_SHA256 `
+            -RequireCleanSource `
+            -RunNegativeTests
+          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/portable-release.yml"
+          $sourceRef = "refs/tags/$env:RELEASE_TAG"
+          $assetFiles = @(
+            $zip[0].FullName,
+            (Resolve-Path "./release-assets/$artifactName.zip.sha256").Path,
+            (Resolve-Path "./release-assets/$artifactName.build.json").Path,
+            (Resolve-Path "./release-assets/$artifactName.cdx.json").Path
+          )
+          foreach ($assetFile in $assetFiles) {
+            gh attestation verify $assetFile `
+              --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow $signerWorkflow `
+              --source-digest $expectedCommit `
+              --source-ref $sourceRef `
+              --deny-self-hosted-runners
+            if ($LASTEXITCODE -ne 0) {
+              throw "GitHub artifact attestation verification failed for $([IO.Path]::GetFileName($assetFile))."
+            }
+          }
+          $zeroDigest = "0" * $expectedCommit.Length
+          gh attestation verify $zip[0].FullName `
+            --repo $env:GITHUB_REPOSITORY `
+            --signer-workflow $signerWorkflow `
+            --source-digest $zeroDigest `
+            --source-ref $sourceRef `
+            --deny-self-hosted-runners *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Attestation verification unexpectedly accepted an incorrect source digest."
+          }
+          Write-Host "PASS expected-failure=attestation-source-digest-mismatch"
+          $sbom = Get-Content -LiteralPath "./release-assets/$artifactName.cdx.json" -Raw | ConvertFrom-Json
+          $nativeNames = @($sbom.components | ForEach-Object { [string]$_.name })
+          foreach ($required in @("libheif", "libde265")) {
+            if ($nativeNames -cnotcontains $required) {
+              throw "CycloneDX SBOM is missing $required."
+            }
+          }
+          $assetHashes = @($assetFiles | ForEach-Object {
+            (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+          })
+          "release_tag=$env:RELEASE_TAG" | Add-Content $env:GITHUB_OUTPUT
+          "zip_sha256=$($assetHashes[0])" | Add-Content $env:GITHUB_OUTPUT
+          "checksum_sha256=$($assetHashes[1])" | Add-Content $env:GITHUB_OUTPUT
+          "metadata_sha256=$($assetHashes[2])" | Add-Content $env:GITHUB_OUTPUT
+          "sbom_sha256=$($assetHashes[3])" | Add-Content $env:GITHUB_OUTPUT
+
+  publish-draft:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.operation == 'promote-draft' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: verify-draft
+    name: Publish the already-verified draft without source checkout
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Recheck unchanged draft assets and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify-draft.outputs.release_tag }}
+          ZIP_SHA256: ${{ needs.verify-draft.outputs.zip_sha256 }}
+          CHECKSUM_SHA256: ${{ needs.verify-draft.outputs.checksum_sha256 }}
+          METADATA_SHA256: ${{ needs.verify-draft.outputs.metadata_sha256 }}
+          SBOM_SHA256: ${{ needs.verify-draft.outputs.sbom_sha256 }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Read-only verification did not provide a valid release tag."
+          }
+          $version = $env:RELEASE_TAG.Substring(1)
+          $artifactName = "ImgViewer-$version-windows-x64"
+          $expectedAssetNames = @(
+            "$artifactName.zip",
+            "$artifactName.zip.sha256",
+            "$artifactName.build.json",
+            "$artifactName.cdx.json"
+          ) | Sort-Object
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft,tagName,assets | ConvertFrom-Json
+          if (-not [bool]$release.isDraft -or [string]$release.tagName -cne $env:RELEASE_TAG) {
+            throw "The verified release is missing or is no longer a draft."
+          }
+          $actualAssetNames = @($release.assets | ForEach-Object { [string]$_.name }) | Sort-Object
+          $assetDifference = @(Compare-Object -ReferenceObject $expectedAssetNames -DifferenceObject $actualAssetNames)
+          if ($assetDifference.Count -gt 0) {
+            throw "Draft asset set changed after read-only verification:`n$($assetDifference | Out-String)"
+          }
+          $assetDirectory = Join-Path $env:RUNNER_TEMP "publish-assets"
+          New-Item -ItemType Directory -Path $assetDirectory -Force | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --dir $assetDirectory `
+            --pattern "$artifactName.zip" `
+            --pattern "$artifactName.zip.sha256" `
+            --pattern "$artifactName.build.json" `
+            --pattern "$artifactName.cdx.json"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to re-download verified draft assets."
+          }
+          $expected = [ordered]@{
+            "$artifactName.zip" = $env:ZIP_SHA256
+            "$artifactName.zip.sha256" = $env:CHECKSUM_SHA256
+            "$artifactName.build.json" = $env:METADATA_SHA256
+            "$artifactName.cdx.json" = $env:SBOM_SHA256
+          }
+          $downloaded = @(Get-ChildItem -LiteralPath $assetDirectory -File)
+          if ($downloaded.Count -ne $expected.Count) {
+            throw "Draft asset set changed after read-only verification."
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            if ($entry.Value -notmatch '^[0-9a-f]{64}$') {
+              throw "Read-only verification did not provide a valid digest for $($entry.Key)."
+            }
+            $path = Join-Path $assetDirectory $entry.Key
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Verified draft asset disappeared before publication: $($entry.Key)"
+            }
+            $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -cne $entry.Value) {
+              throw "Draft asset changed after verification: $($entry.Key)"
+            }
+          }
+          gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release promotion failed."
+          }

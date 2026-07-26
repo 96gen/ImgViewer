@@ -1,0 +1,65 @@
+name: 錯誤回報
+description: 回報可重現的 ImgViewer 功能問題
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        安全漏洞請勿填此表，請依 SECURITY.md 私下回報。
+        請勿上傳私人照片、完整本機路徑或未去識別化的 crash dump。
+  - type: input
+    id: version
+    attributes:
+      label: ImgViewer 版本
+      placeholder: 例如 0.1.2
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Windows 與 WebView2 版本
+      placeholder: 例如 Windows 11 24H2；WebView2 版本
+    validations:
+      required: true
+  - type: dropdown
+    id: format
+    attributes:
+      label: 圖片格式
+      options:
+        - GIF
+        - JPG/JPEG
+        - PNG
+        - TIFF
+        - WebP
+        - HEIC/HEIF
+        - 與格式無關
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 重現步驟
+      description: 請使用合成或可公開再散布的去識別化 fixture。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 預期結果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 實際結果
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隱私確認
+      options:
+        - label: 我未附上私人照片、完整本機路徑或安全漏洞細節。
+          required: true

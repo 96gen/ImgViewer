@@ -9,6 +9,25 @@ permissions:
   contents: read
 
 jobs:
+  dependency-policy:
+    name: Rust dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check advisories, duplicate dependencies, licenses, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: ./src-tauri/Cargo.toml
+          command: check
+          arguments: --all-features
+          command-arguments: advisories bans licenses sources
+
   windows-tests:
     name: Windows frontend and Rust tests
     runs-on: windows-2025
@@ -16,27 +35,30 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: 11.9.0
           run_install: false
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: pnpm
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, toolchain pinned below
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: src-tauri -> target
 
@@ -53,7 +75,7 @@ jobs:
         run: cargo fmt --manifest-path ./src-tauri/Cargo.toml --all -- --check
 
       - name: Rust lint without native HEIC
-        run: cargo clippy --manifest-path ./src-tauri/Cargo.toml --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --manifest-path ./src-tauri/Cargo.toml --all-targets --no-default-features -- -D warnings
 
       - name: Rust tests without native HEIC
-        run: cargo test --manifest-path ./src-tauri/Cargo.toml --no-default-features
+        run: cargo test --locked --manifest-path ./src-tauri/Cargo.toml --no-default-features

@@ -7,6 +7,8 @@ import type { ViewerBridge } from "../src/services/viewerBridge";
 import type { ViewerSnapshot } from "../src/types/viewer";
 
 const emptySnapshot = (generation = 0): ViewerSnapshot => ({
+  protocolVersion: 1,
+  revision: generation * 2,
   generation,
   status: "empty",
   index: null,
@@ -17,6 +19,8 @@ const emptySnapshot = (generation = 0): ViewerSnapshot => ({
 });
 
 const readySnapshot = (generation: number, renderId: number): ViewerSnapshot => ({
+  protocolVersion: 1,
+  revision: generation * 2 + 1,
   generation,
   status: "ready",
   index: generation,
@@ -83,6 +87,8 @@ describe("useViewer", () => {
 
     await session.applySnapshot(readySnapshot(7, 70));
     await session.applySnapshot({
+      protocolVersion: 1,
+      revision: 14,
       generation: 7,
       status: "loading",
       index: 7,
@@ -107,6 +113,8 @@ describe("useViewer", () => {
 
     await session.applySnapshot(readySnapshot(1, 11));
     await session.applySnapshot({
+      protocolVersion: 1,
+      revision: 4,
       generation: 2,
       status: "loading",
       index: 2,
@@ -151,6 +159,7 @@ describe("useViewer", () => {
     expect(session.snapshot.value?.generation).toBe(2);
     expect(session.displayedImage.value?.generation).toBe(1);
     expect(session.imageUrl.value).toBe("blob:1");
+    expect(session.renderPending.value).toBe(true);
     expect(revoke).not.toHaveBeenCalledWith("blob:1");
     expect(revoke).not.toHaveBeenCalledWith("blob:2");
 
@@ -159,6 +168,7 @@ describe("useViewer", () => {
 
     expect(session.displayedImage.value?.generation).toBe(2);
     expect(session.imageUrl.value).toBe("blob:2");
+    expect(session.renderPending.value).toBe(false);
     expect(revoke).toHaveBeenCalledTimes(1);
     expect(revoke).toHaveBeenCalledWith("blob:1");
     expect(releases.get("blob:2")).toHaveBeenCalledOnce();
@@ -200,7 +210,7 @@ describe("useViewer", () => {
     await session.applySnapshot({
       ...withoutRender,
       status: "error",
-      error: { code: "broken", message: "檔案已損壞" },
+      error: { code: "broken", message: "檔案已損壞", parameters: {} },
     });
     oldBytes.resolve(new Uint8Array([1]).buffer);
     await oldLoad;
@@ -209,6 +219,52 @@ describe("useViewer", () => {
     expect(session.imageUrl.value).toBeNull();
     expect(createUrl).not.toHaveBeenCalled();
     wrapper.unmount();
+  });
+
+  it("rechecks generation and revision after URL creation before installing a stale preload", async () => {
+    const readRender = vi.fn(async (renderId: number) =>
+      new Uint8Array([renderId]).buffer,
+    );
+    const staleReady = deferred<void>();
+    const staleRelease = vi.fn();
+    const latestRelease = vi.fn();
+    const preloader = vi.fn<ImagePreloader>((url) =>
+      url === "blob:stale"
+        ? { ready: staleReady.promise, release: staleRelease }
+        : { ready: Promise.resolve(), release: latestRelease },
+    );
+    const revoke = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => undefined);
+    let switchToLatest: Promise<void> | null = null;
+    let session!: ReturnType<typeof useViewer>;
+    vi.spyOn(URL, "createObjectURL")
+      .mockImplementationOnce(() => {
+        switchToLatest = session.applySnapshot(readySnapshot(2, 2));
+        return "blob:stale";
+      })
+      .mockReturnValueOnce("blob:latest");
+    const mounted = mountSession(fakeBridge({ readRender }), preloader);
+    session = mounted.session;
+
+    await session.applySnapshot(readySnapshot(1, 1));
+    if (!switchToLatest) throw new Error("expected a generation switch");
+    await switchToLatest;
+
+    expect(readRender.mock.calls.map(([renderId]) => renderId)).toEqual([1, 2]);
+    expect(preloader).toHaveBeenCalledTimes(1);
+    expect(preloader).toHaveBeenCalledWith("blob:latest");
+    expect(staleRelease).not.toHaveBeenCalled();
+    expect(session.displayedImage.value?.generation).toBe(2);
+    expect(session.imageUrl.value).toBe("blob:latest");
+    expect(revoke.mock.calls.filter(([url]) => url === "blob:stale")).toHaveLength(
+      1,
+    );
+
+    mounted.wrapper.unmount();
+    expect(revoke.mock.calls.filter(([url]) => url === "blob:latest")).toHaveLength(
+      1,
+    );
   });
 
   it("never displays a stale preload and revokes its candidate URL", async () => {
@@ -293,10 +349,81 @@ describe("useViewer", () => {
     await nextTick();
 
     expect(session.imageUrl.value).toBeNull();
+    expect(session.renderPending.value).toBe(false);
     expect(revoke.mock.calls.map(([url]) => url).sort()).toEqual([
       "blob:1",
       "blob:2",
     ]);
+    expect(releases.get("blob:1")).toHaveBeenCalledOnce();
+    expect(releases.get("blob:2")).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the committed frame when the next binary read fails", async () => {
+    let serial = 0;
+    vi.spyOn(URL, "createObjectURL").mockImplementation(
+      () => `blob:${++serial}`,
+    );
+    const revoke = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => undefined);
+    const readRender = vi.fn((renderId: number) =>
+      renderId === 12
+        ? Promise.reject(new Error("render token 已失效"))
+        : Promise.resolve(new Uint8Array([renderId]).buffer),
+    );
+    const { wrapper, session } = mountSession(fakeBridge({ readRender }));
+
+    await session.applySnapshot(readySnapshot(1, 11));
+    await session.applySnapshot(readySnapshot(2, 12));
+
+    expect(session.snapshot.value?.generation).toBe(2);
+    expect(session.displayedImage.value?.generation).toBe(1);
+    expect(session.imageUrl.value).toBe("blob:1");
+    expect(session.clientError.value).toContain("render token 已失效");
+    expect(session.renderPending.value).toBe(false);
+    expect(revoke).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    expect(revoke.mock.calls.filter(([url]) => url === "blob:1")).toHaveLength(1);
+  });
+
+  it("keeps the committed frame and revokes only the failed preload candidate", async () => {
+    let serial = 0;
+    vi.spyOn(URL, "createObjectURL").mockImplementation(
+      () => `blob:${++serial}`,
+    );
+    const revoke = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => undefined);
+    const releases = new Map<string, ReturnType<typeof vi.fn>>();
+    const preloader: ImagePreloader = (url) => {
+      const release = vi.fn();
+      releases.set(url, release);
+      return {
+        ready:
+          url === "blob:2"
+            ? Promise.reject(new Error("WebView2 預解碼失敗"))
+            : Promise.resolve(),
+        release,
+      };
+    };
+    const { wrapper, session } = mountSession(fakeBridge(), preloader);
+
+    await session.applySnapshot(readySnapshot(1, 11));
+    await session.applySnapshot(readySnapshot(2, 12));
+
+    expect(session.snapshot.value?.generation).toBe(2);
+    expect(session.displayedImage.value?.generation).toBe(1);
+    expect(session.imageUrl.value).toBe("blob:1");
+    expect(session.clientError.value).toContain("WebView2 預解碼失敗");
+    expect(session.renderPending.value).toBe(false);
+    expect(revoke.mock.calls.filter(([url]) => url === "blob:2")).toHaveLength(1);
+    expect(revoke).not.toHaveBeenCalledWith("blob:1");
+    expect(releases.get("blob:2")).toHaveBeenCalledOnce();
+
+    wrapper.unmount();
+    expect(revoke.mock.calls.filter(([url]) => url === "blob:1")).toHaveLength(1);
+    expect(revoke.mock.calls.filter(([url]) => url === "blob:2")).toHaveLength(1);
     expect(releases.get("blob:1")).toHaveBeenCalledOnce();
     expect(releases.get("blob:2")).toHaveBeenCalledOnce();
   });
@@ -318,7 +445,7 @@ describe("useViewer", () => {
     await session.applySnapshot({
       ...withoutRender,
       status: "error",
-      error: { code: "deleted", message: "檔案不存在" },
+      error: { code: "deleted", message: "檔案不存在", parameters: {} },
     });
     expect(revoke).toHaveBeenCalledWith("blob:2");
 

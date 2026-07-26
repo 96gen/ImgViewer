@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import packageInfo from "../package.json";
 import ImageViewport from "./components/ImageViewport.vue";
 import { useViewer } from "./composables/useViewer";
 
+const RELEASES_URL = "https://github.com/96gen/ImgViewer/releases";
 const viewer = useViewer();
 const viewport = ref<InstanceType<typeof ImageViewport> | null>(null);
+const releaseUrlInput = ref<HTMLInputElement | null>(null);
+const showAbout = ref(false);
+const copyStatus = ref("");
 
 const snapshot = computed(() => viewer.snapshot.value);
 const displayed = computed(() => viewer.displayedImage.value);
@@ -16,7 +21,7 @@ const isSwitching = computed(() => {
   return Boolean(
     current &&
       visible &&
-      (current.generation !== visible.generation || current.status === "loading"),
+      (current.status === "loading" || viewer.renderPending.value),
   );
 });
 const isInitialLoading = computed(() => {
@@ -53,11 +58,18 @@ const onImageError = (failedSrc: string) => {
     error: {
       code: "webview-image-error",
       message: "WebView2 無法顯示這張圖片。",
+      parameters: {},
     },
   });
 };
 
 const onKeyDown = (event: KeyboardEvent) => {
+  if (event.key === "Escape" && showAbout.value) {
+    event.preventDefault();
+    showAbout.value = false;
+    return;
+  }
+
   if ((event.ctrlKey || event.metaKey) && !event.altKey) {
     if (event.key.toLowerCase() === "o") {
       event.preventDefault();
@@ -86,6 +98,21 @@ const onKeyDown = (event: KeyboardEvent) => {
   }
 };
 
+const copyReleaseUrl = async () => {
+  copyStatus.value = "";
+  try {
+    await navigator.clipboard.writeText(RELEASES_URL);
+    copyStatus.value = "已複製";
+  } catch {
+    releaseUrlInput.value?.select();
+    copyStatus.value = "請按 Ctrl+C 複製";
+  }
+};
+
+const dismissClientError = () => {
+  viewer.clearClientError();
+};
+
 onMounted(() => window.addEventListener("keydown", onKeyDown));
 onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
 </script>
@@ -106,7 +133,18 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
         <span v-if="positionLabel">{{ positionLabel }}</span>
       </div>
 
-      <span v-if="render?.animated" class="animation-badge">動畫</span>
+      <div class="toolbar-actions">
+        <span v-if="render?.animated" class="animation-badge">動畫</span>
+        <button
+          class="about-button"
+          type="button"
+          title="關於 ImgViewer"
+          aria-label="關於 ImgViewer"
+          @click="showAbout = true"
+        >
+          ⓘ
+        </button>
+      </div>
     </header>
 
     <section class="viewer-area" aria-label="圖片檢視區">
@@ -151,6 +189,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
         載入中
       </div>
 
+      <div
+        v-if="hasImage && viewer.clientError.value"
+        class="client-error-banner"
+        role="alert"
+      >
+        <span>{{ viewer.clientError.value }}</span>
+        <button type="button" aria-label="關閉錯誤提示" @click="dismissClientError">
+          ×
+        </button>
+      </div>
+
       <button
         class="nav-button previous"
         type="button"
@@ -172,5 +221,44 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeyDown));
         ›
       </button>
     </section>
+
+    <div
+      v-if="showAbout"
+      class="about-backdrop"
+      role="presentation"
+      @pointerdown.self="showAbout = false"
+    >
+      <section
+        class="about-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="about-title"
+      >
+        <button
+          class="about-close"
+          type="button"
+          aria-label="關閉"
+          @click="showAbout = false"
+        >
+          ×
+        </button>
+        <h2 id="about-title">ImgViewer {{ packageInfo.version }}</h2>
+        <p>Windows 專用、離線、唯讀的圖片瀏覽器。</p>
+        <p class="about-privacy">不含遙測、自動上傳或程式內更新檢查。</p>
+        <label for="release-url">版本發布頁</label>
+        <div class="release-url-row">
+          <input
+            id="release-url"
+            ref="releaseUrlInput"
+            :value="RELEASES_URL"
+            readonly
+            spellcheck="false"
+            @focus="releaseUrlInput?.select()"
+          />
+          <button type="button" @click="copyReleaseUrl">複製</button>
+        </div>
+        <small aria-live="polite">{{ copyStatus }}</small>
+      </section>
+    </div>
   </main>
 </template>

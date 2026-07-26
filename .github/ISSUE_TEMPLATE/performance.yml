@@ -1,0 +1,43 @@
+name: 效能或 RAM 問題
+description: 回報可量測的速度、卡頓或記憶體問題
+title: "[Performance] "
+labels:
+  - performance
+body:
+  - type: markdown
+    attributes:
+      value: |
+        請勿上傳私人圖片。跨機器的絕對 RAM 數值不能直接比較。
+  - type: input
+    id: version
+    attributes:
+      label: ImgViewer、Windows 與 WebView2 版本
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: 固定測試工作量
+      description: 格式、尺寸、張數、循環次數與操作順序。
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: 量測結果
+      description: 提供同一台機器、相同 runtime 與相同工作量的數據。
+    validations:
+      required: true
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 可觀察症狀與重現步驟
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隱私確認
+      options:
+        - label: 資料已去識別化，且不含私人照片或完整本機路徑。
+          required: true

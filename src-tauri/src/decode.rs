@@ -1,4 +1,6 @@
-use std::fs::File;
+#![cfg_attr(all(test, feature = "heic"), allow(unsafe_code))]
+
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
@@ -13,28 +15,94 @@ use moxcms::{
     Transform8BitExecutor, Transform16BitExecutor, XyY, curve_from_gamma,
 };
 
-use crate::catalog::SupportedFormat;
-use crate::model::{DecodedRender, ViewerError};
+use crate::catalog::{SupportedFormat, validate_source_path};
+use crate::error::{ViewerError, code as error_code};
+use crate::model::DecodedRender;
 
 pub(crate) const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_SIDE: u32 = 32_768;
 pub(crate) const MAX_PIXELS: u64 = 100_000_000;
 pub(crate) const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_ANIMATION_FRAMES: u64 = 10_000;
+pub(crate) const MAX_ANIMATION_PIXELS: u64 = 1_000_000_000;
 const MAX_ICC_PROFILE_BYTES: usize = 16 * 1024 * 1024;
+const PNG_ENCODE_FIXED_RESERVE: u64 = 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct ProductionDecoder;
 
 impl ProductionDecoder {
-    pub(crate) fn decode(&self, path: &Path) -> Result<DecodedRender, ViewerError> {
-        decode_file(path)
+    pub(crate) fn decode(&self, path: &Path, file: File) -> Result<DecodedRender, ViewerError> {
+        decode_open_file(path, file)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn decode_file(path: &Path) -> Result<DecodedRender, ViewerError> {
+    let file = open_read_only(path)?;
+    decode_open_file(path, file)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_read_only(path: &Path) -> Result<File, ViewerError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    // The catalog is only a snapshot. Re-run the drive and every-component
+    // reparse policy immediately before CreateFile so navigation cannot rely
+    // on stale directory identity.
+    validate_source_path_for_open(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| ViewerError::io(format!("無法讀取檔案：{error}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ViewerError::io(format!("無法檢查檔案屬性：{error}")))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ViewerError::new(
+            "reparse_point_not_allowed",
+            "基於離線與路徑一致性政策，不允許 reparse point 或符號連結。",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_read_only(path: &Path) -> Result<File, ViewerError> {
+    validate_source_path_for_open(path)?;
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| ViewerError::io(format!("無法讀取檔案：{error}")))
+}
+
+fn validate_source_path_for_open(path: &Path) -> Result<(), ViewerError> {
+    validate_source_path(path).map_err(|error| {
+        if error.code == error_code::INVALID_PATH {
+            // Preserve the established navigation contract: a catalog entry
+            // deleted before open is a recoverable I/O failure. Security
+            // policy errors such as reparse/remote-drive rejection retain
+            // their distinct stable codes.
+            ViewerError::io(error.message)
+        } else {
+            error
+        }
+    })
+}
+
+fn decode_open_file(path: &Path, file: File) -> Result<DecodedRender, ViewerError> {
     let expected = SupportedFormat::from_path(path)
         .ok_or_else(|| ViewerError::new("unsupported_extension", "不支援這個檔案的副檔名。"))?;
-    let bytes = read_limited(path)?;
+    // The caller pins one read-only handle when the selection is scheduled.
+    // Metadata and the bounded read use that exact handle; magic checks,
+    // probes, color handling, and codec calls then operate only on the owned
+    // byte snapshot. `path` is used only for extension policy and display
+    // identity, never reopened here.
+    let bytes = read_limited(file)?;
     let detected = sniff_format(&bytes).ok_or_else(|| {
         ViewerError::new(
             "format_mismatch",
@@ -52,21 +120,19 @@ pub(crate) fn decode_file(path: &Path) -> Result<DecodedRender, ViewerError> {
         SupportedFormat::Jpeg => preserve_raster(bytes, ImageFormat::Jpeg, "image/jpeg", false),
         SupportedFormat::Png => decode_png(bytes),
         SupportedFormat::Gif => {
-            let animated = gif_is_animated(&bytes);
-            preserve_raster(bytes, ImageFormat::Gif, "image/gif", animated)
+            let animation = scan_gif_animation(&bytes)?;
+            preserve_raster(bytes, ImageFormat::Gif, "image/gif", animation.animated)
         }
         SupportedFormat::WebP => {
-            let animated = webp_is_animated(&bytes);
-            preserve_raster(bytes, ImageFormat::WebP, "image/webp", animated)
+            let animation = scan_webp_animation(&bytes)?;
+            preserve_raster(bytes, ImageFormat::WebP, "image/webp", animation.animated)
         }
         SupportedFormat::Tiff => decode_tiff(bytes),
         SupportedFormat::Heif => decode_heif(bytes),
     }
 }
 
-fn read_limited(path: &Path) -> Result<Vec<u8>, ViewerError> {
-    let file =
-        File::open(path).map_err(|error| ViewerError::io(format!("無法讀取檔案：{error}")))?;
+fn read_limited(file: File) -> Result<Vec<u8>, ViewerError> {
     let metadata = file
         .metadata()
         .map_err(|error| ViewerError::io(format!("無法取得檔案大小：{error}")))?;
@@ -161,6 +227,7 @@ fn preserve_raster(
     validate_dimensions(display_width, display_height)?;
 
     if let Some(transform) = color_transform {
+        validate_normalization_working_set(bytes.len() as u64, width, height, 4)?;
         // Re-open with an owned cursor only for mandatory colour conversion.
         // Consuming this decoder releases the compressed input before PNG
         // encoding starts instead of keeping both buffers alive to return it.
@@ -203,13 +270,16 @@ fn decode_png(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
         .ok_or_else(|| ViewerError::corrupt("PNG 標頭不完整，無法讀取色彩位元深度。"))?;
     let (width, height) = raster_dimensions(&bytes, ImageFormat::Png)?;
     validate_dimensions(width, height)?;
-    if bit_depth > 8 {
-        validate_high_bit_working_set(width, height)?;
-    }
     let color_source = png_color_source(&bytes)?;
     if bit_depth <= 8 && !color_source.requires_normalization() {
         return preserve_raster(bytes, ImageFormat::Png, "image/png", false);
     }
+    validate_normalization_working_set(
+        bytes.len() as u64,
+        width,
+        height,
+        if bit_depth > 8 { 8 } else { 4 },
+    )?;
 
     // The decoder owns the compressed input on normalization paths. Once the
     // DynamicImage is produced, the original bytes are freed before the RGBA
@@ -460,6 +530,7 @@ fn raster_dimensions(bytes: &[u8], format: ImageFormat) -> Result<(u32, u32), Vi
 fn decode_tiff(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
     let (width, height) = raster_dimensions(&bytes, ImageFormat::Tiff)?;
     validate_dimensions(width, height)?;
+    let source_bytes = bytes.len() as u64;
 
     // TiffDecoder starts at the first IFD (the first page). Read its orientation
     // before consuming the decoder, then normalize pixels so the PNG does not
@@ -467,13 +538,22 @@ fn decode_tiff(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
     let mut decoder =
         image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)).map_err(image_error)?;
     decoder.set_limits(decode_limits()).map_err(image_error)?;
+    let source_color_type = decoder.color_type();
     let high_bit_depth = matches!(
-        decoder.color_type(),
-        ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16
+        source_color_type,
+        ColorType::L16
+            | ColorType::La16
+            | ColorType::Rgb16
+            | ColorType::Rgba16
+            | ColorType::Rgb32F
+            | ColorType::Rgba32F
     );
-    if high_bit_depth {
-        validate_high_bit_working_set(width, height)?;
-    }
+    validate_normalization_working_set(
+        source_bytes,
+        width,
+        height,
+        u64::from(source_color_type.bytes_per_pixel()),
+    )?;
     let source_profile = decoder
         .icc_profile()
         .map_err(image_error)?
@@ -833,28 +913,64 @@ pub(crate) fn validate_dimensions(width: u32, height: u32) -> Result<(), ViewerE
     Ok(())
 }
 
-fn validate_high_bit_working_set(width: u32, height: u32) -> Result<(), ViewerError> {
-    // High-bit normalization can hold the decoded RGBA16 plane and its RGBA8
-    // result at the same time. ICC conversion additionally keeps at most two
-    // u16 rows (source and destination). Include all three allocations in the
-    // 512 MiB budget before any attacker-controlled full plane is allocated.
-    let plane_bytes = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(8 + 4))
-        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "高位元圖片尺寸計算溢位。"))?;
-    let row_bytes = u64::from(width)
-        .checked_mul(16)
-        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "高位元轉換列大小溢位。"))?;
-    let bytes = plane_bytes
-        .checked_add(row_bytes)
-        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "高位元工作集大小溢位。"))?;
-    if bytes > MAX_DECODE_BYTES {
+fn validate_normalization_working_set(
+    source_bytes: u64,
+    width: u32,
+    height: u32,
+    native_bytes_per_pixel: u64,
+) -> Result<(), ViewerError> {
+    let estimated_bytes =
+        normalization_working_set_bytes(source_bytes, width, height, native_bytes_per_pixel)
+            .ok_or_else(|| {
+                ViewerError::limit("dimensions_exceeded", "圖片正規化工作集大小計算溢位。")
+            })?;
+    if estimated_bytes > MAX_DECODE_BYTES {
         return Err(ViewerError::limit(
             "decode_limit_exceeded",
-            "高位元圖片轉換需要超過 512 MiB 的記憶體。",
-        ));
+            "圖片正規化的總工作集需要超過 512 MiB。",
+        )
+        .with_parameter("phase", "normalization")
+        .with_parameter("estimatedBytes", estimated_bytes)
+        .with_parameter("maxBytes", MAX_DECODE_BYTES));
     }
     Ok(())
+}
+
+fn normalization_working_set_bytes(
+    source_bytes: u64,
+    width: u32,
+    height: u32,
+    native_bytes_per_pixel: u64,
+) -> Option<u64> {
+    // This intentionally budgets all attacker-controlled large buffers
+    // together even where current lexical lifetimes let Rust release one
+    // slightly earlier: compressed source/native decode storage, canonical
+    // RGBA8, a conservative PNG output reserve, and at most two native rows
+    // used by colour conversion. A refactor therefore cannot silently turn
+    // individually-valid allocations into a process-sized memory spike.
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let native_bytes = pixels.checked_mul(native_bytes_per_pixel)?;
+    let rgba_bytes = pixels.checked_mul(4)?;
+    let filtered_png_bytes = rgba_bytes.checked_add(u64::from(height))?;
+    let png_deflate_reserve = filtered_png_bytes
+        .checked_add(filtered_png_bytes.div_ceil(16))?
+        .checked_add(PNG_ENCODE_FIXED_RESERVE)?;
+    let row_workspace = u64::from(width)
+        .checked_mul(native_bytes_per_pixel)?
+        .checked_mul(2)?;
+    checked_component_total(&[
+        source_bytes,
+        native_bytes,
+        rgba_bytes,
+        png_deflate_reserve,
+        row_workspace,
+    ])
+}
+
+fn checked_component_total(components: &[u64]) -> Option<u64> {
+    components
+        .iter()
+        .try_fold(0_u64, |total, value| total.checked_add(*value))
 }
 
 fn try_vec_with_capacity<T>(capacity: usize) -> Result<Vec<T>, ViewerError> {
@@ -886,95 +1002,301 @@ fn image_error(error: image::ImageError) -> ViewerError {
     }
 }
 
-fn gif_is_animated(bytes: &[u8]) -> bool {
-    if bytes.len() < 13 {
-        return false;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AnimationStructure {
+    frame_count: u64,
+    total_pixels: u64,
+    animated: bool,
+}
+
+fn scan_gif_animation(bytes: &[u8]) -> Result<AnimationStructure, ViewerError> {
+    if bytes.len() < 13 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return Err(ViewerError::corrupt("GIF 標頭不完整。"));
     }
+
     let packed = bytes[10];
-    let global_table = if packed & 0x80 != 0 {
+    let global_table_bytes = gif_color_table_bytes(packed);
+    let mut cursor = 13usize
+        .checked_add(global_table_bytes)
+        .ok_or_else(|| ViewerError::corrupt("GIF 全域色盤大小溢位。"))?;
+    if cursor > bytes.len() {
+        return Err(ViewerError::corrupt("GIF 全域色盤被截斷。"));
+    }
+
+    let mut frame_count = 0_u64;
+    let mut total_pixels = 0_u64;
+    loop {
+        let block = *bytes
+            .get(cursor)
+            .ok_or_else(|| ViewerError::corrupt("GIF 缺少結束標記。"))?;
+        match block {
+            0x2c => {
+                let descriptor_end = cursor
+                    .checked_add(10)
+                    .ok_or_else(|| ViewerError::corrupt("GIF frame descriptor 大小溢位。"))?;
+                if descriptor_end > bytes.len() {
+                    return Err(ViewerError::corrupt("GIF frame descriptor 被截斷。"));
+                }
+                let width = u16::from_le_bytes(
+                    bytes[cursor + 5..cursor + 7].try_into().expect("two bytes"),
+                );
+                let height = u16::from_le_bytes(
+                    bytes[cursor + 7..cursor + 9].try_into().expect("two bytes"),
+                );
+                if width == 0 || height == 0 {
+                    return Err(ViewerError::corrupt("GIF frame 尺寸不可為零。"));
+                }
+                record_animation_frame(
+                    "gif",
+                    &mut frame_count,
+                    &mut total_pixels,
+                    u64::from(width),
+                    u64::from(height),
+                )?;
+
+                let local_packed = bytes[cursor + 9];
+                cursor = descriptor_end
+                    .checked_add(gif_color_table_bytes(local_packed))
+                    .ok_or_else(|| ViewerError::corrupt("GIF 區域色盤大小溢位。"))?;
+                let minimum_code_size = *bytes
+                    .get(cursor)
+                    .ok_or_else(|| ViewerError::corrupt("GIF 缺少 LZW code size。"))?;
+                if !(2..=8).contains(&minimum_code_size) {
+                    return Err(ViewerError::corrupt("GIF LZW code size 無效。"));
+                }
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or_else(|| ViewerError::corrupt("GIF frame 位置溢位。"))?;
+                skip_gif_sub_blocks(bytes, &mut cursor)?;
+            }
+            0x21 => {
+                let label_end = cursor
+                    .checked_add(2)
+                    .ok_or_else(|| ViewerError::corrupt("GIF extension 位置溢位。"))?;
+                if label_end > bytes.len() {
+                    return Err(ViewerError::corrupt("GIF extension label 被截斷。"));
+                }
+                cursor = label_end;
+                skip_gif_sub_blocks(bytes, &mut cursor)?;
+            }
+            0x3b => {
+                return Ok(AnimationStructure {
+                    frame_count,
+                    total_pixels,
+                    animated: frame_count > 1,
+                });
+            }
+            _ => return Err(ViewerError::corrupt("GIF 含有無效的 block introducer。")),
+        }
+    }
+}
+
+fn gif_color_table_bytes(packed: u8) -> usize {
+    if packed & 0x80 != 0 {
         3usize << ((packed & 0x07) + 1)
     } else {
         0
-    };
-    let mut cursor = 13usize.saturating_add(global_table);
-    let mut images = 0usize;
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            0x2c => {
-                images += 1;
-                if images > 1 {
-                    return true;
-                }
-                if cursor + 10 > bytes.len() {
-                    return false;
-                }
-                let local_packed = bytes[cursor + 9];
-                cursor += 10;
-                if local_packed & 0x80 != 0 {
-                    cursor = cursor.saturating_add(3usize << ((local_packed & 0x07) + 1));
-                }
-                cursor = cursor.saturating_add(1); // LZW minimum code size.
-                if !skip_sub_blocks(bytes, &mut cursor) {
-                    return false;
-                }
-            }
-            0x21 => {
-                cursor = cursor.saturating_add(2); // introducer and extension label.
-                if !skip_sub_blocks(bytes, &mut cursor) {
-                    return false;
-                }
-            }
-            0x3b => return false,
-            _ => return false,
-        }
     }
-    false
 }
 
-fn skip_sub_blocks(bytes: &[u8], cursor: &mut usize) -> bool {
-    while *cursor < bytes.len() {
-        let size = bytes[*cursor] as usize;
-        *cursor += 1;
+fn skip_gif_sub_blocks(bytes: &[u8], cursor: &mut usize) -> Result<(), ViewerError> {
+    loop {
+        let size = usize::from(
+            *bytes
+                .get(*cursor)
+                .ok_or_else(|| ViewerError::corrupt("GIF data sub-block 被截斷。"))?,
+        );
+        *cursor = cursor
+            .checked_add(1)
+            .ok_or_else(|| ViewerError::corrupt("GIF data sub-block 位置溢位。"))?;
         if size == 0 {
-            return true;
+            return Ok(());
         }
-        let Some(next) = cursor.checked_add(size) else {
-            return false;
-        };
+        let next = cursor
+            .checked_add(size)
+            .ok_or_else(|| ViewerError::corrupt("GIF data sub-block 大小溢位。"))?;
         if next > bytes.len() {
-            return false;
+            return Err(ViewerError::corrupt("GIF data sub-block 超出檔案範圍。"));
         }
         *cursor = next;
     }
-    false
 }
 
-fn webp_is_animated(bytes: &[u8]) -> bool {
-    if bytes.len() < 20 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
-        return false;
+fn scan_webp_animation(bytes: &[u8]) -> Result<AnimationStructure, ViewerError> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return Err(ViewerError::corrupt("WebP RIFF 標頭不完整。"));
     }
+    let declared_size = u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes")) as usize;
+    let riff_end = 8usize
+        .checked_add(declared_size)
+        .ok_or_else(|| ViewerError::corrupt("WebP RIFF 大小溢位。"))?;
+    if declared_size < 4 || riff_end != bytes.len() {
+        return Err(ViewerError::corrupt("WebP RIFF 宣告大小與檔案長度不一致。"));
+    }
+
     let mut cursor = 12usize;
     let mut animation_header = false;
-    let mut animation_frame = false;
-    while cursor + 8 <= bytes.len() {
+    let mut frame_count = 0_u64;
+    let mut total_pixels = 0_u64;
+    while cursor < riff_end {
+        let header_end = cursor
+            .checked_add(8)
+            .ok_or_else(|| ViewerError::corrupt("WebP chunk header 位置溢位。"))?;
+        if header_end > riff_end {
+            return Err(ViewerError::corrupt("WebP chunk header 被截斷。"));
+        }
         let chunk = &bytes[cursor..cursor + 4];
         let length = u32::from_le_bytes(
-            bytes[cursor + 4..cursor + 8]
+            bytes[cursor + 4..header_end]
                 .try_into()
                 .expect("four bytes"),
         ) as usize;
-        let data_start = cursor + 8;
-        let Some(data_end) = data_start.checked_add(length) else {
-            return false;
-        };
-        if data_end > bytes.len() {
-            return false;
+        let data_start = header_end;
+        let data_end = data_start
+            .checked_add(length)
+            .ok_or_else(|| ViewerError::corrupt("WebP chunk 大小溢位。"))?;
+        let padded_end = data_end
+            .checked_add(length & 1)
+            .ok_or_else(|| ViewerError::corrupt("WebP chunk padding 位置溢位。"))?;
+        if padded_end > riff_end {
+            return Err(ViewerError::corrupt("WebP chunk 超出 RIFF 範圍。"));
         }
-        animation_header |= chunk == b"ANIM";
-        animation_frame |= chunk == b"ANMF";
-        cursor = data_end.saturating_add(length & 1);
+
+        if chunk == b"ANIM" {
+            if animation_header || length != 6 {
+                return Err(ViewerError::corrupt("WebP ANIM chunk 結構無效。"));
+            }
+            animation_header = true;
+        } else if chunk == b"ANMF" {
+            if !animation_header {
+                return Err(ViewerError::corrupt(
+                    "WebP ANMF frame 出現在 ANIM header 之前。",
+                ));
+            }
+            if length < 16 {
+                return Err(ViewerError::corrupt("WebP ANMF chunk 被截斷。"));
+            }
+            let width = u64::from(read_webp_u24(&bytes[data_start + 6..data_start + 9])) + 1;
+            let height = u64::from(read_webp_u24(&bytes[data_start + 9..data_start + 12])) + 1;
+            validate_webp_frame_chunks(&bytes[data_start..data_end])?;
+            record_animation_frame("webp", &mut frame_count, &mut total_pixels, width, height)?;
+        }
+
+        cursor = padded_end;
     }
-    animation_header && animation_frame
+
+    if animation_header != (frame_count > 0) {
+        return Err(ViewerError::corrupt(
+            "WebP animation header 與 frame 結構不一致。",
+        ));
+    }
+    Ok(AnimationStructure {
+        frame_count,
+        total_pixels,
+        animated: animation_header,
+    })
+}
+
+fn read_webp_u24(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
+}
+
+fn validate_webp_frame_chunks(frame: &[u8]) -> Result<(), ViewerError> {
+    let mut cursor = 16_usize;
+    let mut image_chunks = 0_u8;
+    while cursor < frame.len() {
+        let header_end = cursor
+            .checked_add(8)
+            .ok_or_else(|| ViewerError::corrupt("WebP frame chunk header 位置溢位。"))?;
+        if header_end > frame.len() {
+            return Err(ViewerError::corrupt(
+                "WebP frame 內部 chunk header 被截斷。",
+            ));
+        }
+        let kind = &frame[cursor..cursor + 4];
+        let length = u32::from_le_bytes(
+            frame[cursor + 4..header_end]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        let data_end = header_end
+            .checked_add(length)
+            .ok_or_else(|| ViewerError::corrupt("WebP frame 內部 chunk 大小溢位。"))?;
+        let padded_end = data_end
+            .checked_add(length & 1)
+            .ok_or_else(|| ViewerError::corrupt("WebP frame 內部 chunk padding 溢位。"))?;
+        if padded_end > frame.len() {
+            return Err(ViewerError::corrupt(
+                "WebP frame 內部 chunk 超出 ANMF 範圍。",
+            ));
+        }
+        match kind {
+            b"VP8 " | b"VP8L" => {
+                image_chunks = image_chunks.saturating_add(1);
+                if image_chunks > 1 {
+                    return Err(ViewerError::corrupt(
+                        "WebP frame 含有多個 image bitstream chunk。",
+                    ));
+                }
+            }
+            b"ALPH" if image_chunks == 0 => {}
+            _ => {
+                return Err(ViewerError::corrupt(
+                    "WebP frame 含有無效或順序錯誤的內部 chunk。",
+                ));
+            }
+        }
+        cursor = padded_end;
+    }
+    if image_chunks != 1 {
+        return Err(ViewerError::corrupt(
+            "WebP ANMF 缺少 image bitstream chunk。",
+        ));
+    }
+    Ok(())
+}
+
+fn record_animation_frame(
+    format: &'static str,
+    frame_count: &mut u64,
+    total_pixels: &mut u64,
+    width: u64,
+    height: u64,
+) -> Result<(), ViewerError> {
+    let next_count = frame_count
+        .checked_add(1)
+        .ok_or_else(|| animation_limit_error(format, u64::MAX, *total_pixels))?;
+    if next_count > MAX_ANIMATION_FRAMES {
+        return Err(animation_limit_error(format, next_count, *total_pixels));
+    }
+    let frame_pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| animation_limit_error(format, next_count, u64::MAX))?;
+    let next_pixels = total_pixels
+        .checked_add(frame_pixels)
+        .ok_or_else(|| animation_limit_error(format, next_count, u64::MAX))?;
+    if next_pixels > MAX_ANIMATION_PIXELS {
+        return Err(animation_limit_error(format, next_count, next_pixels));
+    }
+    *frame_count = next_count;
+    *total_pixels = next_pixels;
+    Ok(())
+}
+
+fn animation_limit_error(
+    format: &'static str,
+    observed_frames: u64,
+    observed_pixels: u64,
+) -> ViewerError {
+    ViewerError::limit(
+        error_code::ANIMATION_LIMIT_EXCEEDED,
+        "動畫結構超過安全幀數或累計像素上限。",
+    )
+    .with_parameter("format", format)
+    .with_parameter("maxFrames", MAX_ANIMATION_FRAMES)
+    .with_parameter("observedFrames", observed_frames)
+    .with_parameter("maxPixels", MAX_ANIMATION_PIXELS)
+    .with_parameter("observedPixels", observed_pixels)
 }
 
 #[cfg(any(feature = "heic", test))]
@@ -1031,6 +1353,7 @@ fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
     // Keep libheif's context and native decoded plane inside a narrow scope.
     // They are released before PNG encoding allocates its output buffer, which
     // avoids retaining two full RGBA planes plus the compressed result.
+    let source_bytes = bytes.len() as u64;
     let (width, height, rgba) = {
         let mut context = HeifContext::new()
             .map_err(|error| ViewerError::corrupt(format!("無法建立 HEIF 解碼器：{error}")))?;
@@ -1066,9 +1389,12 @@ fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
                 format!("不支援 {source_bit_depth}-bit HEIC/HEIF 圖片。"),
             ));
         }
-        if high_bit_depth {
-            validate_high_bit_working_set(handle.width(), handle.height())?;
-        }
+        validate_normalization_working_set(
+            source_bytes,
+            handle.width(),
+            handle.height(),
+            if high_bit_depth { 8 } else { 4 },
+        )?;
         let mut options = DecodingOptions::new()
             .ok_or_else(|| ViewerError::corrupt("無法建立 HEIF 解碼選項。"))?;
         // Keep 10/12/16-bit samples intact until after colour conversion. libheif's
@@ -1279,6 +1605,55 @@ mod tests {
         output
     }
 
+    fn gif_animation_structure(frame_count: usize, width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(14 + frame_count.saturating_mul(15));
+        bytes.extend_from_slice(b"GIF89a");
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0]); // no global color table
+        for _ in 0..frame_count {
+            bytes.push(0x2c);
+            bytes.extend_from_slice(&0_u16.to_le_bytes()); // left
+            bytes.extend_from_slice(&0_u16.to_le_bytes()); // top
+            bytes.extend_from_slice(&width.to_le_bytes());
+            bytes.extend_from_slice(&height.to_le_bytes());
+            bytes.push(0); // no local color table
+            bytes.push(2); // LZW minimum code size
+            bytes.extend_from_slice(&[1, 0, 0]); // one data byte and terminator
+        }
+        bytes.push(0x3b);
+        bytes
+    }
+
+    fn push_webp_chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(data);
+        if data.len() & 1 != 0 {
+            bytes.push(0);
+        }
+    }
+
+    fn webp_animation_structure(frame_count: usize, width: u32, height: u32) -> Vec<u8> {
+        assert!((1..=0x01_00_00_00).contains(&width));
+        assert!((1..=0x01_00_00_00).contains(&height));
+        let mut bytes = Vec::with_capacity(26 + frame_count.saturating_mul(24));
+        bytes.extend_from_slice(b"RIFF\0\0\0\0WEBP");
+        push_webp_chunk(&mut bytes, b"ANIM", &[0; 6]);
+        for _ in 0..frame_count {
+            let mut frame = vec![0_u8; 16];
+            let width_minus_one = width - 1;
+            let height_minus_one = height - 1;
+            frame[6..9].copy_from_slice(&width_minus_one.to_le_bytes()[..3]);
+            frame[9..12].copy_from_slice(&height_minus_one.to_le_bytes()[..3]);
+            push_webp_chunk(&mut frame, b"VP8L", &[0]);
+            push_webp_chunk(&mut bytes, b"ANMF", &frame);
+        }
+        let riff_size = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn magic_detection_does_not_trust_extensions() {
         assert_eq!(
@@ -1300,6 +1675,23 @@ mod tests {
     }
 
     #[test]
+    fn validation_and_decode_use_the_same_bounded_byte_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.png");
+        let original = png_bytes([1, 2, 3, 255]);
+        fs::write(&path, &original).unwrap();
+
+        let captured = read_limited(open_read_only(&path).unwrap()).unwrap();
+        fs::write(&path, b"replacement that is not a PNG").unwrap();
+
+        assert_eq!(sniff_format(&captured), Some(SupportedFormat::Png));
+        let decoded = decode_png(captured).unwrap();
+        assert_eq!((decoded.width, decoded.height), (1, 1));
+        assert_eq!(decoded.bytes, original);
+        assert_eq!(decode_file(&path).unwrap_err().code, "format_mismatch");
+    }
+
+    #[test]
     fn dimension_limits_cover_side_and_total_pixels() {
         assert_eq!(
             validate_dimensions(MAX_SIDE + 1, 1).unwrap_err().code,
@@ -1313,14 +1705,36 @@ mod tests {
     }
 
     #[test]
-    fn high_bit_normalization_preflights_both_full_image_planes() {
-        assert!(validate_high_bit_working_set(6_000, 6_000).is_ok());
+    fn normalization_preflights_the_aggregate_working_set() {
+        assert!(validate_normalization_working_set(0, 5_000, 5_000, 8).is_ok());
+        let error = validate_normalization_working_set(0, 10_000, 10_000, 4).unwrap_err();
+        assert_eq!(error.code, "decode_limit_exceeded");
+        assert_eq!(error.parameters["phase"], "normalization");
+        assert_eq!(error.parameters["maxBytes"], MAX_DECODE_BYTES);
+        assert!(error.parameters["estimatedBytes"].as_u64().unwrap() > MAX_DECODE_BYTES);
+        assert!(!error.parameters.contains_key("path"));
+    }
+
+    #[test]
+    fn aggregate_working_set_calculation_has_exact_boundaries_and_checked_overflow() {
         assert_eq!(
-            validate_high_bit_working_set(8_000, 6_000)
-                .unwrap_err()
-                .code,
-            "decode_limit_exceeded"
+            checked_component_total(&[MAX_DECODE_BYTES - 1, 1]),
+            Some(MAX_DECODE_BYTES)
         );
+        assert_eq!(
+            checked_component_total(&[MAX_DECODE_BYTES, 1]),
+            Some(MAX_DECODE_BYTES + 1)
+        );
+        assert_eq!(checked_component_total(&[u64::MAX, 1]), None);
+
+        let hundred_million_pixel_estimate =
+            normalization_working_set_bytes(0, 10_000, 10_000, 4).unwrap();
+        assert!(hundred_million_pixel_estimate > MAX_DECODE_BYTES);
+        assert_eq!(ColorType::Rgb32F.bytes_per_pixel(), 12);
+        assert_eq!(ColorType::Rgba32F.bytes_per_pixel(), 16);
+        let thirty_million_rgba32f_estimate =
+            normalization_working_set_bytes(0, 6_000, 5_000, 16).unwrap();
+        assert!(thirty_million_rgba32f_estimate > MAX_DECODE_BYTES);
     }
 
     #[test]
@@ -1358,6 +1772,103 @@ mod tests {
     }
 
     #[test]
+    fn gif_frame_count_limit_fails_closed_with_stable_parameters() {
+        let bytes = gif_animation_structure((MAX_ANIMATION_FRAMES + 1) as usize, 1, 1);
+        let error = scan_gif_animation(&bytes).unwrap_err();
+        assert_eq!(error.code, error_code::ANIMATION_LIMIT_EXCEEDED);
+        assert_eq!(error.parameters["format"], "gif");
+        assert_eq!(error.parameters["maxFrames"], MAX_ANIMATION_FRAMES);
+        assert_eq!(error.parameters["observedFrames"], MAX_ANIMATION_FRAMES + 1);
+        assert!(!error.parameters.contains_key("path"));
+    }
+
+    #[test]
+    fn gif_cumulative_frame_pixels_limit_uses_checked_arithmetic() {
+        let bytes = gif_animation_structure(1_001, 1_000, 1_000);
+        let error = scan_gif_animation(&bytes).unwrap_err();
+        assert_eq!(error.code, error_code::ANIMATION_LIMIT_EXCEEDED);
+        assert_eq!(error.parameters["maxPixels"], MAX_ANIMATION_PIXELS);
+        assert_eq!(error.parameters["observedPixels"], 1_001_000_000_u64);
+    }
+
+    #[test]
+    fn gif_truncated_descriptors_and_sub_blocks_are_recoverable_errors() {
+        let mut descriptor = gif_animation_structure(0, 1, 1);
+        descriptor.pop();
+        descriptor.extend_from_slice(&[0x2c, 0, 0, 0]);
+        assert_eq!(
+            scan_gif_animation(&descriptor).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+
+        let mut sub_block = gif_animation_structure(1, 1, 1);
+        sub_block.truncate(sub_block.len() - 2);
+        assert_eq!(
+            scan_gif_animation(&sub_block).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+    }
+
+    #[test]
+    fn webp_frame_count_limit_fails_closed_with_stable_parameters() {
+        let bytes = webp_animation_structure((MAX_ANIMATION_FRAMES + 1) as usize, 1, 1);
+        let error = scan_webp_animation(&bytes).unwrap_err();
+        assert_eq!(error.code, error_code::ANIMATION_LIMIT_EXCEEDED);
+        assert_eq!(error.parameters["format"], "webp");
+        assert_eq!(error.parameters["maxFrames"], MAX_ANIMATION_FRAMES);
+        assert_eq!(error.parameters["observedFrames"], MAX_ANIMATION_FRAMES + 1);
+        assert!(!error.parameters.contains_key("path"));
+    }
+
+    #[test]
+    fn webp_cumulative_frame_pixels_limit_uses_checked_arithmetic() {
+        let bytes = webp_animation_structure(1_001, 1_000, 1_000);
+        let error = scan_webp_animation(&bytes).unwrap_err();
+        assert_eq!(error.code, error_code::ANIMATION_LIMIT_EXCEEDED);
+        assert_eq!(error.parameters["maxPixels"], MAX_ANIMATION_PIXELS);
+        assert_eq!(error.parameters["observedPixels"], 1_001_000_000_u64);
+    }
+
+    #[test]
+    fn webp_truncation_and_chunk_bounds_are_recoverable_errors() {
+        let mut truncated = webp_animation_structure(1, 1, 1);
+        truncated.pop();
+        assert_eq!(
+            scan_webp_animation(&truncated).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+
+        let mut out_of_bounds = webp_animation_structure(1, 1, 1);
+        out_of_bounds[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            scan_webp_animation(&out_of_bounds).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+
+        let mut short_frame = b"RIFF\0\0\0\0WEBP".to_vec();
+        push_webp_chunk(&mut short_frame, b"ANIM", &[0; 6]);
+        push_webp_chunk(&mut short_frame, b"ANMF", &[0; 15]);
+        let riff_size = (short_frame.len() - 8) as u32;
+        short_frame[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert_eq!(
+            scan_webp_animation(&short_frame).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+
+        let mut nested_out_of_bounds = webp_animation_structure(1, 1, 1);
+        let nested_chunk = nested_out_of_bounds
+            .windows(4)
+            .position(|window| window == b"VP8L")
+            .unwrap();
+        nested_out_of_bounds[nested_chunk + 4..nested_chunk + 8]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            scan_webp_animation(&nested_out_of_bounds).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+    }
+
+    #[test]
     fn tiff_conversion_uses_first_page_and_outputs_eight_bit_png() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pages.tiff");
@@ -1381,6 +1892,26 @@ mod tests {
         assert_eq!(decoded.mime_type, "image/png");
         let image = image::load_from_memory(&decoded.bytes).unwrap().to_rgba8();
         assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn small_rgba32f_tiff_is_budgeted_and_normalized_to_eight_bit_png() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(Cursor::new(&mut bytes)).unwrap();
+            encoder
+                .new_image::<tiff::encoder::colortype::RGBA32Float>(1, 1)
+                .unwrap()
+                .write_data(&[1.0, 0.5, 0.0, 1.0])
+                .unwrap();
+        }
+
+        let decoded = decode_tiff(bytes).unwrap();
+        assert_eq!(decoded.mime_type, "image/png");
+        let image = image::load_from_memory(&decoded.bytes).unwrap().to_rgba8();
+        let pixel = image.get_pixel(0, 0).0;
+        assert_eq!([pixel[0], pixel[2], pixel[3]], [255, 0, 255]);
+        assert!((127..=128).contains(&pixel[1]));
     }
 
     #[test]
@@ -1421,9 +1952,11 @@ mod tests {
 
     #[test]
     fn committed_animation_and_invalid_fixtures_match_contract() {
+        let source = fs::read(fixture("animated.webp")).unwrap();
         let webp = decode_file(&fixture("animated.webp")).unwrap();
         assert!(webp.animated);
         assert_eq!(webp.mime_type, "image/webp");
+        assert_eq!(webp.bytes, source);
         assert_eq!(
             decode_file(&fixture("corrupt.jpg")).unwrap_err().code,
             "corrupt_image"
@@ -1720,6 +2253,9 @@ mod tests {
         // The portable build deliberately uses only libheif's built-in
         // libde265 decoder. A non-empty list here would reintroduce runtime
         // DLL scanning, including the empty-path drive-root fallback on Windows.
+        // SAFETY: libheif owns the returned null-terminated pointer array. We
+        // only inspect its first pointer while the allocation is valid, then
+        // release it exactly once with the matching libheif function.
         unsafe {
             let directories = libheif_sys::heif_get_plugin_directories();
             assert!(!directories.is_null());

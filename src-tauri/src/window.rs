@@ -1,8 +1,14 @@
+#![allow(unsafe_code)]
+
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read};
 use std::mem::size_of;
+use std::path::Path;
 use std::ptr::null_mut;
 
 use serde::Deserialize;
+use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Manager, Runtime};
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -16,6 +22,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
 };
 
+const MAX_WINDOW_STATE_BYTES: u64 = 64 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WorkArea {
     x: i64,
@@ -25,7 +33,7 @@ struct WorkArea {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(default)]
+#[allow(dead_code)] // Mirrors every required upstream window-state 2.4.1 field.
 struct SavedWindowState {
     width: u32,
     height: u32,
@@ -34,6 +42,48 @@ struct SavedWindowState {
     prev_x: i32,
     prev_y: i32,
     maximized: bool,
+    visible: bool,
+    decorated: bool,
+    fullscreen: bool,
+}
+
+pub(crate) fn state_preflight_plugin<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new("window-state-preflight")
+        .setup(|app, _api| {
+            sanitize_window_state(app)?;
+            Ok(())
+        })
+        .build()
+}
+
+fn sanitize_window_state<R: Runtime>(app: &AppHandle<R>) -> io::Result<()> {
+    let state_path = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .join(tauri_plugin_window_state::DEFAULT_FILENAME);
+    sanitize_window_state_path(&state_path)
+}
+
+fn sanitize_window_state_path(state_path: &Path) -> io::Result<()> {
+    match read_bounded_state(state_path) {
+        Ok(bytes)
+            if serde_json::from_slice::<HashMap<String, SavedWindowState>>(&bytes).is_ok() =>
+        {
+            Ok(())
+        }
+        Ok(_) => {
+            // The upstream plugin parses this file before honoring
+            // skip_initial_state. Remove an invalid or oversized file before
+            // its setup hook can allocate from untrusted state.
+            std::fs::remove_file(state_path)
+        }
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            std::fs::remove_file(state_path)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn prepare_main_window<R: Runtime>(app: &AppHandle<R>) {
@@ -45,6 +95,9 @@ pub(crate) fn prepare_main_window<R: Runtime>(app: &AppHandle<R>) {
     let callback_window = window.clone();
     let result = window.with_webview(move |webview| {
         let native_result = (|| -> Result<(), String> {
+            // SAFETY: Tauri invokes this closure while the WebView controller
+            // and its parent window are alive. Every returned pointer is
+            // checked before it is passed to the isolated Win32 adapter.
             unsafe {
                 let controller = webview.controller();
                 let mut parent = Default::default();
@@ -85,29 +138,51 @@ fn load_main_window_state<R: Runtime>(app: &AppHandle<R>) -> Option<SavedWindowS
         .app_config_dir()
         .ok()?
         .join(tauri_plugin_window_state::DEFAULT_FILENAME);
-    let bytes = match std::fs::read(&state_path) {
+    let bytes = match read_bounded_state(&state_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            eprintln!(
-                "ImgViewer could not read saved window state at {}: {error}",
-                state_path.display()
-            );
+            eprintln!("ImgViewer could not read saved window state: {error}");
             return None;
         }
     };
     match serde_json::from_slice::<HashMap<String, SavedWindowState>>(&bytes) {
         Ok(states) => states.get("main").copied(),
         Err(error) => {
-            eprintln!(
-                "ImgViewer ignored invalid saved window state at {}: {error}",
-                state_path.display()
-            );
+            eprintln!("ImgViewer ignored invalid saved window state: {error}");
             None
         }
     }
 }
 
+fn read_bounded_state(path: &Path) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_WINDOW_STATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "window state exceeds the 64 KiB safety limit",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(MAX_WINDOW_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_WINDOW_STATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "window state grew beyond the 64 KiB safety limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Restores a hidden Tauri window using its native Win32 handle.
+///
+/// # Safety
+///
+/// `hwnd` must identify the live top-level window that owns the WebView for
+/// the entire duration of this synchronous call.
 unsafe fn restore_and_clamp_native(
     hwnd: HWND,
     saved: Option<&SavedWindowState>,
@@ -117,6 +192,8 @@ unsafe fn restore_and_clamp_native(
     }
 
     let mut current = RECT::default();
+    // SAFETY: `hwnd` was validated as non-null and `current` is writable for
+    // the duration of this synchronous Win32 call.
     if unsafe { GetWindowRect(hwnd, &mut current) } == 0 {
         return Err("GetWindowRect failed.".to_owned());
     }
@@ -137,9 +214,14 @@ unsafe fn restore_and_clamp_native(
             right: x.saturating_add(state.width.min(i32::MAX as u32) as i32),
             bottom: y.saturating_add(state.height.min(i32::MAX as u32) as i32),
         };
+        // SAFETY: `probe` is a fully initialized RECT and the function only
+        // reads it during this call.
         let monitor = unsafe { MonitorFromRect(&probe, MONITOR_DEFAULTTOPRIMARY) };
         let dpi = monitor_dpi(monitor);
+        // SAFETY: `hwnd` remains a live top-level window for this callback;
+        // these getters do not retain the handle.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+        // SAFETY: Same live HWND invariant as the style lookup above.
         let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
         let mut adjusted = RECT {
             left: 0,
@@ -147,6 +229,8 @@ unsafe fn restore_and_clamp_native(
             right: state.width.min(i32::MAX as u32) as i32,
             bottom: state.height.min(i32::MAX as u32) as i32,
         };
+        // SAFETY: `adjusted` is valid writable storage and all scalar style
+        // values came from the same live HWND.
         if unsafe { AdjustWindowRectExForDpi(&mut adjusted, style, 0, extended_style, dpi) } != 0 {
             (
                 i64::from(x),
@@ -179,8 +263,10 @@ unsafe fn restore_and_clamp_native(
         right: clamp_i64_to_i32(x.saturating_add(outer_width)),
         bottom: clamp_i64_to_i32(y.saturating_add(outer_height)),
     };
-    let work_area =
-        monitor_work_area(unsafe { MonitorFromRect(&probe, MONITOR_DEFAULTTOPRIMARY) })?;
+    // SAFETY: `probe` is initialized and borrowed only for this synchronous
+    // monitor lookup.
+    let monitor = unsafe { MonitorFromRect(&probe, MONITOR_DEFAULTTOPRIMARY) };
+    let work_area = monitor_work_area(monitor)?;
     let ((x, y), (outer_width, outer_height)) = clamp_geometry(
         (x, y),
         (outer_width as u64, outer_height as u64),
@@ -192,14 +278,17 @@ unsafe fn restore_and_clamp_native(
     // A move between monitors can synchronously adjust the DPI and non-client
     // frame. Clamp the actual post-move rectangle once more while still hidden.
     let mut actual = RECT::default();
+    // SAFETY: `hwnd` is still live and `actual` is writable for this call.
     if unsafe { GetWindowRect(hwnd, &mut actual) } != 0 {
         let actual_position = (i64::from(actual.left), i64::from(actual.top));
         let actual_size = (
             (i64::from(actual.right) - i64::from(actual.left)).max(1) as u64,
             (i64::from(actual.bottom) - i64::from(actual.top)).max(1) as u64,
         );
-        let actual_work_area =
-            monitor_work_area(unsafe { MonitorFromRect(&actual, MONITOR_DEFAULTTOPRIMARY) })?;
+        // SAFETY: `actual` was initialized by GetWindowRect and is borrowed
+        // only for this synchronous monitor lookup.
+        let monitor = unsafe { MonitorFromRect(&actual, MONITOR_DEFAULTTOPRIMARY) };
+        let actual_work_area = monitor_work_area(monitor)?;
         if let Some((position, size)) =
             clamp_geometry(actual_position, actual_size, &[actual_work_area])
             && (position != actual_position || size != actual_size)
@@ -213,6 +302,8 @@ unsafe fn restore_and_clamp_native(
 fn monitor_dpi(monitor: windows_sys::Win32::Graphics::Gdi::HMONITOR) -> u32 {
     let mut x = 96;
     let mut y = 96;
+    // SAFETY: `x` and `y` are valid writable u32 values and the monitor handle
+    // came from MonitorFromRect.
     let result = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) };
     if result >= 0 && x > 0 { x } else { 96 }
 }
@@ -226,6 +317,8 @@ fn monitor_work_area(
         rcWork: RECT::default(),
         dwFlags: 0,
     };
+    // SAFETY: `info.cbSize` identifies the initialized MONITORINFO allocation
+    // and the monitor handle came from MonitorFromRect.
     if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
         return Err("GetMonitorInfoW failed.".to_owned());
     }
@@ -243,6 +336,8 @@ fn monitor_work_area(
 }
 
 fn set_native_bounds(hwnd: HWND, position: (i64, i64), size: (u64, u64)) -> Result<(), String> {
+    // SAFETY: `hwnd` is the checked live top-level window, no insertion HWND is
+    // used with SWP_NOZORDER, and all dimensions are clamped to Win32 ranges.
     let success = unsafe {
         SetWindowPos(
             hwnd,
@@ -313,6 +408,7 @@ fn overlap_area(x: i64, y: i64, width: u64, height: u64, area: WorkArea) -> u64 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn removed_monitor_moves_window_into_primary_work_area() {
@@ -383,5 +479,47 @@ mod tests {
         assert_eq!(clamp_i64_to_i32(i64::MAX), i32::MAX);
         assert_eq!(clamp_i64_to_i32(i64::MIN), i32::MIN);
         assert_eq!(clamp_i64_to_i32(42), 42);
+    }
+
+    #[test]
+    fn untrusted_window_state_has_a_hard_read_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window-state.json");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_WINDOW_STATE_BYTES as usize + 1])
+            .unwrap();
+        drop(file);
+
+        let error = read_bounded_state(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn invalid_or_oversized_state_is_removed_before_plugin_setup() {
+        let directory = tempfile::tempdir().unwrap();
+        let incomplete = directory.path().join("incomplete.json");
+        std::fs::write(&incomplete, br#"{"main":{"width":1100,"height":750}}"#).unwrap();
+        sanitize_window_state_path(&incomplete).unwrap();
+        assert!(!incomplete.exists());
+
+        let invalid = directory.path().join("invalid.json");
+        std::fs::write(&invalid, b"not-json").unwrap();
+        sanitize_window_state_path(&invalid).unwrap();
+        assert!(!invalid.exists());
+
+        let oversized = directory.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_WINDOW_STATE_BYTES as usize + 1]).unwrap();
+        sanitize_window_state_path(&oversized).unwrap();
+        assert!(!oversized.exists());
+    }
+
+    #[test]
+    fn bounded_window_state_is_read_normally() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window-state.json");
+        std::fs::write(&path, br#"{"main":{"width":1100,"height":750}}"#).unwrap();
+
+        let bytes = read_bounded_state(&path).unwrap();
+        assert!(bytes.len() < MAX_WINDOW_STATE_BYTES as usize);
     }
 }

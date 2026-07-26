@@ -9,8 +9,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 cargo fmt --manifest-path .\src-tauri\Cargo.toml --all -- --check
-cargo clippy --manifest-path .\src-tauri\Cargo.toml --all-targets --no-default-features -- -D warnings
-cargo test --manifest-path .\src-tauri\Cargo.toml --no-default-features
+cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --all-targets --no-default-features -- -D warnings
+cargo test --locked --manifest-path .\src-tauri\Cargo.toml --no-default-features
 ```
 
 PASS anchor：每個命令 exit code 都是 0；Vitest 不得有 leaked Blob URL 測試失敗；Rust 競態測試必須確認最後 generation 的像素與名稱一致，不只是索引一致。16-bit PNG 測試必須證明先做色彩轉換、最後才量化成帶 ICC 的 RGBA8；Display P3 測試必須符合獨立 sRGB 參考值；CICP 與非 RGB ICC 必須走明確的轉換或可恢復錯誤，而等效 sRGB ICC 的普通圖片仍保留原始 bytes。

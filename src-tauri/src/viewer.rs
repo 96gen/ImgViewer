@@ -1,34 +1,39 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex, RwLock};
 use rand::random;
 
 use crate::catalog::{Catalog, build_catalog};
-use crate::decode::{MAX_DECODE_BYTES, ProductionDecoder};
-use crate::model::{
-    DecodedRender, NavigationDirection, RenderDescriptor, ViewerError, ViewerSnapshot, ViewerStatus,
-};
+use crate::decode::{MAX_DECODE_BYTES, ProductionDecoder, open_read_only};
+use crate::error::{ViewerError, code as error_code};
+use crate::model::DecodedRender;
+use crate::policy::DecodePolicy;
+use crate::protocol::{NavigationDirection, RenderDescriptor, ViewerSnapshot, ViewerStatus};
 
 type EventSink = Arc<dyn Fn(ViewerSnapshot) + Send + Sync + 'static>;
 const MAX_SAFE_RENDER_ID: u64 = (1_u64 << 53) - 1;
 
 pub(crate) trait Decoder: Send + Sync + 'static {
-    fn decode(&self, path: &Path) -> Result<DecodedRender, ViewerError>;
+    fn decode(&self, path: &Path, file: File) -> Result<DecodedRender, ViewerError>;
 }
 
 impl Decoder for ProductionDecoder {
-    fn decode(&self, path: &Path) -> Result<DecodedRender, ViewerError> {
-        ProductionDecoder::decode(self, path)
+    fn decode(&self, path: &Path, file: File) -> Result<DecodedRender, ViewerError> {
+        ProductionDecoder::decode(self, path, file)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct DecodeJob {
     generation: u64,
     path: PathBuf,
+    source: Result<File, ViewerError>,
 }
 
 struct RenderCache {
@@ -55,9 +60,10 @@ impl RenderCache {
         let size = bytes.len() as u64;
         if size > self.limit || self.used.saturating_add(size) > self.limit {
             return Err(ViewerError::limit(
-                "cache_limit_exceeded",
+                error_code::CACHE_LIMIT_EXCEEDED,
                 "轉譯快取超過 512 MiB 上限。",
-            ));
+            )
+            .with_parameter("maxBytes", self.limit));
         }
         // JavaScript numbers preserve integers exactly only through 2^53 - 1.
         // Keeping the opaque token in that range prevents invoke argument
@@ -80,22 +86,26 @@ impl RenderCache {
 
 struct ViewerState {
     generation: u64,
+    revision: u64,
     files: Vec<PathBuf>,
     index: Option<usize>,
     snapshot: ViewerSnapshot,
     pending: Option<DecodeJob>,
     renders: RenderCache,
+    shutdown_requested: bool,
 }
 
 impl ViewerState {
     fn new() -> Self {
         Self {
             generation: 0,
+            revision: 0,
             files: Vec::new(),
             index: None,
             snapshot: ViewerSnapshot::empty(),
             pending: None,
             renders: RenderCache::new(MAX_DECODE_BYTES),
+            shutdown_requested: false,
         }
     }
 
@@ -104,16 +114,34 @@ impl ViewerState {
         self.generation
     }
 
+    fn next_revision(&mut self) -> u64 {
+        self.revision = self.revision.wrapping_add(1).max(1);
+        self.revision
+    }
+
     fn schedule_current(&mut self) -> ViewerSnapshot {
         let index = self.index.expect("a selected catalog item");
         let path = self.files[index].clone();
         let generation = self.next_generation();
+        let revision = self.next_revision();
         self.renders.clear();
-        self.snapshot =
-            ViewerSnapshot::loading(generation, index, self.files.len(), display_name(&path));
+        self.snapshot = ViewerSnapshot::loading(
+            generation,
+            revision,
+            index,
+            self.files.len(),
+            display_name(&path),
+        );
         // This assignment is the replaceable one-item pending queue. If a job
-        // is currently decoding, repeated navigation overwrites only this slot.
-        self.pending = Some(DecodeJob { generation, path });
+        // is currently decoding, repeated navigation overwrites only this slot
+        // and drops the superseded handle. Opening here pins the selected file
+        // identity before the worker can observe a path replacement.
+        let source = open_read_only(&path);
+        self.pending = Some(DecodeJob {
+            generation,
+            path,
+            source,
+        });
         self.snapshot.clone()
     }
 
@@ -128,12 +156,51 @@ struct Inner {
     state: Mutex<ViewerState>,
     wake_worker: Condvar,
     decoder: Arc<dyn Decoder>,
+    policy: DecodePolicy,
     event_sink: RwLock<Option<EventSink>>,
+}
+
+struct WorkerLifecycle {
+    inner: Arc<Inner>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl WorkerLifecycle {
+    fn shutdown(&self) {
+        let Some(worker) = self.worker.lock().take() else {
+            return;
+        };
+        {
+            let mut state = self.inner.state.lock();
+            state.shutdown_requested = true;
+            state.pending = None;
+            state.renders.clear();
+        }
+        self.inner.wake_worker.notify_all();
+
+        // The worker never owns WorkerLifecycle, so normal shutdown cannot run
+        // on the worker itself. Keep this guard for defensive idempotence.
+        if worker.thread().id() != thread::current().id()
+            && let Err(payload) = worker.join()
+        {
+            eprintln!(
+                "ImgViewer decode worker terminated unexpectedly: {}",
+                panic_payload_name(payload.as_ref())
+            );
+        }
+    }
+}
+
+impl Drop for WorkerLifecycle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 #[derive(Clone)]
 pub struct ViewerController {
     inner: Arc<Inner>,
+    lifecycle: Arc<WorkerLifecycle>,
 }
 
 impl Default for ViewerController {
@@ -148,18 +215,27 @@ impl ViewerController {
     }
 
     fn with_decoder(decoder: Arc<dyn Decoder>) -> Self {
+        Self::with_decoder_and_policy(decoder, DecodePolicy::default())
+    }
+
+    fn with_decoder_and_policy(decoder: Arc<dyn Decoder>, policy: DecodePolicy) -> Self {
         let inner = Arc::new(Inner {
             state: Mutex::new(ViewerState::new()),
             wake_worker: Condvar::new(),
             decoder,
+            policy,
             event_sink: RwLock::new(None),
         });
         let worker_inner = Arc::clone(&inner);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("imgviewer-decode".to_owned())
             .spawn(move || decode_worker(worker_inner))
             .expect("failed to start the image decode worker");
-        Self { inner }
+        let lifecycle = Arc::new(WorkerLifecycle {
+            inner: Arc::clone(&inner),
+            worker: Mutex::new(Some(worker)),
+        });
+        Self { inner, lifecycle }
     }
 
     pub fn set_event_sink(&self, sink: impl Fn(ViewerSnapshot) + Send + Sync + 'static) {
@@ -172,6 +248,9 @@ impl ViewerController {
             Ok(Catalog { files, index }) => {
                 let snapshot = {
                     let mut state = self.inner.state.lock();
+                    if state.shutdown_requested {
+                        return state.snapshot.clone();
+                    }
                     state.files = files;
                     state.index = Some(index);
                     state.schedule_current()
@@ -181,13 +260,18 @@ impl ViewerController {
             }
             Err(error) => {
                 let mut state = self.inner.state.lock();
+                if state.shutdown_requested {
+                    return state.snapshot.clone();
+                }
                 let generation = state.next_generation();
+                let revision = state.next_revision();
                 state.files.clear();
                 state.index = None;
                 state.pending = None;
                 state.renders.clear();
                 state.snapshot = ViewerSnapshot::open_error(
                     generation,
+                    revision,
                     path.file_name()
                         .map(|name| name.to_string_lossy().into_owned()),
                     error,
@@ -201,6 +285,9 @@ impl ViewerController {
         let mut scheduled = false;
         let snapshot = {
             let mut state = self.inner.state.lock();
+            if state.shutdown_requested {
+                return state.snapshot.clone();
+            }
             let Some(current) = state.index else {
                 return state.snapshot.clone();
             };
@@ -230,28 +317,58 @@ impl ViewerController {
     pub fn take_render(&self, render_id: u64) -> Option<Vec<u8>> {
         self.inner.state.lock().renders.take(render_id)
     }
+
+    /// Stops the decode worker and waits for an in-process decode to return.
+    ///
+    /// The deadline is intentionally a soft policy until native codecs run in
+    /// a helper process: Rust cannot safely terminate a thread inside codec
+    /// code. Calling this method is idempotent.
+    pub fn shutdown(&self) {
+        self.lifecycle.shutdown();
+    }
 }
 
 fn decode_worker(inner: Arc<Inner>) {
     loop {
         let job = {
             let mut state = inner.state.lock();
-            while state.pending.is_none() {
+            while state.pending.is_none() && !state.shutdown_requested {
                 inner.wake_worker.wait(&mut state);
+            }
+            if state.shutdown_requested {
+                return;
             }
             state.pending.take().expect("pending job after wait")
         };
 
-        let result = inner.decoder.decode(&job.path);
+        let is_current = {
+            let state = inner.state.lock();
+            !state.shutdown_requested
+                && state.generation == job.generation
+                && state.selected_path() == Some(job.path.as_path())
+        };
+        if !is_current {
+            continue;
+        }
+
+        let DecodeJob {
+            generation,
+            path,
+            source,
+        } = job;
+        let result = decode_with_policy(&inner, &path, source);
         let snapshot = {
             let mut state = inner.state.lock();
-            if state.generation != job.generation
-                || state.selected_path() != Some(job.path.as_path())
-            {
+            if state.shutdown_requested {
+                return;
+            }
+            if state.generation != generation || state.selected_path() != Some(path.as_path()) {
                 // A newer cursor won the race. Do not write bytes, errors, or
                 // tokens from this obsolete generation into shared state.
                 None
             } else {
+                let revision = state.next_revision();
+                state.snapshot.revision = revision;
                 match result {
                     Ok(decoded) => {
                         let descriptor = match state.renders.insert(decoded.bytes) {
@@ -288,10 +405,46 @@ fn decode_worker(inner: Arc<Inner>) {
 
         if let Some(snapshot) = snapshot {
             let sink = inner.event_sink.read().clone();
-            if let Some(sink) = sink {
-                sink(snapshot);
+            if let Some(sink) = sink
+                && catch_unwind(AssertUnwindSafe(|| sink(snapshot))).is_err()
+            {
+                eprintln!("ImgViewer ignored a panic from the snapshot event sink.");
             }
         }
+    }
+}
+
+fn decode_with_policy(
+    inner: &Inner,
+    path: &Path,
+    source: Result<File, ViewerError>,
+) -> Result<DecodedRender, ViewerError> {
+    let file = source?;
+    // Queue latency belongs to an older in-process decode and must not consume
+    // the latest image's own decode budget. The hard-isolation milestone will
+    // enforce the same boundary in the helper process.
+    let deadline = inner.policy.deadline_from(Instant::now());
+    if deadline.is_expired(Instant::now()) {
+        return Err(ViewerError::deadline_exceeded(deadline.limit_ms()));
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| inner.decoder.decode(path, file)))
+        .unwrap_or_else(|_| Err(ViewerError::decoder_panic()));
+
+    if deadline.is_expired(Instant::now()) {
+        Err(ViewerError::deadline_exceeded(deadline.limit_ms()))
+    } else {
+        result
+    }
+}
+
+fn panic_payload_name(payload: &(dyn std::any::Any + Send)) -> &'static str {
+    if payload.is::<&'static str>() {
+        "static string panic"
+    } else if payload.is::<String>() {
+        "string panic"
+    } else {
+        "non-string panic"
     }
 }
 
@@ -305,7 +458,9 @@ fn display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ColorType, ImageEncoder};
     use std::fs::{self, File};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::time::{Duration, Instant};
 
@@ -315,7 +470,7 @@ mod tests {
     }
 
     impl Decoder for ControlledDecoder {
-        fn decode(&self, path: &Path) -> Result<DecodedRender, ViewerError> {
+        fn decode(&self, path: &Path, _file: File) -> Result<DecodedRender, ViewerError> {
             let name = display_name(path);
             self.started.send(name.clone()).unwrap();
             if name == "1.jpg" {
@@ -359,6 +514,7 @@ mod tests {
         let first = controller.open_path(directory.path().join("1.jpg"));
         let stopped = controller.navigate(NavigationDirection::Previous);
         assert_eq!(first.generation, stopped.generation);
+        assert_eq!(first.revision, stopped.revision);
         assert_eq!(stopped.index, Some(0));
         assert!(!stopped.can_previous);
         assert!(!stopped.can_next);
@@ -382,12 +538,15 @@ mod tests {
 
         let first = controller.open_path(directory.path().join("1.jpg"));
         assert_eq!(first.generation, 1);
+        assert_eq!(first.revision, 1);
         assert_eq!(
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             "1.jpg"
         );
         let second = controller.navigate(NavigationDirection::Next);
         let third = controller.navigate(NavigationDirection::Next);
+        assert_eq!(second.revision, 2);
+        assert_eq!(third.revision, 3);
         assert_eq!(second.file_name.as_deref(), Some("2.jpg"));
         assert_eq!(third.file_name.as_deref(), Some("3.jpg"));
         release_tx.send(()).unwrap();
@@ -400,6 +559,7 @@ mod tests {
         assert!(started_rx.recv_timeout(Duration::from_millis(50)).is_err());
         let ready = wait_until_ready(&controller);
         assert_eq!(ready.generation, third.generation);
+        assert_eq!(ready.revision, 4);
         assert_eq!(ready.index, Some(2));
         assert_eq!(ready.file_name.as_deref(), Some("3.jpg"));
         let token = ready.render.unwrap().render_id;
@@ -410,6 +570,81 @@ mod tests {
         }
         assert_eq!(controller.take_render(token).unwrap(), b"3.jpg");
         assert_eq!(controller.inner.state.lock().renders.used, 0);
+    }
+
+    struct GatedProductionDecoder {
+        started: Sender<String>,
+        release_first: Mutex<Receiver<()>>,
+    }
+
+    impl Decoder for GatedProductionDecoder {
+        fn decode(&self, path: &Path, file: File) -> Result<DecodedRender, ViewerError> {
+            let name = display_name(path);
+            self.started.send(name.clone()).unwrap();
+            if name == "1.png" {
+                self.release_first
+                    .lock()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            ProductionDecoder.decode(path, file)
+        }
+    }
+
+    fn test_png_bytes(color: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&color, 1, 1, ColorType::Rgba8.into())
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn scheduled_file_handle_survives_path_replacement_and_is_released_after_decode() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("1.png");
+        let second_path = directory.path().join("2.png");
+        let pinned_path = directory.path().join("pinned-original.bin");
+        let selected_original = test_png_bytes([1, 2, 3, 255]);
+        let path_replacement = test_png_bytes([200, 100, 50, 255]);
+        fs::write(&first_path, test_png_bytes([9, 8, 7, 255])).unwrap();
+        fs::write(&second_path, &selected_original).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let controller = ViewerController::with_decoder(Arc::new(GatedProductionDecoder {
+            started: started_tx,
+            release_first: Mutex::new(release_rx),
+        }));
+
+        controller.open_path(&first_path);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "1.png"
+        );
+        controller.navigate(NavigationDirection::Next);
+
+        // navigate() has already opened 2.png read-only and placed that exact
+        // handle in the pending job. Replacing the directory entry must not
+        // redirect the worker to these newer bytes.
+        fs::rename(&second_path, &pinned_path).unwrap();
+        fs::write(&second_path, path_replacement).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "2.png"
+        );
+        let ready = wait_until_ready(&controller);
+        assert_eq!(ready.status, ViewerStatus::Ready);
+        assert_eq!(ready.file_name.as_deref(), Some("2.png"));
+        assert_eq!(
+            controller.take_render(ready.render.unwrap().render_id),
+            Some(selected_original)
+        );
+
+        // The decoder consumes and drops the sole job handle before publishing
+        // Ready, so the original file can now be removed on Windows.
+        fs::remove_file(&pinned_path).unwrap();
     }
 
     #[test]
@@ -463,10 +698,7 @@ mod tests {
     struct FileNameDecoder;
 
     impl Decoder for FileNameDecoder {
-        fn decode(&self, path: &Path) -> Result<DecodedRender, ViewerError> {
-            if !path.exists() {
-                return Err(ViewerError::io("檔案已被刪除。"));
-            }
+        fn decode(&self, path: &Path, _file: File) -> Result<DecodedRender, ViewerError> {
             Ok(DecodedRender {
                 bytes: display_name(path).into_bytes(),
                 mime_type: "image/png",
@@ -494,11 +726,137 @@ mod tests {
         assert_eq!(error.status, ViewerStatus::Error);
         assert!(error.can_previous);
         assert_eq!(error.file_name.as_deref(), Some("2.png"));
+        assert_eq!(
+            error.error.as_ref().map(|error| error.code.as_str()),
+            Some(error_code::IO_ERROR)
+        );
 
         controller.navigate(NavigationDirection::Previous);
         let recovered = wait_until_ready(&controller);
         assert_eq!(recovered.status, ViewerStatus::Ready);
         assert_eq!(recovered.file_name.as_deref(), Some("1.png"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reparse_replacement_after_catalog_is_rejected_before_decoder_reads_target() {
+        use std::os::windows::fs::symlink_file;
+
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("1.png");
+        let second_path = directory.path().join("2.png");
+        let target_path = directory.path().join("private-target.bin");
+        fs::write(&first_path, b"first").unwrap();
+        fs::write(&second_path, b"ordinary-at-catalog-time").unwrap();
+        fs::write(&target_path, b"must-not-reach-decoder").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = ViewerController::with_decoder(Arc::new(CountingDecoder {
+            calls: Arc::clone(&calls),
+        }));
+
+        controller.open_path(&first_path);
+        assert_eq!(wait_until_ready(&controller).status, ViewerStatus::Ready);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        fs::remove_file(&second_path).unwrap();
+        match symlink_file(&target_path, &second_path) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                eprintln!("skipping symlink assertion without Windows privilege: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to create test symlink: {error}"),
+        }
+
+        controller.navigate(NavigationDirection::Next);
+        let rejected = wait_until_ready(&controller);
+        assert_eq!(rejected.status, ViewerStatus::Error);
+        assert_eq!(rejected.file_name.as_deref(), Some("2.png"));
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.code.as_str()),
+            Some("reparse_point_not_allowed")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "reparse target reached decoder code"
+        );
+
+        controller.navigate(NavigationDirection::Previous);
+        assert_eq!(wait_until_ready(&controller).status, ViewerStatus::Ready);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ancestor_directory_replacement_after_catalog_is_rejected_before_open() {
+        use std::os::windows::fs::symlink_dir;
+        use std::process::Command;
+
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        let root = tempfile::tempdir().unwrap();
+        let catalog_directory = root.path().join("photos");
+        let original_directory = root.path().join("photos-original");
+        let redirect_directory = root.path().join("redirect");
+        fs::create_dir(&catalog_directory).unwrap();
+        fs::create_dir(&redirect_directory).unwrap();
+        let first_path = catalog_directory.join("1.png");
+        let second_path = catalog_directory.join("2.png");
+        fs::write(&first_path, b"first").unwrap();
+        fs::write(&second_path, b"ordinary-at-catalog-time").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = ViewerController::with_decoder(Arc::new(CountingDecoder {
+            calls: Arc::clone(&calls),
+        }));
+        controller.open_path(&first_path);
+        assert_eq!(wait_until_ready(&controller).status, ViewerStatus::Ready);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        fs::rename(&catalog_directory, &original_directory).unwrap();
+        match symlink_dir(&redirect_directory, &catalog_directory) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                // NTFS directory junctions exercise the same ancestor reparse
+                // policy without requiring the symbolic-link privilege.
+                let output = Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(&catalog_directory)
+                    .arg(&redirect_directory)
+                    .output()
+                    .unwrap();
+                if !output.status.success() {
+                    fs::rename(&original_directory, &catalog_directory).unwrap();
+                    panic!(
+                        "failed to create test junction after symlink privilege error {error}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            Err(error) => {
+                fs::rename(&original_directory, &catalog_directory).unwrap();
+                panic!("failed to create test directory symlink: {error}");
+            }
+        }
+
+        controller.navigate(NavigationDirection::Next);
+        let rejected = wait_until_ready(&controller);
+        assert_eq!(rejected.status, ViewerStatus::Error);
+        assert_eq!(rejected.file_name.as_deref(), Some("2.png"));
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.code.as_str()),
+            Some("reparse_point_not_allowed")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "ancestor reparse target reached decoder code"
+        );
+
+        fs::remove_dir(&catalog_directory).unwrap();
+        fs::rename(&original_directory, &catalog_directory).unwrap();
     }
 
     #[test]
@@ -518,5 +876,238 @@ mod tests {
         assert_eq!(controller.take_render(old_token), None);
         let second = wait_until_ready(&controller);
         assert_eq!(second.file_name.as_deref(), Some("2.png"));
+    }
+
+    #[test]
+    fn every_published_snapshot_transition_advances_revision_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("1.png");
+        let second_path = directory.path().join("2.png");
+        fs::write(&first_path, b"one").unwrap();
+        fs::write(&second_path, b"two").unwrap();
+        let controller = ViewerController::with_decoder(Arc::new(FileNameDecoder));
+
+        let first_loading = controller.open_path(&first_path);
+        let first_ready = wait_until_ready(&controller);
+        let second_loading = controller.navigate(NavigationDirection::Next);
+        let second_ready = wait_until_ready(&controller);
+        let stopped = controller.navigate(NavigationDirection::Next);
+
+        assert_eq!(
+            [
+                first_loading.revision,
+                first_ready.revision,
+                second_loading.revision,
+                second_ready.revision,
+            ],
+            [1, 2, 3, 4]
+        );
+        assert_eq!(first_loading.generation, first_ready.generation);
+        assert_eq!(second_loading.generation, second_ready.generation);
+        assert_eq!(stopped.revision, second_ready.revision);
+        assert_eq!(stopped.generation, second_ready.generation);
+    }
+
+    #[test]
+    fn open_errors_advance_generation_and_revision_without_exposing_a_path() {
+        let controller = ViewerController::with_decoder(Arc::new(FileNameDecoder));
+        let first = controller.open_path("unsupported.bmp");
+        let second = controller.open_path("another.bmp");
+
+        assert_eq!((first.generation, first.revision), (1, 1));
+        assert_eq!((second.generation, second.revision), (2, 2));
+        assert_eq!(second.file_name.as_deref(), Some("another.bmp"));
+        assert!(
+            second
+                .error
+                .as_ref()
+                .is_some_and(|error| error.parameters.is_empty())
+        );
+    }
+
+    struct PanicOnceDecoder {
+        calls: AtomicUsize,
+    }
+
+    impl Decoder for PanicOnceDecoder {
+        fn decode(&self, path: &Path, _file: File) -> Result<DecodedRender, ViewerError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("simulated codec panic");
+            }
+            Ok(DecodedRender {
+                bytes: display_name(path).into_bytes(),
+                mime_type: "image/png",
+                width: 1,
+                height: 1,
+                animated: false,
+            })
+        }
+    }
+
+    #[test]
+    fn decoder_panic_becomes_a_recoverable_error_and_worker_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("1.png");
+        let second_path = directory.path().join("2.png");
+        fs::write(&first_path, b"one").unwrap();
+        fs::write(&second_path, b"two").unwrap();
+        let controller = ViewerController::with_decoder(Arc::new(PanicOnceDecoder {
+            calls: AtomicUsize::new(0),
+        }));
+
+        controller.open_path(&first_path);
+        let failed = wait_until_ready(&controller);
+        assert_eq!(failed.status, ViewerStatus::Error);
+        assert_eq!(
+            failed.error.as_ref().map(|error| error.code.as_str()),
+            Some(error_code::DECODER_PANIC)
+        );
+
+        controller.navigate(NavigationDirection::Next);
+        let recovered = wait_until_ready(&controller);
+        assert_eq!(recovered.status, ViewerStatus::Ready);
+        assert_eq!(recovered.file_name.as_deref(), Some("2.png"));
+        assert_eq!(recovered.revision, 4);
+    }
+
+    struct CountingDecoder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Decoder for CountingDecoder {
+        fn decode(&self, path: &Path, _file: File) -> Result<DecodedRender, ViewerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DecodedRender {
+                bytes: display_name(path).into_bytes(),
+                mime_type: "image/png",
+                width: 1,
+                height: 1,
+                animated: false,
+            })
+        }
+    }
+
+    #[test]
+    fn expired_pending_jobs_fail_closed_and_latest_cursor_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("1.png");
+        let second_path = directory.path().join("2.png");
+        fs::write(&first_path, b"one").unwrap();
+        fs::write(&second_path, b"two").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let controller = ViewerController::with_decoder_and_policy(
+            Arc::new(CountingDecoder {
+                calls: Arc::clone(&calls),
+            }),
+            DecodePolicy::with_max_decode_duration(Duration::ZERO),
+        );
+
+        controller.open_path(&first_path);
+        let latest_loading = controller.navigate(NavigationDirection::Next);
+        let latest = wait_until_ready(&controller);
+
+        assert_eq!(latest.generation, latest_loading.generation);
+        assert_eq!(latest.file_name.as_deref(), Some("2.png"));
+        assert_eq!(latest.status, ViewerStatus::Error);
+        let error = latest.error.unwrap();
+        assert_eq!(error.code, error_code::DECODE_DEADLINE_EXCEEDED);
+        assert_eq!(error.parameters["limitMs"], 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an already-expired job must not enter decoder code"
+        );
+    }
+
+    struct SlowDecoder;
+
+    impl Decoder for SlowDecoder {
+        fn decode(&self, path: &Path, _file: File) -> Result<DecodedRender, ViewerError> {
+            thread::sleep(Duration::from_millis(15));
+            Ok(DecodedRender {
+                bytes: display_name(path).into_bytes(),
+                mime_type: "image/png",
+                width: 1,
+                height: 1,
+                animated: false,
+            })
+        }
+    }
+
+    #[test]
+    fn decode_that_returns_after_soft_deadline_is_not_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("1.png");
+        fs::write(&path, b"one").unwrap();
+        let controller = ViewerController::with_decoder_and_policy(
+            Arc::new(SlowDecoder),
+            DecodePolicy::with_max_decode_duration(Duration::from_millis(1)),
+        );
+
+        controller.open_path(&path);
+        let expired = wait_until_ready(&controller);
+
+        assert_eq!(expired.status, ViewerStatus::Error);
+        assert_eq!(
+            expired.error.as_ref().map(|error| error.code.as_str()),
+            Some(error_code::DECODE_DEADLINE_EXCEEDED)
+        );
+        assert!(expired.render.is_none());
+    }
+
+    #[test]
+    fn stale_timeout_cannot_replace_a_newer_successful_decode() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["1.jpg", "2.jpg"] {
+            File::create(directory.path().join(name)).unwrap();
+        }
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let controller = ViewerController::with_decoder_and_policy(
+            Arc::new(ControlledDecoder {
+                started: started_tx,
+                release_first: Mutex::new(release_rx),
+            }),
+            DecodePolicy::with_max_decode_duration(Duration::from_millis(100)),
+        );
+
+        controller.open_path(directory.path().join("1.jpg"));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "1.jpg"
+        );
+        let latest_loading = controller.navigate(NavigationDirection::Next);
+        // This wait exhausts the first decode's budget while the latest job is
+        // pending. The latest job must receive a fresh budget when it starts.
+        thread::sleep(Duration::from_millis(125));
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "2.jpg"
+        );
+        let latest = wait_until_ready(&controller);
+        assert_eq!(latest.status, ViewerStatus::Ready);
+        assert_eq!(latest.generation, latest_loading.generation);
+        assert_eq!(latest.file_name.as_deref(), Some("2.jpg"));
+        assert_eq!(
+            controller.take_render(latest.render.unwrap().render_id),
+            Some(b"2.jpg".to_vec())
+        );
+    }
+
+    #[test]
+    fn explicit_shutdown_joins_worker_and_releases_its_shared_state() {
+        let controller = ViewerController::with_decoder(Arc::new(FileNameDecoder));
+        let inner = Arc::downgrade(&controller.inner);
+
+        controller.shutdown();
+        controller.shutdown();
+        drop(controller);
+
+        assert!(
+            inner.upgrade().is_none(),
+            "worker or lifecycle retained ViewerState after shutdown"
+        );
     }
 }

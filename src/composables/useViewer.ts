@@ -110,6 +110,7 @@ export function useViewer(
   const displayedImage = shallowRef<DisplayedImage | null>(null);
   const imageUrl = computed(() => displayedImage.value?.url ?? null);
   const clientError = shallowRef<string | null>(null);
+  const renderPending = shallowRef(false);
 
   const unlisteners: UnlistenFn[] = [];
   let requestedRenderId: number | null = null;
@@ -117,6 +118,7 @@ export function useViewer(
   let latestRenderRequest = 0;
   let renderReadQueue: Promise<void> = Promise.resolve();
   let newestGeneration = -1;
+  let newestRevision = -1;
   let pendingImage: PendingImage | null = null;
   let disposed = false;
 
@@ -139,6 +141,7 @@ export function useViewer(
     latestRenderRequest += 1;
     requestedRenderId = null;
     requestedGeneration = -1;
+    renderPending.value = false;
     if (pendingImage) retirePendingImage(pendingImage);
   };
 
@@ -146,7 +149,9 @@ export function useViewer(
     const current = snapshot.value;
     return (
       !disposed &&
+      candidate.revision === newestRevision &&
       candidate.generation === newestGeneration &&
+      current?.revision === candidate.revision &&
       current?.generation === candidate.generation &&
       current.status === "ready" &&
       current.render?.renderId === renderId
@@ -182,6 +187,10 @@ export function useViewer(
         descriptor.mimeType,
       );
       if (!nextUrl) return;
+      if (!isCurrentRender(candidate, renderId)) {
+        URL.revokeObjectURL(nextUrl);
+        return;
+      }
 
       let cancel!: () => void;
       const canceled = new Promise<void>((resolve) => {
@@ -194,6 +203,10 @@ export function useViewer(
         cancel,
         retired: false,
       };
+      if (!isCurrentRender(candidate, renderId)) {
+        retirePendingImage(next);
+        return;
+      }
       pendingImage = next;
 
       const outcome = await Promise.race([
@@ -235,7 +248,6 @@ export function useViewer(
         URL.revokeObjectURL(nextUrl);
       }
       if (isCurrentRender(candidate, renderId)) {
-        releaseDisplayedImage();
         clientError.value = messageFrom(error);
       }
     }
@@ -260,6 +272,7 @@ export function useViewer(
     const request = ++latestRenderRequest;
     requestedRenderId = descriptor.renderId;
     requestedGeneration = candidate.generation;
+    renderPending.value = true;
 
     // Binary invoke responses cannot be aborted. Serialize them and allow all
     // queued-but-not-started requests except the newest to expire, bounding
@@ -273,6 +286,7 @@ export function useViewer(
         if (request === latestRenderRequest) {
           requestedRenderId = null;
           requestedGeneration = -1;
+          renderPending.value = false;
         }
       });
     renderReadQueue = queued;
@@ -280,9 +294,29 @@ export function useViewer(
   };
 
   const applySnapshot = async (candidate: ViewerSnapshot) => {
-    if (disposed || candidate.generation < newestGeneration) return;
-
+    if (
+      disposed ||
+      candidate.revision < newestRevision ||
+      candidate.generation < newestGeneration
+    ) {
+      return;
+    }
     const current = snapshot.value;
+    const isLocalImageFailure =
+      candidate.revision === newestRevision &&
+      current?.status === "ready" &&
+      candidate.status === "error" &&
+      candidate.generation === current.generation &&
+      candidate.error?.code === "webview-image-error";
+    if (
+      candidate.revision === newestRevision &&
+      current &&
+      candidate !== current &&
+      !isLocalImageFailure
+    ) {
+      return;
+    }
+
     if (candidate.generation === newestGeneration && current) {
       const currentIsTerminal =
         current.status === "ready" || current.status === "error";
@@ -301,6 +335,7 @@ export function useViewer(
     }
 
     const generationChanged = candidate.generation > newestGeneration;
+    newestRevision = candidate.revision;
     if (generationChanged) {
       newestGeneration = candidate.generation;
       invalidateRenderRequests();
@@ -323,6 +358,10 @@ export function useViewer(
 
   const reportCommandError = (error: unknown) => {
     clientError.value = messageFrom(error);
+  };
+
+  const clearClientError = () => {
+    clientError.value = null;
   };
 
   const openPath = async (path: string) => {
@@ -373,7 +412,10 @@ export function useViewer(
     // snapshot. Otherwise a startup decode can finish in the gap and its
     // ready event can be lost.
     await rememberUnlistener(
-      bridge.listenSnapshot((next) => void applySnapshot(next)),
+      bridge.listenSnapshot(
+        (next) => void applySnapshot(next),
+        (error) => reportCommandError(error),
+      ),
     );
     void rememberUnlistener(
       bridge.listenFileDrop((path) => void openPath(path)),
@@ -407,6 +449,9 @@ export function useViewer(
     displayedImage,
     imageUrl,
     displayError,
+    clientError,
+    renderPending,
+    clearClientError,
     applySnapshot,
     chooseAndOpen,
     openPath,

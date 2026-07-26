@@ -399,9 +399,12 @@ function Send-ViewerKeys {
     param([IntPtr]$Window, [string]$Keys)
     [ImgViewerNativeSmoke]::MakeTopmost($Window)
     $rect = [ImgViewerNativeSmoke]::ReadRect($Window)
+    # Focus the WebView content instead of repeatedly clicking the title bar.
+    # Two title-bar clicks inside the Windows double-click interval maximize
+    # the window and make the geometry assertion fail for the wrong reason.
     [ImgViewerNativeSmoke]::LeftClick(
         [int][Math]::Floor(($rect.Left + $rect.Right) / 2),
-        [int]($rect.Top + 14)
+        [int][Math]::Floor(($rect.Top + $rect.Bottom) / 2)
     )
     [ImgViewerNativeSmoke]::SetForegroundWindow($Window) | Out-Null
     Start-Sleep -Milliseconds 100

@@ -1,0 +1,60 @@
+name: Security maintenance
+
+on:
+  schedule:
+    # Monday 04:00 Asia/Taipei (Sunday 20:00 UTC).
+    - cron: "0 20 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-maintenance
+  cancel-in-progress: false
+
+jobs:
+  dependency-audit:
+    name: Dependency advisories, licenses, and sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 11.9.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, toolchain pinned below
+        with:
+          toolchain: 1.88.0
+
+      - name: Install pinned Rust security tools
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Audit Rust advisories
+        run: cargo audit --file ./src-tauri/Cargo.lock
+
+      - name: Check Rust advisories, duplicate dependencies, licenses, and sources
+        run: cargo deny --manifest-path ./src-tauri/Cargo.toml --all-features check advisories bans licenses sources
+
+      - name: Audit production frontend dependencies
+        run: pnpm audit --prod --audit-level high
+
+      - name: Verify audits did not rewrite lockfiles
+        run: git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock

@@ -14,8 +14,8 @@ src-tauri/gen/
 .tools/
 vcpkg_installed/
 
-# Portable release output
-release/
+# Portable release output (root only; docs/release is source documentation)
+/release/
 
 # Native smoke and local diagnostics
 screenshots/

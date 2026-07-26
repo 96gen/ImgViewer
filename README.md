@@ -4,7 +4,8 @@ ImgViewer 是 Windows x64 專用的免安裝圖片瀏覽器。介面以 Vue 3 �
 
 ## 使用需求
 
-- Windows 10 22H2 x64 或 Windows 11 x64。
+- Windows 11 x64 是正式支援與安全驗收平台。Windows 10 22H2 x64
+  僅 best-effort，不阻擋 WebView2、Tauri 或 codec 的必要安全更新。
 - Microsoft Edge WebView2 Evergreen Runtime。支援版本的 Windows 通常已安裝；若系統提示缺少 runtime，請使用 Microsoft 的 [WebView2 Runtime 下載頁](https://developer.microsoft.com/microsoft-edge/webview2/consumer/) 安裝 Evergreen Runtime。
 - 不需要 Windows HEIF Image Extensions；ZIP 已包含 `libheif` 與 `libde265`。
 
@@ -29,16 +30,35 @@ ImgViewer 是 Windows x64 專用的免安裝圖片瀏覽器。介面以 Vue 3 �
 ## 效能與記憶體
 
 - 一般 JPG、8-bit PNG、GIF 與 WebP 只在 Rust 端驗證 magic、尺寸、方向及必要色彩 metadata，原始壓縮 bytes 直接交給 WebView2，避免預先建立第二份完整像素平面。
-- 必須轉成 8-bit sRGB PNG 的 TIFF、HEIC/HEIF、高位元或廣色域圖片，會在 PNG 編碼前提早釋放原始輸入與 native 解碼平面；色彩轉換重用單一 scanline buffer。
+- 必須轉成 8-bit sRGB PNG 的 TIFF、HEIC/HEIF、高位元或廣色域圖片，會在配置完整像素平面前，以 checked arithmetic 合併計算壓縮來源、native plane（含 32-bit float TIFF）、RGBA8、色彩轉換列與保守 PNG 輸出 reserve；已知大型緩衝區總和超過 512 MiB 即拒絕。實際流程仍會在 PNG 編碼前提早釋放原始輸入與 native 解碼平面。
 - binary IPC 讀取一次只允許一個在途；快速連續切圖時，尚未開始的舊 generation 會被最後目標覆蓋。候選 Blob 會先由 WebView2 預解碼，確認仍是最新 generation 後才原子換圖；舊 Blob 會保留到下一個畫面週期再撤銷。
 - 無閃切換期間最多短暫同時保留一張目前顯示圖與一張候選圖；過期候選會取消並立即回收，不做多張預載或長時間 crossfade。
 - 拖曳平移合併到每個 animation frame 更新一次；重複但尺寸未變的 ResizeObserver 通知不觸發重算。
 
 ## 安全與隱私
 
-ImgViewer 不含網路、遙測、更新器、shell 或一般檔案系統 API。WebView 會接收選檔或拖放產生的路徑，再交給只接受支援圖片格式的 `open_path` command；command 不驗證該路徑一定來自選檔器，因此這不是檔案存取 sandbox。WebView 沒有一般目錄列舉／讀寫 API，圖片內容則只透過一次性 binary render token 回傳。CSP 只允許本地內容、Tauri IPC 與圖片 `blob:` URL。
+ImgViewer 不含網路、遙測、更新器、shell 或一般檔案系統 API。WebView 會接收選檔或拖放產生的路徑，再交給只接受支援圖片格式的 `open_path` command；command 不驗證該路徑一定來自選檔器，因此這不是檔案存取 sandbox。WebView 沒有一般目錄列舉／讀寫 API，圖片內容則只透過一次性 binary render token 回傳。CSP 只允許本地內容、Tauri IPC 與圖片 `blob:` URL；原生導覽 hook 另會拒絕所有不在固定本地 origin 白名單內的頂層頁面。
 
-固定限制為：輸入檔 256 MiB、單邊 32,768 px、總像素 100,000,000、解碼配置 512 MiB。第一版不遞迴掃描、不監看資料夾，也不提供編輯、儲存、刪除、縮圖列、檔案關聯或安裝程式。
+固定限制為：輸入檔 256 MiB、單邊 32,768 px、總像素 100,000,000、已知解碼工作集 512 MiB；GIF／animated WebP 另限制 10,000 個 frame 與 1,000,000,000 累計 frame pixels。動畫原始 bytes 交給 WebView2 前，Rust 會先完整掃描 GIF image descriptor 或 WebP `ANMF` 結構，截斷、越界或超限都顯示可恢復錯誤。第一版不遞迴掃描、不監看資料夾，也不提供編輯、儲存、刪除、縮圖列、檔案關聯或安裝程式。
+
+為維持真正離線，UNC、網路、裝置路徑與 reparse point 會被拒絕。同步資料夾
+列舉最多檢查 100,000 個項目並保留 20,000 張圖片；超限會顯示可恢復錯誤。
+每次 navigation 開檔前會由磁碟 root 到檔案重新檢查 drive type 與 reparse
+component，最後檔案再以 no-follow flag 開啟。這可拒絕 catalog 建立後已被換成
+junction 的父資料夾，但檢查與 `CreateFile` 仍是兩個 Win32 操作；能主動搶在
+兩者之間反覆切換 reparse point 的本機攻擊者仍是已知競態，完整 component
+handle／broker 隔離列在 Roadmap。
+窗口狀態 JSON 在外掛載入前也有 64 KiB 上限。GIF／animated WebP 仍由
+WebView2 播放；結構型 frame／累計像素限制可先拒絕 frame bomb，但目前沒有
+helper process 能硬中止 WebView2 的動畫解碼，因此仍不宣稱已完全隔離
+animation CPU／codec hang DoS。
+
+解碼工作目前有 30 秒 soft deadline：超時返回的結果不會覆蓋畫面，但
+同 process 內卡死的 native codec 仍無法安全強制中止。TIFF／HEIF helper
+process 與 Windows Job Object 硬隔離列在 [Roadmap](ROADMAP.md)，此限制
+也記錄於 [威脅模型](THREAT_MODEL.md)。漏洞請依 [安全政策](SECURITY.md)
+私下回報；維護頻率與支援邊界分別見 [維護節奏](MAINTENANCE.md)、
+[支援政策](SUPPORT.md)。
 
 HDR 的 PQ/HLG transfer 與廣色域原色會轉進有限的 8-bit sRGB 顯示範圍；超出 SDR／sRGB 範圍的值會截斷，第一版不輸出 HDR，也不提供可調整的感知式 tone mapping。
 
@@ -48,7 +68,8 @@ HDR 的 PQ/HLG transfer 與廣色域原色會轉進有限的 8-bit sRGB 顯示�
 
 Windows 建置環境需要：
 
-- Node.js 20.19 以上與 `package.json` 指定的 pnpm 版本。
+- Node.js 24.18.0（見 `.node-version`）與 `package.json` 指定的 pnpm
+  版本。
 - Rust 1.88 以上的 MSVC toolchain（`image 0.25.10` 的最低需求）。
 - Visual Studio 2022 Build Tools，包含 Desktop development with C++、MSVC x64 tools、Windows SDK 與 VC++ Redistributable files。
 - Windows PowerShell 5.1 或 PowerShell 7，以及 Git。
@@ -60,8 +81,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 cargo fmt --manifest-path .\src-tauri\Cargo.toml --all -- --check
-cargo clippy --manifest-path .\src-tauri\Cargo.toml --all-targets --no-default-features -- -D warnings
-cargo test --manifest-path .\src-tauri\Cargo.toml --no-default-features
+cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --all-targets --no-default-features -- -D warnings
+cargo test --locked --manifest-path .\src-tauri\Cargo.toml --no-default-features
 ```
 
 原生窗口 smoke 不使用 WDIO、WebDriver 或測試外掛；它直接啟動正式 binary，以 Windows UI Automation 找到已顯示的圖片，再用 Win32 讀取原生窗口 rect：
@@ -94,7 +115,7 @@ $env:VCPKG_ROOT = "$PWD\.tools\vcpkg"
 $env:VCPKGRS_DYNAMIC = "1"
 $env:VCPKGRS_TRIPLET = "x64-windows"
 $env:PATH = "$nativeBin;$env:PATH"
-pnpm exec tauri dev --features heic
+pnpm run tauri dev --features heic
 ```
 
 `.tools/vcpkg` 固定為 tag `2026.05.25`。這是 annotated tag：tag object 是 `baddcee32f29086c2c1c1f002df5078e371f7934`，實際 checkout 與 `builtin-baseline` 必須使用 peeled commit `d015e31e90838a4c9dfa3eed45979bc70d9357fc`。專案內的 `vcpkg-overlays/ports/libheif` 保留該版本 port，僅在編譯時停用 libheif runtime plugin loading；HEIC 仍由內建註冊的 libde265 decoder 解碼，程式不會掃描外部 codec DLL。
@@ -115,7 +136,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 4. 用 `dumpbin /DEPENDENTS` 遞迴收集 vcpkg DLL 與必要 MSVC runtime。
 5. 移除外部搜尋路徑後再檢查 dependency closure 與禁止 codec 清單；任何未封裝的非系統 DLL 都會使發佈失敗。
 6. 對 stage binary 執行無 WebDriver 的 native smoke。
-7. 加入 README、MIT/LGPL 授權與來源版本通知，輸出 `release/ImgViewer-{version}-windows-x64.zip`。
+7. 加入 README、MIT/LGPL 授權、來源版本通知與 `BUILD_METADATA.json`，
+   輸出 ZIP、SHA-256 manifest 與 build metadata sidecar。
+
+GitHub 的 tag workflow 只建置一次並建立 draft release；CI 另產生並補強
+CycloneDX SBOM，且對 ZIP、checksum、metadata 與 SBOM 建立 artifact
+attestation。互動式 Windows 11 測試機必須下載同一份 ZIP、核對 digest
+並完成 packaged smoke，之後才可用該 digest 將 draft 升為正式 release；
+promotion 不會重新建置或替換資產。完整程序見
+[發布驗證指南](docs/release/README.md)。
 
 若測試已由同一個乾淨 commit 的 CI job 通過，可使用 `-SkipChecks`；它不會略過 native dependency 或 ZIP closure 驗證。`-SkipNativeSmoke` 只供沒有互動式桌面的 CI，或供稍後依上方命令手動執行同一個 smoke。完整的自動與人工驗證步驟見 [scripts/VERIFYING.md](scripts/VERIFYING.md)。
 

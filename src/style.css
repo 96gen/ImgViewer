@@ -120,6 +120,112 @@ button:focus-visible {
   font-size: 11px;
 }
 
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.about-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  cursor: pointer;
+  font-size: 18px;
+}
+
+.about-backdrop {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(0 0 0 / 58%);
+  user-select: text;
+}
+
+.about-dialog {
+  position: relative;
+  width: min(520px, 100%);
+  padding: 26px;
+  border: 1px solid #454a54;
+  border-radius: 12px;
+  background: #202329;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 45%);
+}
+
+.about-dialog h2 {
+  margin: 0 42px 8px 0;
+  color: #f6f7f9;
+  font-size: 20px;
+}
+
+.about-dialog p {
+  margin: 5px 0;
+  color: #c7cbd2;
+}
+
+.about-dialog .about-privacy {
+  margin-bottom: 20px;
+  color: #9ea4ae;
+  font-size: 13px;
+}
+
+.about-dialog label {
+  display: block;
+  margin-bottom: 6px;
+  color: #d5d8de;
+  font-size: 13px;
+}
+
+.release-url-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.release-url-row input {
+  min-width: 0;
+  height: 36px;
+  padding: 0 9px;
+  border: 1px solid #474c56;
+  border-radius: 7px;
+  color: #dce0e6;
+  background: #15171b;
+  font: 12px/1.2 Consolas, monospace;
+}
+
+.release-url-row button,
+.about-close {
+  border: 1px solid #4a505b;
+  border-radius: 7px;
+  color: #f0f2f5;
+  background: #30343c;
+  cursor: pointer;
+}
+
+.release-url-row button {
+  padding: 0 14px;
+}
+
+.about-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 32px;
+  height: 32px;
+  font-size: 21px;
+  line-height: 1;
+}
+
+.about-dialog small {
+  display: block;
+  min-height: 18px;
+  margin-top: 7px;
+  color: #9dcfff;
+}
+
 .viewer-area,
 .image-viewport {
   position: relative;
@@ -187,6 +293,49 @@ button:focus-visible {
   box-shadow: 0 3px 12px #0006;
   font-size: 12px;
   pointer-events: none;
+}
+
+.client-error-banner {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  z-index: 4;
+  display: flex;
+  max-width: min(620px, calc(100% - 180px));
+  min-height: 34px;
+  padding: 7px 8px 7px 12px;
+  transform: translateX(-50%);
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #985f39;
+  border-radius: 8px;
+  color: #ffe4d0;
+  background: #301f18f2;
+  box-shadow: 0 4px 16px #0008;
+  font-size: 13px;
+}
+
+.client-error-banner span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.client-error-banner button {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.client-error-banner button:hover {
+  background: #ffffff18;
 }
 
 .mini-spinner {

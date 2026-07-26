@@ -12,9 +12,12 @@ export interface RenderDescriptor {
 export interface ViewerError {
   code: string;
   message: string;
+  parameters: Record<string, string | number | boolean>;
 }
 
 export interface ViewerSnapshot {
+  protocolVersion: number;
+  revision: number;
   generation: number;
   status: ViewerStatus;
   index: number | null;

@@ -6,8 +6,13 @@ import type {
   NavigationDirection,
   ViewerSnapshot,
 } from "../types/viewer";
+import {
+  parseViewerSnapshot,
+  validateRenderBuffer,
+} from "./snapshotProtocol";
 
 export type SnapshotListener = (snapshot: ViewerSnapshot) => void;
+export type ProtocolErrorListener = (error: Error) => void;
 export type FileDropListener = (path: string) => void;
 
 export interface ViewerBridge {
@@ -16,7 +21,10 @@ export interface ViewerBridge {
   navigate(direction: NavigationDirection): Promise<ViewerSnapshot>;
   currentSnapshot(): Promise<ViewerSnapshot>;
   readRender(renderId: number): Promise<ArrayBuffer | ArrayBufferView>;
-  listenSnapshot(listener: SnapshotListener): Promise<UnlistenFn>;
+  listenSnapshot(
+    listener: SnapshotListener,
+    onProtocolError?: ProtocolErrorListener,
+  ): Promise<UnlistenFn>;
   listenFileDrop(listener: FileDropListener): Promise<UnlistenFn>;
 }
 
@@ -36,26 +44,34 @@ export const tauriViewerBridge: ViewerBridge = {
     return typeof result === "string" ? result : null;
   },
 
-  openPath(path) {
-    return invoke<ViewerSnapshot>("open_path", { path });
+  async openPath(path) {
+    return parseViewerSnapshot(await invoke<unknown>("open_path", { path }));
   },
 
-  navigate(direction) {
-    return invoke<ViewerSnapshot>("navigate", { direction });
+  async navigate(direction) {
+    return parseViewerSnapshot(await invoke<unknown>("navigate", { direction }));
   },
 
-  currentSnapshot() {
-    return invoke<ViewerSnapshot>("current_snapshot");
+  async currentSnapshot() {
+    return parseViewerSnapshot(await invoke<unknown>("current_snapshot"));
   },
 
-  readRender(renderId) {
-    return invoke<ArrayBuffer>("read_render", { renderId });
+  async readRender(renderId) {
+    return validateRenderBuffer(await invoke<unknown>("read_render", { renderId }));
   },
 
-  listenSnapshot(listener) {
-    return getCurrentWebviewWindow().listen<ViewerSnapshot>(
+  listenSnapshot(listener, onProtocolError) {
+    return getCurrentWebviewWindow().listen<unknown>(
       "viewer://snapshot",
-      (event) => listener(event.payload),
+      (event) => {
+        try {
+          listener(parseViewerSnapshot(event.payload));
+        } catch (error) {
+          onProtocolError?.(
+            error instanceof Error ? error : new Error("後端 snapshot 協定無效。"),
+          );
+        }
+      },
     );
   },
 
