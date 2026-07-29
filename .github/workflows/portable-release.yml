@@ -424,9 +424,18 @@ jobs:
           }
           Write-Host "PASS expected-failure=attestation-source-digest-mismatch"
           $sbom = Get-Content -LiteralPath "./release-assets/$artifactName.cdx.json" -Raw | ConvertFrom-Json
-          $nativeNames = @($sbom.components | ForEach-Object { [string]$_.name })
-          foreach ($required in @("libheif", "libde265")) {
-            if ($nativeNames -cnotcontains $required) {
+          $buildMetadata = Get-Content -LiteralPath "./release-assets/$artifactName.build.json" -Raw | ConvertFrom-Json
+          $componentNames = @($sbom.components | ForEach-Object { [string]$_.name })
+          $requiredComponents = @(
+            "imgviewer",
+            "imgviewer-codec-core",
+            "imgviewer-codec-helper",
+            "imgviewer-codec-protocol",
+            "libheif",
+            "libde265"
+          ) + @($buildMetadata.native.msvcRuntime | ForEach-Object { [string]$_.fileName })
+          foreach ($required in $requiredComponents) {
+            if ($componentNames -cnotcontains $required) {
               throw "CycloneDX SBOM is missing $required."
             }
           }

@@ -12,7 +12,15 @@ param(
     [switch]$RequireCleanSource,
     [switch]$SkipDllClosure,
     [switch]$RunNegativeTests,
-    [ValidateSet("None", "ChecksumMismatch", "MetadataVersionMismatch", "NativeHashMismatch", "MissingDll")]
+    [ValidateSet(
+        "None",
+        "ChecksumMismatch",
+        "MetadataVersionMismatch",
+        "NativeHashMismatch",
+        "MissingDll",
+        "MissingHelper",
+        "HelperHashMismatch"
+    )]
     [string]$NegativeMode = "None"
 )
 
@@ -147,7 +155,7 @@ function Assert-Metadata {
         [switch]$CleanSource
     )
 
-    if ([int]$Metadata.schemaVersion -ne 1) {
+    if ([int]$Metadata.schemaVersion -ne 2) {
         throw "Unsupported BUILD_METADATA schemaVersion: $($Metadata.schemaVersion)"
     }
     if ([string]$Metadata.application.name -cne "ImgViewer") {
@@ -184,6 +192,65 @@ function Assert-Metadata {
         }
         if ([string]::IsNullOrWhiteSpace([string]$Metadata.native.vcpkgToolVersion)) {
             throw "BUILD_METADATA does not report the pinned vcpkg-tool version."
+        }
+    }
+}
+
+function Assert-ExecutablePayloadHashes {
+    param(
+        [Parameter(Mandatory)] [psobject]$Metadata,
+        [Parameter(Mandatory)] [string]$StageDirectory
+    )
+
+    $executables = @($Metadata.executables)
+    if ($executables.Count -ne 2) {
+        throw "BUILD_METADATA must describe exactly the main and codec-helper executables."
+    }
+
+    $expectedFiles = [ordered]@{
+        "main" = "ImgViewer.exe"
+        "codec-helper" = "ImgViewer.CodecHelper.exe"
+    }
+    $seenRoles = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $protocolVersion = $null
+    foreach ($item in $executables) {
+        $role = [string]$item.role
+        if (-not $expectedFiles.Contains($role) -or -not $seenRoles.Add($role)) {
+            throw "BUILD_METADATA contains an invalid or duplicate executable role: $role"
+        }
+        $fileName = [string]$item.fileName
+        if ($fileName -cne [string]$expectedFiles[$role]) {
+            throw "BUILD_METADATA executable '$role' must name '$($expectedFiles[$role])'."
+        }
+        $itemProtocolVersion = [int]$item.protocolVersion
+        if ($itemProtocolVersion -lt 1) {
+            throw "BUILD_METADATA executable '$role' has an invalid protocol version."
+        }
+        if ($null -eq $protocolVersion) {
+            $protocolVersion = $itemProtocolVersion
+        } elseif ($itemProtocolVersion -ne $protocolVersion) {
+            throw "BUILD_METADATA executables disagree on the codec helper protocol version."
+        }
+
+        $expectedHash = ([string]$item.sha256).ToUpperInvariant()
+        if ($expectedHash -notmatch '^[0-9A-F]{64}$') {
+            throw "BUILD_METADATA contains an invalid executable SHA-256 for $fileName."
+        }
+        $payloadPath = Join-Path $StageDirectory $fileName
+        if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
+            throw "Executable payload named by BUILD_METADATA is missing: $fileName"
+        }
+        $actualHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($actualHash -cne $expectedHash) {
+            throw "Executable payload hash mismatch for $fileName. Metadata=$expectedHash Actual=$actualHash"
+        }
+    }
+
+    foreach ($role in $expectedFiles.Keys) {
+        if (-not $seenRoles.Contains($role)) {
+            throw "BUILD_METADATA is missing executable role: $role"
         }
     }
 }
@@ -235,6 +302,8 @@ function Invoke-DllClosure {
 
     $resolver = Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1"
     & $resolver -StageDirectory $StageDirectory -RequireBundledMsvcRuntime | Out-Null
+    $boundary = Join-Path $PSScriptRoot "Assert-CodecBinaryBoundary.ps1"
+    & $boundary -StageDirectory $StageDirectory | Out-Null
 }
 
 function Assert-ExpectedFailure {
@@ -304,6 +373,7 @@ try {
         $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
         foreach ($requiredEntry in @(
             "$artifactRoot/ImgViewer.exe",
+            "$artifactRoot/ImgViewer.CodecHelper.exe",
             "$artifactRoot/heif.dll",
             "$artifactRoot/libde265.dll",
             "$artifactRoot/LICENSE",
@@ -350,6 +420,7 @@ try {
     Assert-Metadata -Metadata $metadata -ArtifactFileName $artifactFileName `
         -Version $metadataVersion -Commit $ExpectedCommit -Tag $ExpectedTag `
         -CleanSource:$RequireCleanSource
+    Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $stageDirectory
     Assert-NativePayloadHashes -Metadata $metadata -StageDirectory $stageDirectory
 
     if ($MetadataPath) {
@@ -391,6 +462,36 @@ try {
         }
         return
     }
+    if ($NegativeMode -eq "MissingHelper") {
+        $negativeStage = Join-Path $temporaryRoot "missing-helper"
+        Copy-Item -LiteralPath $stageDirectory -Destination $negativeStage -Recurse
+        Remove-Item -LiteralPath (
+            Join-Path $negativeStage "ImgViewer.CodecHelper.exe"
+        ) -Force
+        Assert-ExpectedFailure -Name "missing-helper" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $negativeStage
+        }
+        return
+    }
+    if ($NegativeMode -eq "HelperHashMismatch") {
+        $negativeStage = Join-Path $temporaryRoot "helper-hash-mismatch"
+        Copy-Item -LiteralPath $stageDirectory -Destination $negativeStage -Recurse
+        $tamperedPath = Join-Path $negativeStage "ImgViewer.CodecHelper.exe"
+        $stream = [System.IO.File]::Open(
+            $tamperedPath,
+            [System.IO.FileMode]::Append,
+            [System.IO.FileAccess]::Write
+        )
+        try {
+            $stream.WriteByte(0)
+        } finally {
+            $stream.Dispose()
+        }
+        Assert-ExpectedFailure -Name "helper-hash-mismatch" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $negativeStage
+        }
+        return
+    }
 
     if (-not $SkipDllClosure) {
         Invoke-DllClosure -StageDirectory $stageDirectory
@@ -418,6 +519,30 @@ try {
         Assert-ExpectedFailure -Name "native-hash-mismatch" -Operation {
             Assert-NativePayloadHashes -Metadata $metadata -StageDirectory $negativeHashStage
         }
+        $missingHelperStage = Join-Path $temporaryRoot "missing-helper"
+        Copy-Item -LiteralPath $stageDirectory -Destination $missingHelperStage -Recurse
+        Remove-Item -LiteralPath (
+            Join-Path $missingHelperStage "ImgViewer.CodecHelper.exe"
+        ) -Force
+        Assert-ExpectedFailure -Name "missing-helper" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $missingHelperStage
+        }
+        $helperHashStage = Join-Path $temporaryRoot "helper-hash-mismatch"
+        Copy-Item -LiteralPath $stageDirectory -Destination $helperHashStage -Recurse
+        $tamperedHelper = Join-Path $helperHashStage "ImgViewer.CodecHelper.exe"
+        $stream = [System.IO.File]::Open(
+            $tamperedHelper,
+            [System.IO.FileMode]::Append,
+            [System.IO.FileAccess]::Write
+        )
+        try {
+            $stream.WriteByte(0)
+        } finally {
+            $stream.Dispose()
+        }
+        Assert-ExpectedFailure -Name "helper-hash-mismatch" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $helperHashStage
+        }
         if (-not $SkipDllClosure) {
             $negativeStage = Join-Path $temporaryRoot "missing-dll"
             Copy-Item -LiteralPath $stageDirectory -Destination $negativeStage -Recurse
@@ -428,7 +553,7 @@ try {
         }
     }
 
-    Write-Host "PASS portable-integrity version=$ExpectedVersion sha256=$artifactHash dll-closure=$(-not $SkipDllClosure)"
+    Write-Host "PASS portable-integrity version=$ExpectedVersion sha256=$artifactHash helper=verified dll-closure=$(-not $SkipDllClosure)"
     Write-Output $artifactHash
 } finally {
     if (Test-Path -LiteralPath $temporaryRoot) {

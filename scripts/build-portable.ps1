@@ -111,6 +111,15 @@ $vcpkgProjectVersion = [string]$vcpkgManifest.'version-string'
 $versionSources = [ordered]@{
     "src-tauri/tauri.conf.json" = $version
     "src-tauri/Cargo.toml" = $cargoVersion
+    "src-tauri/crates/codec-core/Cargo.toml" = Get-CargoPackageVersion -ManifestPath (
+        Join-Path $repoRoot "src-tauri\crates\codec-core\Cargo.toml"
+    )
+    "src-tauri/crates/codec-helper/Cargo.toml" = Get-CargoPackageVersion -ManifestPath (
+        Join-Path $repoRoot "src-tauri\crates\codec-helper\Cargo.toml"
+    )
+    "src-tauri/crates/codec-protocol/Cargo.toml" = Get-CargoPackageVersion -ManifestPath (
+        Join-Path $repoRoot "src-tauri\crates\codec-protocol\Cargo.toml"
+    )
     "package.json" = $packageVersion
     "vcpkg.json" = $vcpkgProjectVersion
 }
@@ -121,6 +130,18 @@ $mismatchedVersions = @(
 )
 if ($mismatchedVersions.Count -gt 0) {
     throw "ImgViewer version mismatch. Expected $version; found $($mismatchedVersions -join ', ')."
+}
+
+$codecProtocolSource = Get-Content -LiteralPath (
+    Join-Path $repoRoot "src-tauri\crates\codec-protocol\src\lib.rs"
+) -Raw
+if ($codecProtocolSource -notmatch
+    'pub\s+const\s+PROTOCOL_VERSION\s*:\s*u16\s*=\s*(?<version>\d+)\s*;') {
+    throw "Unable to read the codec helper protocol version."
+}
+$codecProtocolVersion = [int]$Matches.version
+if ($codecProtocolVersion -lt 1) {
+    throw "The codec helper protocol version must be positive."
 }
 
 $git = Get-Command git.exe -ErrorAction SilentlyContinue
@@ -254,8 +275,12 @@ try {
     Invoke-Checked $pnpm.Source install --frozen-lockfile
     if (-not $SkipChecks) {
         Invoke-Checked $pnpm.Source test
-        Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --all-targets --no-default-features --features heic "--" "-Dwarnings"
-        Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --no-default-features --features heic
+        Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --all-targets --no-default-features "--" "-Dwarnings"
+        Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --no-default-features
+        foreach ($codecPackage in @("imgviewer-codec-core", "imgviewer-codec-helper")) {
+            Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --all-targets --no-default-features --features heic "--" "-Dwarnings"
+            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic
+        }
     }
     # Execute the exact CLI installed by the frozen project lock. `pnpm exec`
     # depends on pnpm's global store/index being writable and has failed on
@@ -264,7 +289,10 @@ try {
     if (-not (Test-Path -LiteralPath $tauriCli -PathType Leaf)) {
         throw "The locked Tauri CLI shim is missing: node_modules\\.bin\\tauri.cmd"
     }
-    Invoke-Checked $tauriCli build --no-bundle --features heic "--" "--locked"
+    # The Tauri process intentionally has no native HEIF feature. Only the
+    # private helper below links libheif.
+    Invoke-Checked $tauriCli build --no-bundle "--" "--locked"
+    Invoke-Checked cargo build --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --release "--package" imgviewer-codec-helper --no-default-features --features heic
     if ($ReleaseMode) {
         $postBuildRevision = Invoke-Captured -FilePath $git.Source -Arguments @(
             "-C", $repoRoot, "rev-parse", "--verify", "HEAD"
@@ -297,6 +325,10 @@ $builtExe = Get-ChildItem -LiteralPath $releaseDirectory -File -Filter "*.exe" |
 if (-not $builtExe) {
     throw "Tauri build completed but ImgViewer.exe was not found in $releaseDirectory"
 }
+$builtHelper = Join-Path $releaseDirectory "imgviewer-codec-helper.exe"
+if (-not (Test-Path -LiteralPath $builtHelper -PathType Leaf)) {
+    throw "Codec helper build completed but imgviewer-codec-helper.exe was not found in $releaseDirectory"
+}
 
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -324,6 +356,9 @@ foreach ($oldOutput in @($zipPath, $checksumPath, $metadataPath, $sbomPath, $bas
 }
 New-Item -ItemType Directory -Path $stageDirectory | Out-Null
 Copy-Item -LiteralPath $builtExe.FullName -Destination (Join-Path $stageDirectory "ImgViewer.exe")
+Copy-Item -LiteralPath $builtHelper -Destination (
+    Join-Path $stageDirectory "ImgViewer.CodecHelper.exe"
+)
 
 & (Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1") `
     -StageDirectory $stageDirectory `
@@ -357,6 +392,11 @@ if ($forbiddenCodecFiles.Count -gt 0) {
     -RequireBundledMsvcRuntime | Write-Host
 if ($LASTEXITCODE -ne 0) {
     throw "Final DLL dependency closure validation failed."
+}
+& (Join-Path $PSScriptRoot "Assert-CodecBinaryBoundary.ps1") `
+    -StageDirectory $stageDirectory | Write-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Codec process import-boundary validation failed."
 }
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination $stageDirectory
@@ -477,13 +517,32 @@ $msvcRuntimeMetadata = @(
             }
         }
 )
+$executableMetadata = @(
+    [ordered]@{
+        role = "main"
+        fileName = "ImgViewer.exe"
+        protocolVersion = $codecProtocolVersion
+        sha256 = (Get-FileHash -LiteralPath (
+            Join-Path $stageDirectory "ImgViewer.exe"
+        ) -Algorithm SHA256).Hash
+    },
+    [ordered]@{
+        role = "codec-helper"
+        fileName = "ImgViewer.CodecHelper.exe"
+        protocolVersion = $codecProtocolVersion
+        sha256 = (Get-FileHash -LiteralPath (
+            Join-Path $stageDirectory "ImgViewer.CodecHelper.exe"
+        ) -Algorithm SHA256).Hash
+    }
+)
 $buildMetadata = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     application = [ordered]@{
         name = "ImgViewer"
         version = $version
         target = "windows-x64"
     }
+    executables = $executableMetadata
     artifact = [ordered]@{
         fileName = "$artifactName.zip"
         archiveRoot = $artifactName
@@ -552,6 +611,7 @@ try {
     $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
     foreach ($requiredEntry in @(
         "$artifactName/ImgViewer.exe",
+        "$artifactName/ImgViewer.CodecHelper.exe",
         "$artifactName/heif.dll",
         "$artifactName/libde265.dll",
         "$artifactName/LICENSE",

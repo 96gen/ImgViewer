@@ -11,6 +11,9 @@ pnpm build
 cargo fmt --manifest-path .\src-tauri\Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --workspace --all-targets --no-default-features -- -D warnings
 cargo test --locked --manifest-path .\src-tauri\Cargo.toml --workspace --no-default-features
+cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --all-targets --no-default-features --features heic -- -D warnings
+cargo test --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --no-default-features --features heic
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-release-contract.ps1
 ```
 
 PASS anchor：每個命令 exit code 都是 0；Vitest 不得有 leaked Blob URL 測試失敗；Rust 競態測試必須確認最後 generation 的像素與名稱一致，不只是索引一致。16-bit PNG 測試必須證明先做色彩轉換、最後才量化成帶 ICC 的 RGBA8；Display P3 測試必須符合獨立 sRGB 參考值；CICP 與非 RGB ICC 必須走明確的轉換或可恢復錯誤，而等效 sRGB ICC 的普通圖片仍保留原始 bytes。
@@ -70,9 +73,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 PASS anchor：
 
 - `release/ImgViewer-{version}-windows-x64.zip` 存在。
-- release gate 的 Clippy 與 Rust tests 都以 `--features heic` 通過，確實編譯並執行 native HEIC 路徑。
-- stage 內至少包含 `ImgViewer.exe`、`heif.dll`、`libde265.dll`、必要 `vcruntime*.dll` / `msvcp*.dll`、`README.md`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、`SOURCE_VERSIONS.txt` 與 `licenses/`。
+- release gate 先對全 workspace 跑無 HEIC 的 Clippy/tests，再對 codec core 與 helper 以 `--features heic` 編譯及測試 native HEIC 路徑；Tauri 主程式本身不得啟用 HEIC feature。
+- stage 內至少包含 `ImgViewer.exe`、`ImgViewer.CodecHelper.exe`、`heif.dll`、`libde265.dll`、必要 `vcruntime*.dll` / `msvcp*.dll`、`README.md`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、`SOURCE_VERSIONS.txt` 與 `licenses/`。
 - 腳本最後一次 dependency scan 顯示零個 unresolved non-system DLL。
+- `dumpbin /DEPENDENTS` 必須證明主程式不匯入 `heif.dll`／`libde265.dll`，且 helper 直接匯入 `heif.dll`。
+- `BUILD_METADATA.json` schema v2 必須包含 main/helper 的 role、SHA-256 與相同 codec protocol version；下載後驗證須拒絕 helper 遺失或 hash 不符。
+- CycloneDX SBOM 必須包含四個 Rust workspace crate、helper payload hash、libheif、libde265 與 MSVC runtime。
 - `SOURCE_VERSIONS.txt` 顯示 vcpkg commit `d015e31e90838a4c9dfa3eed45979bc70d9357fc`、libheif 1.21.2 與 libde265 1.0.18。
 - stage 不含 `x265.dll`、AOM/AVIF codec 或 WebView2 offline installer。
 
@@ -115,3 +121,4 @@ PASS anchor：兩台 VM 都不需安裝 ImgViewer 或 HEIF Extension即可解碼
 
   dependency scan 必須以 unresolved DLL 非零結束，不得誤報 PASS。
 - 將 PNG 改名成 `.jpg`：應回報格式偽裝，不得依副檔名直接顯示。
+- 暫時移走 `ImgViewer.CodecHelper.exe`，或修改其任一 byte：`verify-portable-release.ps1` 必須分別以 missing-helper 或 helper-hash-mismatch 拒絕。
