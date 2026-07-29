@@ -121,21 +121,30 @@ fn create_anonymous_pipe_read_handle() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions};
     use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::IntoRawHandle;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../tests/fixtures")
-            .join(name)
-    }
-
-    fn transferred_fixture() -> (u64, u64) {
-        let file = File::open(fixture("primary-second.heic")).unwrap();
+    fn transferred_unique_file(contents: &[u8]) -> (TempDir, PathBuf, u64, u64) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unique-handle.bin");
+        fs::write(&path, contents).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            // Deliberately deny FILE_SHARE_DELETE. Removing this unique path
+            // after an error proves that the transferred file object was
+            // closed without relying on a numeric HANDLE value that Windows
+            // may immediately recycle for an unrelated parallel test.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
         let length = file.metadata().unwrap().len();
         let raw = file.into_raw_handle() as usize as u64;
-        (raw, length)
+        (directory, path, raw, length)
     }
 
     #[test]
@@ -152,19 +161,19 @@ mod tests {
 
     #[test]
     fn exact_disk_handle_is_owned_and_closed_by_file_drop() {
-        let (raw, length) = transferred_fixture();
-        assert!(handle_is_open(raw));
+        let (_directory, path, raw, length) = transferred_unique_file(b"\0\0\0\x0cftypdata");
         let mut file = take_disk_file(raw, length).unwrap();
         let mut signature = [0_u8; 12];
         file.read_exact(&mut signature).unwrap();
         assert_eq!(&signature[4..8], b"ftyp");
         drop(file);
-        assert!(!handle_is_open(raw));
+        fs::remove_file(path).expect("dropping the owned File must release delete sharing");
     }
 
     #[test]
     fn length_mismatch_and_limit_errors_close_transferred_handle() {
-        let (mismatch_raw, length) = transferred_fixture();
+        let (_mismatch_directory, mismatch_path, mismatch_raw, length) =
+            transferred_unique_file(b"length-mismatch");
         assert_eq!(
             take_disk_file(mismatch_raw, length + 1).unwrap_err(),
             HandleError::LengthMismatch {
@@ -172,9 +181,11 @@ mod tests {
                 observed: length,
             }
         );
-        assert!(!handle_is_open(mismatch_raw));
+        fs::remove_file(mismatch_path)
+            .expect("length mismatch must release the transferred file object");
 
-        let (oversize_raw, _) = transferred_fixture();
+        let (_oversize_directory, oversize_path, oversize_raw, _) =
+            transferred_unique_file(b"oversize-expected-length");
         assert_eq!(
             take_disk_file(oversize_raw, MAX_INPUT_BYTES + 1).unwrap_err(),
             HandleError::FileTooLarge {
@@ -182,7 +193,8 @@ mod tests {
                 maximum: MAX_INPUT_BYTES,
             }
         );
-        assert!(!handle_is_open(oversize_raw));
+        fs::remove_file(oversize_path)
+            .expect("size limit must release the transferred file object");
     }
 
     #[test]
