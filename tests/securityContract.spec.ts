@@ -18,6 +18,10 @@ function filesBelow(path: string): string[] {
   });
 }
 
+function beforeTestModule(source: string) {
+  return source.split(/\r?\n#\[cfg\(test\)\]\r?\n/)[0];
+}
+
 describe("desktop security contract", () => {
   it("keeps the main window capability on an exact least-privilege allowlist", () => {
     const capability = JSON.parse(read("src-tauri/capabilities/main.json"));
@@ -177,19 +181,44 @@ describe("desktop security contract", () => {
       "imgviewer-codec-protocol",
     ]);
 
+    const protocolSource = read(
+      "src-tauri/crates/codec-protocol/src/lib.rs",
+    );
+    const helperLibrary = read("src-tauri/crates/codec-helper/src/lib.rs");
+    const helperMain = read("src-tauri/crates/codec-helper/src/main.rs");
+    const helperHandleAdapter = read(
+      "src-tauri/crates/codec-helper/src/windows_handle.rs",
+    );
     const helperSource = [
-      read("src-tauri/crates/codec-protocol/src/lib.rs"),
-      read("src-tauri/crates/codec-helper/src/lib.rs"),
-      read("src-tauri/crates/codec-helper/src/main.rs"),
+      protocolSource,
+      helperLibrary,
+      helperMain,
+      helperHandleAdapter,
     ].join("\n");
-    expect(helperSource.match(/#!\[forbid\(unsafe_code\)\]/g)).toHaveLength(3);
+    expect(protocolSource).toContain("#![forbid(unsafe_code)]");
+    expect(helperMain).toContain("#![forbid(unsafe_code)]");
+    expect(helperLibrary).toContain("#![deny(unsafe_code)]");
+    expect(helperLibrary).toMatch(
+      /#\[allow\(\s*unsafe_code,\s*reason = "the explicit Windows handle adapter owns all transferred raw handles"\s*\)\]\s*mod windows_handle;/,
+    );
     expect(
       `${coreManifest}\n${protocolManifest}\n${helperManifest}\n${helperSource}`,
     ).not.toMatch(
       /\b(?:tauri|reqwest|hyper|ureq|curl|tokio|async_std|smol)\b|https?:\/\/|std::process::Command|cmd\.exe|powershell/i,
     );
-    expect(helperSource).not.toMatch(
-      /\b(?:Path|PathBuf)\b|std::fs|File::open/,
+    const helperProductionSource = [
+      beforeTestModule(helperLibrary),
+      helperMain,
+      beforeTestModule(helperHandleAdapter),
+    ].join("\n");
+    expect(helperProductionSource).not.toMatch(
+      /\b(?:Path|PathBuf|OpenOptions)\b|File::open/,
+    );
+    expect(helperProductionSource).toContain(
+      "File::from_raw_handle(handle)",
+    );
+    expect(helperProductionSource).toContain(
+      "take_disk_file(request.duplicated_handle, request.expected_length)",
     );
     expect(helperSource).toContain("validate_cli_arguments(std::env::args_os())");
     expect(helperSource).toContain("CliError::UnexpectedArgument");
@@ -202,6 +231,55 @@ describe("desktop security contract", () => {
         "--workspace",
       );
     }
+  });
+
+  it("keeps unsafe Rust inside reviewed Win32 and codec FFI adapters", () => {
+    const rustPaths = [
+      ...filesBelow("src-tauri/src"),
+      ...filesBelow("src-tauri/crates"),
+    ].filter((path) => path.endsWith(".rs"));
+    const unsafeFiles = rustPaths
+      .filter((path) => /\bunsafe\s*(?:\{|extern\b)/.test(read(path)))
+      .map((path) => path.replaceAll("\\", "/"))
+      .sort();
+    expect(unsafeFiles).toEqual(
+      [
+        "src-tauri/crates/codec-core/src/heif_ffi_adapter.rs",
+        "src-tauri/crates/codec-helper/src/windows_handle.rs",
+        "src-tauri/src/catalog.rs",
+        "src-tauri/src/codec_helper/windows.rs",
+        "src-tauri/src/window.rs",
+      ].sort(),
+    );
+
+    for (const path of unsafeFiles) {
+      const lines = read(path).split(/\r?\n/);
+      for (const [index, line] of lines.entries()) {
+        if (!/\bunsafe\s*(?:\{|extern\b)/.test(line)) {
+          continue;
+        }
+        const safetyContext = lines
+          .slice(Math.max(0, index - 4), index)
+          .join("\n");
+        expect(
+          safetyContext,
+          `${path}:${index + 1} 缺少就近 SAFETY 理由`,
+        ).toContain("SAFETY:");
+      }
+    }
+
+    expect(read("src-tauri/src/lib.rs")).toContain(
+      "#![deny(unsafe_code)]",
+    );
+    expect(read("src-tauri/crates/codec-core/src/lib.rs")).toContain(
+      "#![deny(unsafe_code)]",
+    );
+    expect(read("src-tauri/crates/codec-helper/src/lib.rs")).toContain(
+      "#![deny(unsafe_code)]",
+    );
+    expect(read("src-tauri/crates/codec-protocol/src/lib.rs")).toContain(
+      "#![forbid(unsafe_code)]",
+    );
   });
 
   it("pins the local and CI toolchains and uses locked Cargo graphs", () => {
