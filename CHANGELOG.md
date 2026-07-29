@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- HEIC／HEIF 原生解碼移入固定同目錄的私有 helper process；主程式只傳
+  duplicated read-only handle，不傳本機路徑、任意 command line 或輸出路徑。
+- helper 與主程式使用固定版本、固定欄位、大小受限的 binary protocol，
+  支援同一 session 多次解碼與嚴格 request ID／PNG 結果驗證。
+- helper 啟動時先套用 Windows Job Object，再恢復執行；限制單一 process、
+  768 MiB 記憶體及 30 秒硬 deadline。
+
+### Security
+
+- helper timeout、取消、pipe 中斷、codec crash 或不合法回應都會終止整個
+  Job；不重試同一張不可信圖片，下一次選取才建立乾淨 helper。
+- Rust `unsafe` 收斂到明列的 Win32 與 codec FFI adapter；契約測試要求每個
+  unsafe block 都有就近 `SAFETY` 理由。
+- 更新 Rust 鎖檔並將 `serde_with` 提升到 3.21.0；Windows target 的
+  `cargo audit`／`cargo deny` 維持零未核准 advisory。
+
 ## [0.2.1] - 2026-07-29
 
 ### Fixed

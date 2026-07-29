@@ -1,6 +1,6 @@
 [package]
 name = "imgviewer-codec-helper"
-version = "0.2.0"
+version = "0.3.0"
 description = "Private out-of-process codec helper for ImgViewer"
 license = "MIT"
 edition = "2024"
@@ -12,8 +12,8 @@ default = []
 heic = ["imgviewer-codec-core/heic"]
 
 [dependencies]
-imgviewer-codec-core = { version = "=0.2.0", path = "../codec-core" }
-imgviewer-codec-protocol = { version = "=0.2.0", path = "../codec-protocol" }
+imgviewer-codec-core = { version = "=0.3.0", path = "../codec-core" }
+imgviewer-codec-protocol = { version = "=0.3.0", path = "../codec-protocol" }
 
 [lib]
 path = "src/lib.rs"

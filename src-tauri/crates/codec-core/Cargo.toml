@@ -1,6 +1,6 @@
 [package]
 name = "imgviewer-codec-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Path-independent bounded image decode engine for ImgViewer"
 license = "MIT"
 edition = "2024"
