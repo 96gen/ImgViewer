@@ -3,7 +3,7 @@
 use std::io;
 use std::process::ExitCode;
 
-use imgviewer_codec_helper::{serve_once, validate_cli_arguments};
+use imgviewer_codec_helper::{serve, validate_cli_arguments};
 
 fn main() -> ExitCode {
     if validate_cli_arguments(std::env::args_os()).is_err() {
@@ -12,7 +12,7 @@ fn main() -> ExitCode {
 
     let stdin = io::stdin();
     let stdout = io::stdout();
-    if serve_once(&mut stdin.lock(), &mut stdout.lock()).is_err() {
+    if serve(&mut stdin.lock(), &mut stdout.lock()).is_err() {
         return ExitCode::from(70);
     }
     ExitCode::SUCCESS

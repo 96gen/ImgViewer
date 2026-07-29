@@ -1,5 +1,3 @@
-#![cfg_attr(all(test, feature = "heic"), allow(unsafe_code))]
-
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
@@ -17,7 +15,7 @@ use moxcms::{
 
 use crate::{DecodedRender, SupportedFormat, ViewerError, code as error_code};
 
-pub(crate) const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_SIDE: u32 = 32_768;
 pub(crate) const MAX_PIXELS: u64 = 100_000_000;
 pub const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
@@ -80,15 +78,32 @@ fn decode_open_file(path: &Path, file: File) -> Result<DecodedRender, ViewerErro
     }
 }
 
+/// Decodes a HEIC/HEIF image from an already-open, owned file handle.
+///
+/// The handle is consumed exactly once. Size validation, bounded reading,
+/// magic validation, and native decoding all operate on that same handle and
+/// its owned byte snapshot; no path is accepted or reopened.
+pub fn decode_heif_file(file: File) -> Result<DecodedRender, ViewerError> {
+    let bytes = read_limited(file)?;
+    if sniff_format(&bytes) != Some(SupportedFormat::Heif) {
+        return Err(ViewerError::new(
+            "format_mismatch",
+            "檔案內容不是有效的 HEIC/HEIF 格式。",
+        ));
+    }
+    decode_heif(bytes)
+}
+
 fn read_limited(file: File) -> Result<Vec<u8>, ViewerError> {
     let metadata = file
         .metadata()
         .map_err(|error| ViewerError::io(format!("無法取得檔案大小：{error}")))?;
     if metadata.len() > MAX_INPUT_BYTES {
-        return Err(ViewerError::limit(
-            "file_too_large",
-            "檔案超過 256 MiB 上限。",
-        ));
+        return Err(
+            ViewerError::limit("file_too_large", "檔案超過 256 MiB 上限。")
+                .with_parameter("observedBytes", metadata.len())
+                .with_parameter("maxBytes", MAX_INPUT_BYTES),
+        );
     }
 
     // `take` closes the TOCTOU gap if the file grows after metadata() and also
@@ -99,10 +114,11 @@ fn read_limited(file: File) -> Result<Vec<u8>, ViewerError> {
         .read_to_end(&mut bytes)
         .map_err(|error| ViewerError::io(format!("讀取檔案時發生錯誤：{error}")))?;
     if bytes.len() as u64 > MAX_INPUT_BYTES {
-        return Err(ViewerError::limit(
-            "file_too_large",
-            "檔案超過 256 MiB 上限。",
-        ));
+        return Err(
+            ViewerError::limit("file_too_large", "檔案超過 256 MiB 上限。")
+                .with_parameter("observedBytes", bytes.len() as u64)
+                .with_parameter("maxBytes", MAX_INPUT_BYTES),
+        );
     }
     Ok(bytes)
 }
@@ -836,29 +852,42 @@ fn oriented_dimensions(width: u32, height: u32, orientation: Orientation) -> (u3
 pub(crate) fn validate_dimensions(width: u32, height: u32) -> Result<(), ViewerError> {
     let pixels = u64::from(width)
         .checked_mul(u64::from(height))
-        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "圖片尺寸計算溢位。"))?;
+        .ok_or_else(|| dimension_limit_error("圖片尺寸計算溢位。", width, height))?;
     if width == 0 || height == 0 {
         return Err(ViewerError::corrupt("圖片寬度或高度為零。"));
     }
     if width > MAX_SIDE || height > MAX_SIDE {
-        return Err(ViewerError::limit(
-            "dimensions_exceeded",
+        return Err(dimension_limit_error(
             "圖片單邊超過 32,768 像素上限。",
+            width,
+            height,
         ));
     }
     if pixels > MAX_PIXELS {
-        return Err(ViewerError::limit(
-            "dimensions_exceeded",
+        return Err(dimension_limit_error(
             "圖片超過 100,000,000 像素上限。",
+            width,
+            height,
         ));
     }
-    if pixels.saturating_mul(4) > MAX_DECODE_BYTES {
+    let decoded_bytes = pixels.saturating_mul(4);
+    if decoded_bytes > MAX_DECODE_BYTES {
         return Err(ViewerError::limit(
             "decode_limit_exceeded",
             "解碼圖片需要超過 512 MiB 的記憶體。",
-        ));
+        )
+        .with_parameter("observedBytes", decoded_bytes)
+        .with_parameter("maxBytes", MAX_DECODE_BYTES));
     }
     Ok(())
+}
+
+fn dimension_limit_error(message: &'static str, width: u32, height: u32) -> ViewerError {
+    ViewerError::limit("dimensions_exceeded", message)
+        .with_parameter("width", u64::from(width))
+        .with_parameter("height", u64::from(height))
+        .with_parameter("maxSide", u64::from(MAX_SIDE))
+        .with_parameter("maxPixels", MAX_PIXELS)
 }
 
 fn validate_normalization_working_set(
@@ -1327,7 +1356,7 @@ fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
         let handle = context
             .primary_image_handle()
             .map_err(|error| ViewerError::corrupt(format!("HEIF 找不到 primary image：{error}")))?;
-        validate_dimensions(handle.width(), handle.height())?;
+        validate_heif_dimensions(handle.width(), handle.height())?;
         let source_profile = heif_source_color_profile(&handle)?;
         let source_bit_depth = handle.luma_bits_per_pixel();
         let high_bit_depth = source_bit_depth > 8;
@@ -1335,7 +1364,8 @@ fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
             return Err(ViewerError::new(
                 "unsupported_bit_depth",
                 format!("不支援 {source_bit_depth}-bit HEIC/HEIF 圖片。"),
-            ));
+            )
+            .with_parameter("bitDepth", u64::from(source_bit_depth)));
         }
         validate_normalization_working_set(
             source_bytes,
@@ -1362,7 +1392,7 @@ fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
         let premultiplied_alpha = image.is_premultiplied_alpha();
         let width = image.width();
         let height = image.height();
-        validate_dimensions(width, height)?;
+        validate_heif_dimensions(width, height)?;
         let plane = image
             .planes()
             .interleaved
@@ -1492,6 +1522,11 @@ fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
     })
 }
 
+#[cfg(feature = "heic")]
+fn validate_heif_dimensions(width: u32, height: u32) -> Result<(), ViewerError> {
+    validate_dimensions(width, height)
+}
+
 #[cfg(not(feature = "heic"))]
 fn decode_heif(_bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
     Err(ViewerError::new(
@@ -1603,6 +1638,46 @@ mod tests {
     }
 
     #[test]
+    fn path_independent_heif_entry_rejects_magic_before_codec_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("disguised.heic");
+        fs::write(&path, png_bytes([1, 2, 3, 255])).unwrap();
+
+        let error = decode_heif_file(File::open(path).unwrap()).unwrap_err();
+        assert_eq!(error.code, "format_mismatch");
+        assert!(error.parameters.is_empty());
+    }
+
+    #[test]
+    fn path_independent_heif_entry_enforces_input_limit_and_releases_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.heic");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_INPUT_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = decode_heif_file(File::open(&path).unwrap()).unwrap_err();
+        assert_eq!(error.code, "file_too_large");
+        assert_eq!(
+            error.parameters["observedBytes"],
+            serde_json::json!(MAX_INPUT_BYTES + 1)
+        );
+        assert_eq!(
+            error.parameters["maxBytes"],
+            serde_json::json!(MAX_INPUT_BYTES)
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(not(feature = "heic"))]
+    #[test]
+    fn path_independent_heif_entry_reports_disabled_codec_after_validation() {
+        let decoded =
+            decode_heif_file(File::open(fixture("primary-second.heic")).unwrap()).unwrap_err();
+        assert_eq!(decoded.code, "heic_unavailable");
+    }
+
+    #[test]
     fn magic_detection_does_not_trust_extensions() {
         assert_eq!(
             sniff_format(b"\xff\xd8\xffanything"),
@@ -1641,15 +1716,31 @@ mod tests {
 
     #[test]
     fn dimension_limits_cover_side_and_total_pixels() {
-        assert_eq!(
-            validate_dimensions(MAX_SIDE + 1, 1).unwrap_err().code,
-            "dimensions_exceeded"
-        );
-        assert_eq!(
-            validate_dimensions(20_000, 20_000).unwrap_err().code,
-            "dimensions_exceeded"
-        );
+        let side = validate_dimensions(MAX_SIDE + 1, 1).unwrap_err();
+        assert_eq!(side.code, "dimensions_exceeded");
+        assert_eq!(side.parameters["width"], u64::from(MAX_SIDE + 1));
+        assert_eq!(side.parameters["height"], 1);
+        assert_eq!(side.parameters["maxSide"], u64::from(MAX_SIDE));
+        assert_eq!(side.parameters["maxPixels"], MAX_PIXELS);
+
+        let pixels = validate_dimensions(20_000, 20_000).unwrap_err();
+        assert_eq!(pixels.code, "dimensions_exceeded");
+        assert_eq!(pixels.parameters["width"], 20_000);
+        assert_eq!(pixels.parameters["height"], 20_000);
+        assert_eq!(pixels.parameters["maxPixels"], MAX_PIXELS);
         assert!(validate_dimensions(10_000, 10_000).is_ok());
+    }
+
+    #[cfg(feature = "heic")]
+    #[test]
+    fn heif_dimension_path_preserves_stable_numeric_parameters() {
+        let error = validate_heif_dimensions(MAX_SIDE + 1, 7).unwrap_err();
+        assert_eq!(error.code, "dimensions_exceeded");
+        assert_eq!(error.parameters["width"], u64::from(MAX_SIDE + 1));
+        assert_eq!(error.parameters["height"], 7);
+        assert_eq!(error.parameters["maxSide"], u64::from(MAX_SIDE));
+        assert_eq!(error.parameters["maxPixels"], MAX_PIXELS);
+        assert!(!error.parameters.contains_key("path"));
     }
 
     #[test]
@@ -2201,19 +2292,10 @@ mod tests {
         // The portable build deliberately uses only libheif's built-in
         // libde265 decoder. A non-empty list here would reintroduce runtime
         // DLL scanning, including the empty-path drive-root fallback on Windows.
-        // SAFETY: libheif owns the returned null-terminated pointer array. We
-        // only inspect its first pointer while the allocation is valid, then
-        // release it exactly once with the matching libheif function.
-        unsafe {
-            let directories = libheif_sys::heif_get_plugin_directories();
-            assert!(!directories.is_null());
-            let is_empty = (*directories).is_null();
-            libheif_sys::heif_free_plugin_directories(directories);
-            assert!(
-                is_empty,
-                "libheif runtime plugin loading must stay disabled"
-            );
-        }
+        assert!(
+            crate::heif_ffi_adapter::runtime_plugin_directories_are_empty(),
+            "libheif runtime plugin loading must stay disabled"
+        );
     }
 
     #[cfg(feature = "heic")]
@@ -2249,5 +2331,18 @@ mod tests {
                 && single_pixel[1] > single_pixel[2],
             "expected green .heif pixels, got {single_pixel:?}"
         );
+    }
+
+    #[cfg(feature = "heic")]
+    #[test]
+    fn path_independent_heif_entry_decodes_primary_image_and_releases_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owned-handle.heic");
+        fs::copy(fixture("primary-second.heic"), &path).unwrap();
+
+        let decoded = decode_heif_file(File::open(&path).unwrap()).unwrap();
+        assert_eq!((decoded.width, decoded.height), (3, 5));
+        assert!(decoded.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        fs::remove_file(path).unwrap();
     }
 }
