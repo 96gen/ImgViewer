@@ -21,11 +21,23 @@ const MAX_SAFE_RENDER_ID: u64 = (1_u64 << 53) - 1;
 
 pub(crate) trait Decoder: Send + Sync + 'static {
     fn decode(&self, path: &Path, file: File) -> Result<DecodedRender, ViewerError>;
+
+    fn cancel_current(&self) {}
+
+    fn shutdown(&self) {}
 }
 
 impl Decoder for ProductionDecoder {
     fn decode(&self, path: &Path, file: File) -> Result<DecodedRender, ViewerError> {
         ProductionDecoder::decode(self, path, file)
+    }
+
+    fn cancel_current(&self) {
+        ProductionDecoder::cancel_current(self);
+    }
+
+    fn shutdown(&self) {
+        ProductionDecoder::shutdown(self);
     }
 }
 
@@ -176,6 +188,10 @@ impl WorkerLifecycle {
             state.pending = None;
             state.renders.clear();
         }
+        // A helper decode can be blocked in native code or pipe I/O. Terminate
+        // its constrained Job before joining the worker so shutdown remains
+        // bounded.
+        self.inner.decoder.shutdown();
         self.inner.wake_worker.notify_all();
 
         // The worker never owns WorkerLifecycle, so normal shutdown cannot run
@@ -211,7 +227,7 @@ impl Default for ViewerController {
 
 impl ViewerController {
     pub fn new() -> Self {
-        Self::with_decoder(Arc::new(ProductionDecoder))
+        Self::with_decoder(Arc::new(ProductionDecoder::default()))
     }
 
     fn with_decoder(decoder: Arc<dyn Decoder>) -> Self {
@@ -255,28 +271,33 @@ impl ViewerController {
                     state.index = Some(index);
                     state.schedule_current()
                 };
+                self.inner.decoder.cancel_current();
                 self.inner.wake_worker.notify_one();
                 snapshot
             }
             Err(error) => {
-                let mut state = self.inner.state.lock();
-                if state.shutdown_requested {
-                    return state.snapshot.clone();
-                }
-                let generation = state.next_generation();
-                let revision = state.next_revision();
-                state.files.clear();
-                state.index = None;
-                state.pending = None;
-                state.renders.clear();
-                state.snapshot = ViewerSnapshot::open_error(
-                    generation,
-                    revision,
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned()),
-                    error,
-                );
-                state.snapshot.clone()
+                let snapshot = {
+                    let mut state = self.inner.state.lock();
+                    if state.shutdown_requested {
+                        return state.snapshot.clone();
+                    }
+                    let generation = state.next_generation();
+                    let revision = state.next_revision();
+                    state.files.clear();
+                    state.index = None;
+                    state.pending = None;
+                    state.renders.clear();
+                    state.snapshot = ViewerSnapshot::open_error(
+                        generation,
+                        revision,
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned()),
+                        error,
+                    );
+                    state.snapshot.clone()
+                };
+                self.inner.decoder.cancel_current();
+                snapshot
             }
         }
     }
@@ -305,6 +326,7 @@ impl ViewerController {
             }
         };
         if scheduled {
+            self.inner.decoder.cancel_current();
             self.inner.wake_worker.notify_one();
         }
         snapshot
@@ -587,7 +609,7 @@ mod tests {
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap();
             }
-            ProductionDecoder.decode(path, file)
+            ProductionDecoder::default().decode(path, file)
         }
     }
 
@@ -1094,6 +1116,63 @@ mod tests {
             controller.take_render(latest.render.unwrap().render_id),
             Some(b"2.jpg".to_vec())
         );
+    }
+
+    struct LifecycleDecoder {
+        cancels: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl Decoder for LifecycleDecoder {
+        fn decode(&self, path: &Path, _file: File) -> Result<DecodedRender, ViewerError> {
+            Ok(DecodedRender {
+                bytes: display_name(path).into_bytes(),
+                mime_type: "image/png",
+                width: 1,
+                height: 1,
+                animated: false,
+            })
+        }
+
+        fn cancel_current(&self) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn shutdown(&self) {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn selection_changes_cancel_active_decoder_and_shutdown_precedes_join() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("1.png");
+        let second = directory.path().join("2.png");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let controller = ViewerController::with_decoder(Arc::new(LifecycleDecoder {
+            cancels: Arc::clone(&cancels),
+            shutdowns: Arc::clone(&shutdowns),
+        }));
+
+        controller.open_path(&first);
+        wait_until_ready(&controller);
+        controller.navigate(NavigationDirection::Next);
+        wait_until_ready(&controller);
+        controller.navigate(NavigationDirection::Next);
+        assert_eq!(
+            cancels.load(Ordering::SeqCst),
+            2,
+            "opening and successful navigation cancel; a stopped boundary does not"
+        );
+
+        controller.open_path(directory.path().join("missing.bmp"));
+        assert_eq!(cancels.load(Ordering::SeqCst), 3);
+        controller.shutdown();
+        controller.shutdown();
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -2,9 +2,39 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use crate::catalog::validate_source_path;
+use crate::codec_helper::HeifHelperClient;
 use crate::error::{ViewerError, code as error_code};
 
-pub(crate) use imgviewer_codec_core::{MAX_DECODE_BYTES, ProductionDecoder};
+pub(crate) use imgviewer_codec_core::MAX_DECODE_BYTES;
+use imgviewer_codec_core::SupportedFormat;
+
+#[derive(Default)]
+pub(crate) struct ProductionDecoder {
+    local: imgviewer_codec_core::ProductionDecoder,
+    heif: HeifHelperClient,
+}
+
+impl ProductionDecoder {
+    pub(crate) fn decode(
+        &self,
+        path: &Path,
+        file: File,
+    ) -> Result<imgviewer_codec_core::DecodedRender, ViewerError> {
+        if SupportedFormat::from_path(path) == Some(SupportedFormat::Heif) {
+            self.heif.decode(file)
+        } else {
+            self.local.decode(path, file)
+        }
+    }
+
+    pub(crate) fn cancel_current(&self) {
+        self.heif.cancel_current();
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.heif.shutdown();
+    }
+}
 
 #[cfg(windows)]
 pub(crate) fn open_read_only(path: &Path) -> Result<File, ViewerError> {
