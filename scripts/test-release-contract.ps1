@@ -35,11 +35,29 @@ function Write-TestFile {
     )
 }
 
+function Get-Sha256 {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $stream = [System.IO.File]::OpenRead(
+        [System.IO.Path]::GetFullPath($Path)
+    )
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (
+            [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        )
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Get-TestHash {
     param([Parameter(Mandatory)] [string]$Name)
-    return (Get-FileHash -LiteralPath (
-        Join-Path $stageDirectory $Name
-    ) -Algorithm SHA256).Hash
+    return Get-Sha256 -Path (Join-Path $stageDirectory $Name)
 }
 
 function Assert-TestFailure {
@@ -207,9 +225,7 @@ exit /b 1
     [System.IO.File]::WriteAllText($metadataPath, $metadataJson, $utf8WithoutBom)
 
     Compress-Archive -LiteralPath $stageDirectory -DestinationPath $artifactPath
-    $artifactHash = (
-        Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
+    $artifactHash = (Get-Sha256 -Path $artifactPath).ToLowerInvariant()
     [System.IO.File]::WriteAllText(
         $checksumPath,
         "$artifactHash  $([System.IO.Path]::GetFileName($artifactPath))`n",

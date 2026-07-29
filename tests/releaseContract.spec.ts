@@ -96,6 +96,12 @@ describe("portable helper release contract", () => {
   windowsIt(
     "passes the synthetic schema, helper negative, and SBOM script checks",
     () => {
+      const contractScript = read("scripts/test-release-contract.ps1");
+      expect(contractScript).toContain(
+        "[System.Security.Cryptography.SHA256]::Create()",
+      );
+      expect(contractScript).not.toContain("Get-FileHash");
+
       const result = spawnSync(
         "powershell.exe",
         [
