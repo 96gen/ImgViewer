@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const root = join(import.meta.dirname, "..");
@@ -102,6 +102,20 @@ describe("portable helper release contract", () => {
       );
       expect(contractScript).not.toContain("Get-FileHash");
 
+      // GitHub's pwsh runner prepends PowerShell 7 module paths. A nested
+      // Windows PowerShell 5.1 process inherits that value and otherwise
+      // cannot auto-load built-in Windows modules such as
+      // Microsoft.PowerShell.Utility (Get-FileHash).
+      const windowsPowerShellModules = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "Modules",
+      );
+      const psModulePath = [process.env.PSModulePath, windowsPowerShellModules]
+        .filter((value): value is string => Boolean(value))
+        .join(delimiter);
       const result = spawnSync(
         "powershell.exe",
         [
@@ -115,6 +129,10 @@ describe("portable helper release contract", () => {
           cwd: root,
           encoding: "utf8",
           timeout: 60_000,
+          env: {
+            ...process.env,
+            PSModulePath: psModulePath,
+          },
         },
       );
 
