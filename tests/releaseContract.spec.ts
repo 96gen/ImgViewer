@@ -17,7 +17,7 @@ describe("portable helper release contract", () => {
       "Invoke-Checked $tauriCli build --no-bundle \"--\" \"--locked\"",
     );
     expect(build).toMatch(
-      /cargo build --locked [^\r\n]*--package imgviewer-codec-helper [^\r\n]*--features heic/,
+      /cargo build --locked [^\r\n]*"?--package"?\s+imgviewer-codec-helper [^\r\n]*--features heic/,
     );
     expect(build).not.toMatch(
       /\$tauriCli build[^\r\n]*--features\s+heic/,

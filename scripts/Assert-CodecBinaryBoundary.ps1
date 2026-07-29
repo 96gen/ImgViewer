@@ -89,7 +89,7 @@ $mainImports = @(Get-ImportedDlls -BinaryPath $mainPath -DumpbinPath $dumpbin)
 $helperImports = @(Get-ImportedDlls -BinaryPath $helperPath -DumpbinPath $dumpbin)
 
 $forbiddenMainImports = @(
-    $mainImports | Where-Object { $_ -match '^(?i:heif|libde265)\.dll$' }
+    $mainImports | Where-Object { $_ -match '^(?i:(?:lib)?heif|libde265)\.dll$' }
 )
 if ($forbiddenMainImports.Count -gt 0) {
     throw "ImgViewer.exe must not import native HEIF codecs: $($forbiddenMainImports -join ', ')"
