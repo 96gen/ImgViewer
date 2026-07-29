@@ -399,11 +399,17 @@ describe("desktop security contract", () => {
     );
   });
 
-  it("keeps packaged keyboard smoke away from the native title bar", () => {
+  it("keeps packaged keyboard smoke focused and rapid navigation deterministic", () => {
     const smoke = read("scripts/smoke-native.ps1");
     expect(smoke).not.toContain("[int]($rect.Top + 14)");
     expect(smoke).toContain(
       "[int][Math]::Floor(($rect.Top + $rect.Bottom) / 2)",
     );
+    expect(smoke).toContain("function Invoke-ViewerNavigationBurst");
+    expect(smoke).toContain(
+      "PASS rapid-navigation final=10.jpg trigger=uia-burst count=2 rect=unchanged",
+    );
+    expect(smoke).toContain("uia-images=[$imageSummary]");
+    expect(smoke).toContain("uia-text=[$textSummary]");
   });
 });

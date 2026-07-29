@@ -311,30 +311,88 @@ function Assert-CodecHelperExecutablePath {
 
 function Wait-Image {
     param([IntPtr]$Window, [string]$Name)
-    return Wait-Until -FailureMessage "Timed out waiting for rendered image '$Name'." -Condition {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastError = $null
+    do {
         try {
             $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
-            if ($null -eq $root) { return $null }
-            $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::NameProperty,
-                $Name
-            )
-            $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::Image
-            )
-            $condition = [System.Windows.Automation.AndCondition]::new($nameCondition, $typeCondition)
-            return $root.FindFirst(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                $condition
-            )
+            if ($null -ne $root) {
+                $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::NameProperty,
+                    $Name
+                )
+                $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Image
+                )
+                $condition = [System.Windows.Automation.AndCondition]::new(
+                    $nameCondition,
+                    $typeCondition
+                )
+                $image = $root.FindFirst(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    $condition
+                )
+                if ($null -ne $image) {
+                    return $image
+                }
+            }
         }
         catch {
             # WebView2 can replace its child HWND while the native window is
             # already visible. Treat that short UIA gap as not-ready.
-            return $null
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    $imageNames = @()
+    $textNames = @()
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
+        if ($null -ne $root) {
+            $imageType = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Image
+            )
+            $images = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $imageType
+            )
+            for ($index = 0; $index -lt $images.Count; $index++) {
+                $candidateName = [string]$images.Item($index).Current.Name
+                if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
+                    $imageNames += $candidateName
+                }
+            }
+
+            $textType = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Text
+            )
+            $texts = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $textType
+            )
+            for ($index = 0; $index -lt $texts.Count; $index++) {
+                $candidateName = [string]$texts.Item($index).Current.Name
+                if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
+                    $textNames += $candidateName
+                }
+            }
         }
     }
+    catch {
+        $lastError = $_.Exception.Message
+    }
+
+    $imageSummary = @($imageNames | Select-Object -Unique) -join ', '
+    $textSummary = @($textNames | Select-Object -Unique -First 20) -join ', '
+    throw (
+        "Timed out waiting for rendered image '$Name'; " +
+        "uia-images=[$imageSummary]; uia-text=[$textSummary]; " +
+        "last-uia-error='$lastError'."
+    )
 }
 
 function Get-ViewerImages {
@@ -626,6 +684,29 @@ function Navigate-Viewer {
         $invokePattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
         $invokePattern.Invoke()
         Start-Sleep -Milliseconds 100
+    }
+}
+
+function Invoke-ViewerNavigationBurst {
+    param(
+        [IntPtr]$Window,
+        [ValidateSet('previous', 'next')] [string]$Direction,
+        [ValidateRange(1, 100)] [int]$Count
+    )
+
+    $buttonName = if ($Direction -eq 'previous') {
+        ([char[]](0x4E0A, 0x4E00, 0x5F35) -join '')
+    }
+    else {
+        ([char[]](0x4E0B, 0x4E00, 0x5F35) -join '')
+    }
+    $button = Wait-Control $Window $buttonName ([System.Windows.Automation.ControlType]::Button)
+    if (-not $button.Current.IsEnabled) {
+        throw "Viewer button '$buttonName' was disabled before the rapid navigation burst."
+    }
+    $invokePattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    for ($step = 0; $step -lt $Count; $step++) {
+        $invokePattern.Invoke()
     }
 }
 
@@ -996,15 +1077,15 @@ try {
     Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) 'end-stop navigation'
     Write-Output 'PASS end-stop file=10.jpg rect=unchanged'
 
-    Navigate-Viewer $window 'previous' 2
+    Invoke-ViewerNavigationBurst $window 'previous' 2
     Wait-Image $window '1.jpg' | Out-Null
-    Navigate-Viewer $window 'next' 2
+    Invoke-ViewerNavigationBurst $window 'next' 2
     $rapidImage = Wait-Image $window '10.jpg'
     if (-not $SkipPixelChecks) {
         Wait-DominantColor $window $rapidImage 'blue' 'rapid latest-wins navigation' | Out-Null
     }
     Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) 'rapid latest-wins navigation'
-    Write-Output 'PASS rapid-navigation final=10.jpg rect=unchanged'
+    Write-Output 'PASS rapid-navigation final=10.jpg trigger=uia-burst count=2 rect=unchanged'
 
     $continuityOldImage = Open-ThroughExistingInstance $continuityRedPath $window
     if (-not $SkipPixelChecks) {
