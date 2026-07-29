@@ -119,6 +119,54 @@ describe("desktop security contract", () => {
     }
   });
 
+  it("keeps the private codec helper workspace isolated from desktop capabilities", () => {
+    const cargoManifest = read("src-tauri/Cargo.toml");
+    const workspaceMembers = [
+      ...cargoManifest.matchAll(/"(crates\/codec-(?:helper|protocol))"/g),
+    ].map((match) => match[1]);
+    expect(workspaceMembers.sort()).toEqual([
+      "crates/codec-helper",
+      "crates/codec-protocol",
+    ]);
+    expect(cargoManifest).toContain('default-members = ["."]');
+
+    const protocolManifest = read(
+      "src-tauri/crates/codec-protocol/Cargo.toml",
+    );
+    const helperManifest = read("src-tauri/crates/codec-helper/Cargo.toml");
+    const helperDependencySection = helperManifest
+      .split("[dependencies]")[1]
+      .split(/\r?\n\[/)[0];
+    const helperDependencies = [
+      ...helperDependencySection.matchAll(/^([a-z0-9_-]+)\s*=/gm),
+    ].map((match) => match[1]);
+    expect(helperDependencies).toEqual(["imgviewer-codec-protocol"]);
+
+    const helperSource = [
+      read("src-tauri/crates/codec-protocol/src/lib.rs"),
+      read("src-tauri/crates/codec-helper/src/lib.rs"),
+      read("src-tauri/crates/codec-helper/src/main.rs"),
+    ].join("\n");
+    expect(helperSource.match(/#!\[forbid\(unsafe_code\)\]/g)).toHaveLength(3);
+    expect(`${protocolManifest}\n${helperManifest}\n${helperSource}`).not.toMatch(
+      /\b(?:tauri|reqwest|hyper|ureq|curl|tokio|async_std|smol)\b|https?:\/\/|std::process::Command|cmd\.exe|powershell/i,
+    );
+    expect(helperSource).not.toMatch(
+      /\b(?:Path|PathBuf)\b|std::fs|File::open/,
+    );
+    expect(helperSource).toContain("validate_cli_arguments(std::env::args_os())");
+    expect(helperSource).toContain("CliError::UnexpectedArgument");
+
+    const ci = read(".github/workflows/ci.yml");
+    for (const command of [
+      ...ci.matchAll(/run:\s*(cargo (?:clippy|test)[^\r\n]*)/g),
+    ].map((match) => match[1])) {
+      expect(command, `Workspace crate 未納入 CI：${command}`).toContain(
+        "--workspace",
+      );
+    }
+  });
+
   it("pins the local and CI toolchains and uses locked Cargo graphs", () => {
     expect(read(".node-version").trim()).toBe("24.18.0");
     const rustToolchain = read("rust-toolchain.toml");

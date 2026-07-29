@@ -81,8 +81,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 cargo fmt --manifest-path .\src-tauri\Cargo.toml --all -- --check
-cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --all-targets --no-default-features -- -D warnings
-cargo test --locked --manifest-path .\src-tauri\Cargo.toml --no-default-features
+cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --workspace --all-targets --no-default-features -- -D warnings
+cargo test --locked --manifest-path .\src-tauri\Cargo.toml --workspace --no-default-features
 ```
 
 原生窗口 smoke 不使用 WDIO、WebDriver 或測試外掛；它直接啟動正式 binary，以 Windows UI Automation 找到已顯示的圖片，再用 Win32 讀取原生窗口 rect：

@@ -1780,6 +1780,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "imgviewer-codec-helper"
+version = "0.2.0"
+dependencies = [
+ "imgviewer-codec-protocol",
+]
+
+[[package]]
+name = "imgviewer-codec-protocol"
+version = "0.2.0"
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
