@@ -250,7 +250,7 @@ try {
     # libheif-sys copies heif.dll into Cargo OUT_DIR. Rust caches do not notice
     # when vcpkg rebuilds that DLL, so remove only this package's stale native
     # artifacts before using the HEIC test/build gate.
-    Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") -p libheif-sys
+    Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" libheif-sys
     Invoke-Checked $pnpm.Source install --frozen-lockfile
     if (-not $SkipChecks) {
         Invoke-Checked $pnpm.Source test

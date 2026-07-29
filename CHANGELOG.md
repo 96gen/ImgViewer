@@ -5,6 +5,15 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-29
+
+### Fixed
+
+- 修正 PowerShell 7 將 Cargo 的 `-p` 誤判為模糊 common parameter，導致
+  portable tag workflow 在 native dependencies 完成後中止。
+- 移除僅執行 audit、未建立 pnpm store 的安全維護工作流程 cache 設定，
+  避免所有實質檢查成功後在 cleanup 階段誤報失敗。
+
 ## [0.2.0] - 2026-07-27
 
 ### Added
