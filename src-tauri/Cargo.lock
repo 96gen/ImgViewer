@@ -1761,11 +1761,8 @@ name = "imgviewer"
 version = "0.2.0"
 dependencies = [
  "image",
- "libheif-rs",
- "libheif-sys",
- "moxcms",
+ "imgviewer-codec-core",
  "parking_lot",
- "png 0.18.1",
  "rand",
  "serde",
  "serde_json",
@@ -1775,14 +1772,29 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-window-state",
  "tempfile",
- "tiff 0.10.3",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "imgviewer-codec-core"
+version = "0.2.0"
+dependencies = [
+ "image",
+ "libheif-rs",
+ "libheif-sys",
+ "moxcms",
+ "png 0.18.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tiff 0.10.3",
 ]
 
 [[package]]
 name = "imgviewer-codec-helper"
 version = "0.2.0"
 dependencies = [
+ "imgviewer-codec-core",
  "imgviewer-codec-protocol",
 ]
 

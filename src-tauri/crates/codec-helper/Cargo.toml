@@ -7,7 +7,12 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[features]
+default = []
+heic = ["imgviewer-codec-core/heic"]
+
 [dependencies]
+imgviewer-codec-core = { version = "=0.2.0", path = "../codec-core" }
 imgviewer-codec-protocol = { version = "=0.2.0", path = "../codec-protocol" }
 
 [lib]

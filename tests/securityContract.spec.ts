@@ -121,26 +121,61 @@ describe("desktop security contract", () => {
 
   it("keeps the private codec helper workspace isolated from desktop capabilities", () => {
     const cargoManifest = read("src-tauri/Cargo.toml");
+    const workspaceSection = cargoManifest
+      .split("[workspace]")[1]
+      .split(/\r?\n\[/)[0];
     const workspaceMembers = [
-      ...cargoManifest.matchAll(/"(crates\/codec-(?:helper|protocol))"/g),
+      ...workspaceSection.matchAll(
+        /"(crates\/codec-(?:core|helper|protocol))"/g,
+      ),
     ].map((match) => match[1]);
     expect(workspaceMembers.sort()).toEqual([
+      "crates/codec-core",
       "crates/codec-helper",
       "crates/codec-protocol",
     ]);
     expect(cargoManifest).toContain('default-members = ["."]');
 
+    const coreManifest = read("src-tauri/crates/codec-core/Cargo.toml");
     const protocolManifest = read(
       "src-tauri/crates/codec-protocol/Cargo.toml",
     );
     const helperManifest = read("src-tauri/crates/codec-helper/Cargo.toml");
+    const rootDependencySection = cargoManifest
+      .split("[dependencies]")[1]
+      .split(/\r?\n\[/)[0];
+    const coreDependencySection = coreManifest
+      .split("[dependencies]")[1]
+      .split(/\r?\n\[/)[0];
+    const coreDependencies = [
+      ...coreDependencySection.matchAll(/^([a-z0-9_-]+)\s*=/gm),
+    ].map((match) => match[1]);
+    expect(coreDependencies).toEqual([
+      "image",
+      "libheif-rs",
+      "libheif-sys",
+      "moxcms",
+      "png",
+      "serde",
+      "serde_json",
+    ]);
+    expect(rootDependencySection).not.toMatch(/^libheif-(?:rs|sys)\s*=/m);
+    expect(coreManifest).toMatch(
+      /^libheif-rs\s*=\s*\{[^}]*optional\s*=\s*true[^}]*\}$/m,
+    );
+    expect(coreManifest).toMatch(
+      /^libheif-sys\s*=\s*\{[^}]*optional\s*=\s*true[^}]*\}$/m,
+    );
     const helperDependencySection = helperManifest
       .split("[dependencies]")[1]
       .split(/\r?\n\[/)[0];
     const helperDependencies = [
       ...helperDependencySection.matchAll(/^([a-z0-9_-]+)\s*=/gm),
     ].map((match) => match[1]);
-    expect(helperDependencies).toEqual(["imgviewer-codec-protocol"]);
+    expect(helperDependencies).toEqual([
+      "imgviewer-codec-core",
+      "imgviewer-codec-protocol",
+    ]);
 
     const helperSource = [
       read("src-tauri/crates/codec-protocol/src/lib.rs"),
@@ -148,7 +183,9 @@ describe("desktop security contract", () => {
       read("src-tauri/crates/codec-helper/src/main.rs"),
     ].join("\n");
     expect(helperSource.match(/#!\[forbid\(unsafe_code\)\]/g)).toHaveLength(3);
-    expect(`${protocolManifest}\n${helperManifest}\n${helperSource}`).not.toMatch(
+    expect(
+      `${coreManifest}\n${protocolManifest}\n${helperManifest}\n${helperSource}`,
+    ).not.toMatch(
       /\b(?:tauri|reqwest|hyper|ureq|curl|tokio|async_std|smol)\b|https?:\/\/|std::process::Command|cmd\.exe|powershell/i,
     );
     expect(helperSource).not.toMatch(
@@ -208,7 +245,10 @@ describe("desktop security contract", () => {
   });
 
   it("preserves hard image and allocation limits in the Rust core", () => {
-    const rust = filesBelow("src-tauri/src")
+    const rust = [
+      ...filesBelow("src-tauri/src"),
+      ...filesBelow("src-tauri/crates/codec-core/src"),
+    ]
       .filter((path) => path.endsWith(".rs"))
       .map(read)
       .join("\n");

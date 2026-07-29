@@ -10,6 +10,7 @@ rust-version = "1.88"
 
 [workspace]
 members = [
+    "crates/codec-core",
     "crates/codec-helper",
     "crates/codec-protocol",
 ]
@@ -22,21 +23,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = []
-# The portable release pipeline enables this feature after provisioning the
-# pinned libheif vcpkg dependency. Keeping it optional lets contributors run
-# the pure-Rust test suite without VCPKG_ROOT.
-heic = ["dep:libheif-rs", "dep:libheif-sys"]
+# Transitional compatibility for existing development commands. Native HEIF
+# dependencies live only in imgviewer-codec-core and are not forwarded into
+# the Tauri application process.
+heic = []
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
-image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "tiff", "webp"] }
-libheif-rs = { version = "=2.7.0", optional = true, default-features = false, features = ["v1_21"] }
-libheif-sys = { version = "=5.2.0", optional = true, default-features = false, features = ["v1_21"] }
-moxcms = "=0.8.1"
+imgviewer-codec-core = { version = "=0.2.0", path = "crates/codec-core" }
 parking_lot = "=0.12.4"
-png = "=0.18.1"
 rand = "=0.9.3"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"
@@ -57,5 +54,5 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 
 [dev-dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 tempfile = "=3.20.0"
-tiff = "=0.10.3"

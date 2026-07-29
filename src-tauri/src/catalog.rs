@@ -4,40 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::ViewerError;
+pub(crate) use imgviewer_codec_core::SupportedFormat;
 
 pub(crate) const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 pub(crate) const MAX_CATALOG_FILES: usize = 20_000;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SupportedFormat {
-    Jpeg,
-    Png,
-    Gif,
-    Tiff,
-    WebP,
-    Heif,
-}
-
-impl SupportedFormat {
-    pub(crate) fn from_path(path: &Path) -> Option<Self> {
-        let extension = path.extension()?.to_str()?;
-        if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
-            Some(Self::Jpeg)
-        } else if extension.eq_ignore_ascii_case("png") {
-            Some(Self::Png)
-        } else if extension.eq_ignore_ascii_case("gif") {
-            Some(Self::Gif)
-        } else if extension.eq_ignore_ascii_case("tif") || extension.eq_ignore_ascii_case("tiff") {
-            Some(Self::Tiff)
-        } else if extension.eq_ignore_ascii_case("webp") {
-            Some(Self::WebP)
-        } else if extension.eq_ignore_ascii_case("heic") || extension.eq_ignore_ascii_case("heif") {
-            Some(Self::Heif)
-        } else {
-            None
-        }
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct Catalog {
