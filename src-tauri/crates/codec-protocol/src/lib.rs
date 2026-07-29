@@ -7,6 +7,16 @@ pub const PROTOCOL_MAGIC: [u8; 8] = *b"IMGVC001";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 16;
 pub const MAX_CONTROL_PAYLOAD_BYTES: u32 = 64 * 1024;
+pub const MAX_RENDER_BYTES: u32 = 512 * 1024 * 1024;
+pub const MAX_RENDER_SIDE: u32 = 32_768;
+pub const MAX_RENDER_PIXELS: u64 = 100_000_000;
+pub const DECODE_REQUEST_LEN: u32 = 24;
+pub const DECODE_SUCCESS_PREFIX_LEN: u32 = 24;
+pub const DECODE_ERROR_LEN: u32 = 32;
+pub const MAX_RENDER_PAYLOAD_BYTES: u32 = MAX_RENDER_BYTES + DECODE_SUCCESS_PREFIX_LEN;
+
+const PNG_METADATA_LEN: usize = 24;
+const PNG_SIGNATURE: [u8; 8] = *b"\x89PNG\r\n\x1a\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -14,11 +24,13 @@ pub enum MessageKind {
     Hello = 1,
     Ready = 2,
     DecodeHeif = 3,
-    NotImplemented = 4,
+    DecodeSuccess = 4,
+    DecodeError = 5,
+    Shutdown = 6,
 }
 
 impl MessageKind {
-    const fn code(self) -> u16 {
+    pub const fn code(self) -> u16 {
         self as u16
     }
 }
@@ -31,7 +43,9 @@ impl TryFrom<u16> for MessageKind {
             1 => Ok(Self::Hello),
             2 => Ok(Self::Ready),
             3 => Ok(Self::DecodeHeif),
-            4 => Ok(Self::NotImplemented),
+            4 => Ok(Self::DecodeSuccess),
+            5 => Ok(Self::DecodeError),
+            6 => Ok(Self::Shutdown),
             _ => Err(ProtocolError::UnknownMessageKind(value)),
         }
     }
@@ -45,13 +59,27 @@ pub struct Header {
 
 impl Header {
     pub fn new(kind: MessageKind, payload_len: u32) -> Result<Self, ProtocolError> {
-        validate_payload_len(payload_len)?;
+        validate_header_payload(kind, payload_len)?;
         Ok(Self { kind, payload_len })
     }
 
-    pub const fn empty(kind: MessageKind) -> Self {
+    pub const fn hello() -> Self {
         Self {
-            kind,
+            kind: MessageKind::Hello,
+            payload_len: 0,
+        }
+    }
+
+    pub const fn ready() -> Self {
+        Self {
+            kind: MessageKind::Ready,
+            payload_len: 0,
+        }
+    }
+
+    pub const fn shutdown() -> Self {
+        Self {
+            kind: MessageKind::Shutdown,
             payload_len: 0,
         }
     }
@@ -90,13 +118,176 @@ impl Header {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeHeifRequest {
+    pub request_id: u64,
+    pub duplicated_handle: u64,
+    pub expected_length: u64,
+}
+
+impl DecodeHeifRequest {
+    pub fn encode(self) -> [u8; DECODE_REQUEST_LEN as usize] {
+        let mut bytes = [0_u8; DECODE_REQUEST_LEN as usize];
+        bytes[..8].copy_from_slice(&self.request_id.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.duplicated_handle.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.expected_length.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: [u8; DECODE_REQUEST_LEN as usize]) -> Self {
+        Self {
+            request_id: u64::from_le_bytes(bytes[..8].try_into().expect("fixed request id")),
+            duplicated_handle: u64::from_le_bytes(
+                bytes[8..16].try_into().expect("fixed duplicated handle"),
+            ),
+            expected_length: u64::from_le_bytes(
+                bytes[16..24].try_into().expect("fixed expected length"),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum WireErrorCode {
+    CorruptImage = 1,
+    FormatMismatch = 2,
+    FileTooLarge = 3,
+    DimensionsExceeded = 4,
+    DecodeLimitExceeded = 5,
+    UnsupportedBitDepth = 6,
+    UnsupportedColorProfile = 7,
+    IoError = 8,
+    InternalDecoderError = 9,
+    NotImplemented = 10,
+    InvalidHandle = 11,
+}
+
+impl WireErrorCode {
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+impl TryFrom<u16> for WireErrorCode {
+    type Error = ProtocolError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::CorruptImage),
+            2 => Ok(Self::FormatMismatch),
+            3 => Ok(Self::FileTooLarge),
+            4 => Ok(Self::DimensionsExceeded),
+            5 => Ok(Self::DecodeLimitExceeded),
+            6 => Ok(Self::UnsupportedBitDepth),
+            7 => Ok(Self::UnsupportedColorProfile),
+            8 => Ok(Self::IoError),
+            9 => Ok(Self::InternalDecoderError),
+            10 => Ok(Self::NotImplemented),
+            11 => Ok(Self::InvalidHandle),
+            _ => Err(ProtocolError::UnknownWireErrorCode(value)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeError {
+    pub request_id: u64,
+    pub code: WireErrorCode,
+    pub arg0: u64,
+    pub arg1: u64,
+}
+
+impl DecodeError {
+    pub fn encode(self) -> [u8; DECODE_ERROR_LEN as usize] {
+        let mut bytes = [0_u8; DECODE_ERROR_LEN as usize];
+        bytes[..8].copy_from_slice(&self.request_id.to_le_bytes());
+        bytes[8..10].copy_from_slice(&self.code.code().to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.arg0.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.arg1.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: [u8; DECODE_ERROR_LEN as usize]) -> Result<Self, ProtocolError> {
+        if bytes[10..16] != [0_u8; 6] {
+            return Err(ProtocolError::NonCanonicalReservedBytes);
+        }
+        Ok(Self {
+            request_id: u64::from_le_bytes(bytes[..8].try_into().expect("fixed request id")),
+            code: WireErrorCode::try_from(u16::from_le_bytes([bytes[8], bytes[9]]))?,
+            arg0: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed error arg0")),
+            arg1: u64::from_le_bytes(bytes[24..32].try_into().expect("fixed error arg1")),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeSuccess {
+    pub request_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecodeResponse {
+    Success(DecodeSuccess),
+    Error(DecodeError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelperCommand {
+    DecodeHeif(DecodeHeifRequest),
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolError {
     Io(io::ErrorKind),
-    TruncatedHeader { bytes_read: usize },
+    TruncatedHeader {
+        bytes_read: usize,
+    },
+    TruncatedPayload {
+        expected: usize,
+        bytes_read: usize,
+    },
     InvalidMagic,
     UnsupportedVersion(u16),
     UnknownMessageKind(u16),
-    PayloadTooLarge { observed: u32, maximum: u32 },
+    UnknownWireErrorCode(u16),
+    UnexpectedMessage {
+        observed: MessageKind,
+    },
+    PayloadTooLarge {
+        kind: MessageKind,
+        observed: u32,
+        maximum: u32,
+    },
+    InvalidPayloadLength {
+        kind: MessageKind,
+        observed: u32,
+        minimum: u32,
+        maximum: u32,
+    },
+    RequestIdMismatch {
+        expected: u64,
+        observed: u64,
+    },
+    AllocationFailed {
+        requested: u32,
+    },
+    InvalidRenderDimensions {
+        width: u32,
+        height: u32,
+    },
+    InvalidPngSignature,
+    InvalidPngHeader,
+    PngDimensionMismatch {
+        declared_width: u32,
+        declared_height: u32,
+        png_width: u32,
+        png_height: u32,
+    },
+    NonCanonicalReservedBytes,
 }
 
 impl fmt::Display for ProtocolError {
@@ -106,6 +297,13 @@ impl fmt::Display for ProtocolError {
             Self::TruncatedHeader { bytes_read } => {
                 write!(formatter, "truncated codec header after {bytes_read} bytes")
             }
+            Self::TruncatedPayload {
+                expected,
+                bytes_read,
+            } => write!(
+                formatter,
+                "truncated codec payload after {bytes_read} of {expected} bytes"
+            ),
             Self::InvalidMagic => formatter.write_str("invalid codec protocol magic"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported codec protocol version {version}")
@@ -113,10 +311,56 @@ impl fmt::Display for ProtocolError {
             Self::UnknownMessageKind(kind) => {
                 write!(formatter, "unknown codec protocol message kind {kind}")
             }
-            Self::PayloadTooLarge { observed, maximum } => write!(
+            Self::UnknownWireErrorCode(code) => {
+                write!(formatter, "unknown codec wire error code {code}")
+            }
+            Self::UnexpectedMessage { observed } => {
+                write!(formatter, "unexpected codec message {observed:?}")
+            }
+            Self::PayloadTooLarge {
+                kind,
+                observed,
+                maximum,
+            } => write!(
                 formatter,
-                "codec control payload length {observed} exceeds {maximum}"
+                "{kind:?} payload length {observed} exceeds {maximum}"
             ),
+            Self::InvalidPayloadLength {
+                kind,
+                observed,
+                minimum,
+                maximum,
+            } => write!(
+                formatter,
+                "{kind:?} payload length {observed} is outside {minimum}..={maximum}"
+            ),
+            Self::RequestIdMismatch { expected, observed } => write!(
+                formatter,
+                "codec response request id {observed} does not match {expected}"
+            ),
+            Self::AllocationFailed { requested } => {
+                write!(
+                    formatter,
+                    "unable to allocate bounded {requested}-byte payload"
+                )
+            }
+            Self::InvalidRenderDimensions { width, height } => {
+                write!(formatter, "invalid render dimensions {width}x{height}")
+            }
+            Self::InvalidPngSignature => formatter.write_str("invalid PNG signature"),
+            Self::InvalidPngHeader => formatter.write_str("invalid PNG IHDR"),
+            Self::PngDimensionMismatch {
+                declared_width,
+                declared_height,
+                png_width,
+                png_height,
+            } => write!(
+                formatter,
+                "PNG dimensions {png_width}x{png_height} do not match declared {declared_width}x{declared_height}"
+            ),
+            Self::NonCanonicalReservedBytes => {
+                formatter.write_str("non-zero reserved protocol bytes")
+            }
         }
     }
 }
@@ -125,15 +369,7 @@ impl std::error::Error for ProtocolError {}
 
 pub fn read_header(reader: &mut (impl Read + ?Sized)) -> Result<Header, ProtocolError> {
     let mut bytes = [0_u8; HEADER_LEN];
-    let mut bytes_read = 0;
-    while bytes_read < HEADER_LEN {
-        match reader.read(&mut bytes[bytes_read..]) {
-            Ok(0) => return Err(ProtocolError::TruncatedHeader { bytes_read }),
-            Ok(count) => bytes_read += count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(ProtocolError::Io(error.kind())),
-        }
-    }
+    read_exact_counted(reader, &mut bytes, true)?;
     Header::decode(bytes)
 }
 
@@ -146,12 +382,276 @@ pub fn write_header(
         .map_err(|error| ProtocolError::Io(error.kind()))
 }
 
-fn validate_payload_len(payload_len: u32) -> Result<(), ProtocolError> {
-    if payload_len > MAX_CONTROL_PAYLOAD_BYTES {
+pub fn write_hello(writer: &mut (impl Write + ?Sized)) -> Result<(), ProtocolError> {
+    write_header(writer, Header::hello())
+}
+
+pub fn read_hello(reader: &mut (impl Read + ?Sized)) -> Result<(), ProtocolError> {
+    require_message(read_header(reader)?, MessageKind::Hello)
+}
+
+pub fn write_ready(writer: &mut (impl Write + ?Sized)) -> Result<(), ProtocolError> {
+    write_header(writer, Header::ready())
+}
+
+pub fn read_ready(reader: &mut (impl Read + ?Sized)) -> Result<(), ProtocolError> {
+    require_message(read_header(reader)?, MessageKind::Ready)
+}
+
+pub fn write_shutdown(writer: &mut (impl Write + ?Sized)) -> Result<(), ProtocolError> {
+    write_header(writer, Header::shutdown())
+}
+
+pub fn write_decode_request(
+    writer: &mut (impl Write + ?Sized),
+    request: DecodeHeifRequest,
+) -> Result<(), ProtocolError> {
+    write_header(
+        writer,
+        Header::new(MessageKind::DecodeHeif, DECODE_REQUEST_LEN)?,
+    )?;
+    writer
+        .write_all(&request.encode())
+        .map_err(|error| ProtocolError::Io(error.kind()))
+}
+
+pub fn read_helper_command(
+    reader: &mut (impl Read + ?Sized),
+) -> Result<HelperCommand, ProtocolError> {
+    let header = read_header(reader)?;
+    match header.kind() {
+        MessageKind::DecodeHeif => {
+            let mut bytes = [0_u8; DECODE_REQUEST_LEN as usize];
+            read_exact_counted(reader, &mut bytes, false)?;
+            Ok(HelperCommand::DecodeHeif(DecodeHeifRequest::decode(bytes)))
+        }
+        MessageKind::Shutdown => Ok(HelperCommand::Shutdown),
+        observed => Err(ProtocolError::UnexpectedMessage { observed }),
+    }
+}
+
+pub fn write_decode_error(
+    writer: &mut (impl Write + ?Sized),
+    error: DecodeError,
+) -> Result<(), ProtocolError> {
+    write_header(
+        writer,
+        Header::new(MessageKind::DecodeError, DECODE_ERROR_LEN)?,
+    )?;
+    writer
+        .write_all(&error.encode())
+        .map_err(|io_error| ProtocolError::Io(io_error.kind()))
+}
+
+pub fn write_decode_success(
+    writer: &mut (impl Write + ?Sized),
+    request_id: u64,
+    width: u32,
+    height: u32,
+    png: &[u8],
+) -> Result<(), ProtocolError> {
+    validate_render_dimensions(width, height)?;
+    let png_len = u32::try_from(png.len()).map_err(|_| ProtocolError::PayloadTooLarge {
+        kind: MessageKind::DecodeSuccess,
+        observed: u32::MAX,
+        maximum: MAX_RENDER_BYTES,
+    })?;
+    if png_len > MAX_RENDER_BYTES {
         return Err(ProtocolError::PayloadTooLarge {
+            kind: MessageKind::DecodeSuccess,
+            observed: png_len,
+            maximum: MAX_RENDER_BYTES,
+        });
+    }
+    validate_png_metadata(png, width, height)?;
+    let payload_len = DECODE_SUCCESS_PREFIX_LEN
+        .checked_add(png_len)
+        .expect("bounded render payload fits u32");
+    write_header(
+        writer,
+        Header::new(MessageKind::DecodeSuccess, payload_len)?,
+    )?;
+
+    let mut prefix = [0_u8; DECODE_SUCCESS_PREFIX_LEN as usize];
+    prefix[..8].copy_from_slice(&request_id.to_le_bytes());
+    prefix[8..12].copy_from_slice(&width.to_le_bytes());
+    prefix[12..16].copy_from_slice(&height.to_le_bytes());
+    prefix[16..20].copy_from_slice(&png_len.to_le_bytes());
+    writer
+        .write_all(&prefix)
+        .and_then(|_| writer.write_all(png))
+        .map_err(|error| ProtocolError::Io(error.kind()))
+}
+
+pub fn read_decode_response(
+    reader: &mut (impl Read + ?Sized),
+    expected_request_id: u64,
+) -> Result<DecodeResponse, ProtocolError> {
+    let header = read_header(reader)?;
+    match header.kind() {
+        MessageKind::DecodeError => {
+            let mut bytes = [0_u8; DECODE_ERROR_LEN as usize];
+            read_exact_counted(reader, &mut bytes, false)?;
+            let error = DecodeError::decode(bytes)?;
+            validate_request_id(expected_request_id, error.request_id)?;
+            Ok(DecodeResponse::Error(error))
+        }
+        MessageKind::DecodeSuccess => {
+            let mut prefix = [0_u8; DECODE_SUCCESS_PREFIX_LEN as usize];
+            read_exact_counted(reader, &mut prefix, false)?;
+            if prefix[20..24] != [0_u8; 4] {
+                return Err(ProtocolError::NonCanonicalReservedBytes);
+            }
+
+            let request_id = u64::from_le_bytes(prefix[..8].try_into().expect("fixed request id"));
+            validate_request_id(expected_request_id, request_id)?;
+            let width = u32::from_le_bytes(prefix[8..12].try_into().expect("fixed width"));
+            let height = u32::from_le_bytes(prefix[12..16].try_into().expect("fixed height"));
+            validate_render_dimensions(width, height)?;
+            let png_len = u32::from_le_bytes(prefix[16..20].try_into().expect("fixed PNG length"));
+            if png_len > MAX_RENDER_BYTES {
+                return Err(ProtocolError::PayloadTooLarge {
+                    kind: MessageKind::DecodeSuccess,
+                    observed: png_len,
+                    maximum: MAX_RENDER_BYTES,
+                });
+            }
+            let expected_payload_len = DECODE_SUCCESS_PREFIX_LEN
+                .checked_add(png_len)
+                .expect("bounded render payload fits u32");
+            if header.payload_len() != expected_payload_len {
+                return Err(ProtocolError::InvalidPayloadLength {
+                    kind: MessageKind::DecodeSuccess,
+                    observed: header.payload_len(),
+                    minimum: expected_payload_len,
+                    maximum: expected_payload_len,
+                });
+            }
+
+            let png_capacity =
+                usize::try_from(png_len).expect("u32 render length fits supported hosts");
+            let mut png = Vec::new();
+            png.try_reserve_exact(png_capacity)
+                .map_err(|_| ProtocolError::AllocationFailed { requested: png_len })?;
+            png.resize(png_capacity, 0);
+            read_exact_counted(reader, &mut png, false)?;
+            validate_png_metadata(&png, width, height)?;
+            Ok(DecodeResponse::Success(DecodeSuccess {
+                request_id,
+                width,
+                height,
+                png,
+            }))
+        }
+        observed => Err(ProtocolError::UnexpectedMessage { observed }),
+    }
+}
+
+fn validate_header_payload(kind: MessageKind, payload_len: u32) -> Result<(), ProtocolError> {
+    if kind != MessageKind::DecodeSuccess && payload_len > MAX_CONTROL_PAYLOAD_BYTES {
+        return Err(ProtocolError::PayloadTooLarge {
+            kind,
             observed: payload_len,
             maximum: MAX_CONTROL_PAYLOAD_BYTES,
         });
+    }
+    if kind == MessageKind::DecodeSuccess && payload_len > MAX_RENDER_PAYLOAD_BYTES {
+        return Err(ProtocolError::PayloadTooLarge {
+            kind,
+            observed: payload_len,
+            maximum: MAX_RENDER_PAYLOAD_BYTES,
+        });
+    }
+
+    let (minimum, maximum) = match kind {
+        MessageKind::Hello | MessageKind::Ready | MessageKind::Shutdown => (0, 0),
+        MessageKind::DecodeHeif => (DECODE_REQUEST_LEN, DECODE_REQUEST_LEN),
+        MessageKind::DecodeError => (DECODE_ERROR_LEN, DECODE_ERROR_LEN),
+        MessageKind::DecodeSuccess => (DECODE_SUCCESS_PREFIX_LEN, MAX_RENDER_PAYLOAD_BYTES),
+    };
+    if payload_len < minimum || payload_len > maximum {
+        return Err(ProtocolError::InvalidPayloadLength {
+            kind,
+            observed: payload_len,
+            minimum,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+fn require_message(header: Header, expected: MessageKind) -> Result<(), ProtocolError> {
+    if header.kind() != expected {
+        return Err(ProtocolError::UnexpectedMessage {
+            observed: header.kind(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_request_id(expected: u64, observed: u64) -> Result<(), ProtocolError> {
+    if observed != expected {
+        return Err(ProtocolError::RequestIdMismatch { expected, observed });
+    }
+    Ok(())
+}
+
+fn validate_render_dimensions(width: u32, height: u32) -> Result<(), ProtocolError> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0
+        || height == 0
+        || width > MAX_RENDER_SIDE
+        || height > MAX_RENDER_SIDE
+        || pixels > MAX_RENDER_PIXELS
+    {
+        return Err(ProtocolError::InvalidRenderDimensions { width, height });
+    }
+    Ok(())
+}
+
+fn validate_png_metadata(
+    png: &[u8],
+    declared_width: u32,
+    declared_height: u32,
+) -> Result<(), ProtocolError> {
+    if png.len() < PNG_METADATA_LEN || png[..8] != PNG_SIGNATURE {
+        return Err(ProtocolError::InvalidPngSignature);
+    }
+    if png[8..12] != 13_u32.to_be_bytes() || png[12..16] != *b"IHDR" {
+        return Err(ProtocolError::InvalidPngHeader);
+    }
+    let png_width = u32::from_be_bytes(png[16..20].try_into().expect("fixed PNG width"));
+    let png_height = u32::from_be_bytes(png[20..24].try_into().expect("fixed PNG height"));
+    if png_width != declared_width || png_height != declared_height {
+        return Err(ProtocolError::PngDimensionMismatch {
+            declared_width,
+            declared_height,
+            png_width,
+            png_height,
+        });
+    }
+    Ok(())
+}
+
+fn read_exact_counted(
+    reader: &mut (impl Read + ?Sized),
+    bytes: &mut [u8],
+    header: bool,
+) -> Result<(), ProtocolError> {
+    let mut bytes_read = 0;
+    while bytes_read < bytes.len() {
+        match reader.read(&mut bytes[bytes_read..]) {
+            Ok(0) if header => return Err(ProtocolError::TruncatedHeader { bytes_read }),
+            Ok(0) => {
+                return Err(ProtocolError::TruncatedPayload {
+                    expected: bytes.len(),
+                    bytes_read,
+                });
+            }
+            Ok(count) => bytes_read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(ProtocolError::Io(error.kind())),
+        }
     }
     Ok(())
 }
@@ -161,76 +661,244 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    #[test]
-    fn fixed_header_round_trips_without_allocation() {
-        let header = Header::new(MessageKind::DecodeHeif, 32).unwrap();
-        assert_eq!(Header::decode(header.encode()).unwrap(), header);
-        assert_eq!(header.kind(), MessageKind::DecodeHeif);
-        assert_eq!(header.payload_len(), 32);
+    fn png_metadata(width: u32, height: u32) -> Vec<u8> {
+        let mut png = Vec::from(PNG_SIGNATURE);
+        png.extend_from_slice(&13_u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&width.to_be_bytes());
+        png.extend_from_slice(&height.to_be_bytes());
+        png
     }
 
     #[test]
-    fn invalid_magic_is_rejected() {
-        let mut bytes = Header::empty(MessageKind::Hello).encode();
-        bytes[0] ^= 0xff;
+    fn fixed_header_and_decode_request_round_trip_uses_explicit_fields() {
+        let request = DecodeHeifRequest {
+            request_id: 42,
+            duplicated_handle: 0x1234,
+            expected_length: 9_876,
+        };
+        let mut bytes = Vec::new();
+        write_decode_request(&mut bytes, request).unwrap();
+        assert_eq!(bytes.len(), HEADER_LEN + DECODE_REQUEST_LEN as usize);
         assert_eq!(
-            Header::decode(bytes).unwrap_err(),
+            read_helper_command(&mut Cursor::new(bytes)).unwrap(),
+            HelperCommand::DecodeHeif(request)
+        );
+    }
+
+    #[test]
+    fn invalid_magic_version_and_kind_are_rejected() {
+        let mut invalid_magic = Header::hello().encode();
+        invalid_magic[0] ^= 0xff;
+        assert_eq!(
+            Header::decode(invalid_magic).unwrap_err(),
             ProtocolError::InvalidMagic
         );
-    }
 
-    #[test]
-    fn unsupported_version_is_rejected() {
-        let mut bytes = Header::empty(MessageKind::Hello).encode();
-        bytes[8..10].copy_from_slice(&(PROTOCOL_VERSION + 1).to_le_bytes());
+        let mut invalid_version = Header::hello().encode();
+        invalid_version[8..10].copy_from_slice(&(PROTOCOL_VERSION + 1).to_le_bytes());
         assert_eq!(
-            Header::decode(bytes).unwrap_err(),
+            Header::decode(invalid_version).unwrap_err(),
             ProtocolError::UnsupportedVersion(PROTOCOL_VERSION + 1)
         );
-    }
 
-    #[test]
-    fn unknown_message_kind_is_rejected() {
-        let mut bytes = Header::empty(MessageKind::Hello).encode();
-        bytes[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        let mut invalid_kind = Header::hello().encode();
+        invalid_kind[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
         assert_eq!(
-            Header::decode(bytes).unwrap_err(),
+            Header::decode(invalid_kind).unwrap_err(),
             ProtocolError::UnknownMessageKind(u16::MAX)
         );
     }
 
     #[test]
-    fn oversized_control_payload_is_rejected_before_allocation() {
-        let mut bytes = Header::empty(MessageKind::DecodeHeif).encode();
-        let oversized = MAX_CONTROL_PAYLOAD_BYTES + 1;
-        bytes[12..16].copy_from_slice(&oversized.to_le_bytes());
+    fn control_and_render_oversize_are_rejected_from_headers_before_allocation() {
+        let mut control = Header::hello().encode();
+        control[12..16].copy_from_slice(&(MAX_CONTROL_PAYLOAD_BYTES + 1).to_le_bytes());
         assert_eq!(
-            Header::decode(bytes).unwrap_err(),
+            Header::decode(control).unwrap_err(),
             ProtocolError::PayloadTooLarge {
-                observed: oversized,
+                kind: MessageKind::Hello,
+                observed: MAX_CONTROL_PAYLOAD_BYTES + 1,
                 maximum: MAX_CONTROL_PAYLOAD_BYTES,
             }
         );
-    }
 
-    #[test]
-    fn truncated_header_reports_observed_length() {
-        let bytes = Header::empty(MessageKind::Hello).encode();
-        let mut input = Cursor::new(&bytes[..HEADER_LEN - 1]);
+        let mut render = Header::new(MessageKind::DecodeSuccess, DECODE_SUCCESS_PREFIX_LEN)
+            .unwrap()
+            .encode();
+        render[12..16].copy_from_slice(&(MAX_RENDER_PAYLOAD_BYTES + 1).to_le_bytes());
         assert_eq!(
-            read_header(&mut input).unwrap_err(),
-            ProtocolError::TruncatedHeader {
-                bytes_read: HEADER_LEN - 1,
+            Header::decode(render).unwrap_err(),
+            ProtocolError::PayloadTooLarge {
+                kind: MessageKind::DecodeSuccess,
+                observed: MAX_RENDER_PAYLOAD_BYTES + 1,
+                maximum: MAX_RENDER_PAYLOAD_BYTES,
             }
         );
     }
 
     #[test]
-    fn header_io_round_trip_uses_exact_fixed_length() {
-        let header = Header::empty(MessageKind::Ready);
+    fn truncated_header_and_payload_report_observed_lengths() {
+        let header = Header::hello().encode();
+        assert_eq!(
+            read_header(&mut Cursor::new(&header[..HEADER_LEN - 1])).unwrap_err(),
+            ProtocolError::TruncatedHeader {
+                bytes_read: HEADER_LEN - 1
+            }
+        );
+
+        let mut request = Vec::new();
+        write_header(
+            &mut request,
+            Header::new(MessageKind::DecodeHeif, DECODE_REQUEST_LEN).unwrap(),
+        )
+        .unwrap();
+        request.extend_from_slice(&[0_u8; 5]);
+        assert_eq!(
+            read_helper_command(&mut Cursor::new(request)).unwrap_err(),
+            ProtocolError::TruncatedPayload {
+                expected: DECODE_REQUEST_LEN as usize,
+                bytes_read: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn success_round_trip_validates_png_signature_ihdr_dimensions_and_request_id() {
+        let png = png_metadata(3, 2);
+        let mut response = Vec::new();
+        write_decode_success(&mut response, 77, 3, 2, &png).unwrap();
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(response.clone()), 77).unwrap(),
+            DecodeResponse::Success(DecodeSuccess {
+                request_id: 77,
+                width: 3,
+                height: 2,
+                png,
+            })
+        );
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(response), 78).unwrap_err(),
+            ProtocolError::RequestIdMismatch {
+                expected: 78,
+                observed: 77,
+            }
+        );
+    }
+
+    #[test]
+    fn fake_png_and_mismatched_ihdr_are_rejected() {
+        let fake = vec![0_u8; PNG_METADATA_LEN];
+        assert_eq!(
+            write_decode_success(&mut Vec::new(), 1, 1, 1, &fake).unwrap_err(),
+            ProtocolError::InvalidPngSignature
+        );
+
+        let mismatched = png_metadata(2, 1);
+        assert_eq!(
+            write_decode_success(&mut Vec::new(), 1, 1, 1, &mismatched).unwrap_err(),
+            ProtocolError::PngDimensionMismatch {
+                declared_width: 1,
+                declared_height: 1,
+                png_width: 2,
+                png_height: 1,
+            }
+        );
+
+        let mut malicious_response = Vec::new();
+        write_header(
+            &mut malicious_response,
+            Header::new(
+                MessageKind::DecodeSuccess,
+                DECODE_SUCCESS_PREFIX_LEN + PNG_METADATA_LEN as u32,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut prefix = [0_u8; DECODE_SUCCESS_PREFIX_LEN as usize];
+        prefix[..8].copy_from_slice(&1_u64.to_le_bytes());
+        prefix[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        prefix[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        prefix[16..20].copy_from_slice(&(PNG_METADATA_LEN as u32).to_le_bytes());
+        malicious_response.extend_from_slice(&prefix);
+        malicious_response.extend_from_slice(&fake);
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(malicious_response), 1).unwrap_err(),
+            ProtocolError::InvalidPngSignature
+        );
+    }
+
+    #[test]
+    fn error_round_trip_uses_numeric_code_and_validates_request_id() {
+        let error = DecodeError {
+            request_id: 99,
+            code: WireErrorCode::DecodeLimitExceeded,
+            arg0: 600,
+            arg1: 512,
+        };
+        let mut response = Vec::new();
+        write_decode_error(&mut response, error).unwrap();
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(response.clone()), 99).unwrap(),
+            DecodeResponse::Error(error)
+        );
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(response), 100).unwrap_err(),
+            ProtocolError::RequestIdMismatch {
+                expected: 100,
+                observed: 99,
+            }
+        );
+    }
+
+    #[test]
+    fn success_body_length_must_match_bounded_png_length_before_allocation() {
         let mut bytes = Vec::new();
-        write_header(&mut bytes, header).unwrap();
-        assert_eq!(bytes.len(), HEADER_LEN);
-        assert_eq!(read_header(&mut Cursor::new(bytes)).unwrap(), header);
+        write_header(
+            &mut bytes,
+            Header::new(MessageKind::DecodeSuccess, DECODE_SUCCESS_PREFIX_LEN + 100).unwrap(),
+        )
+        .unwrap();
+        let mut prefix = [0_u8; DECODE_SUCCESS_PREFIX_LEN as usize];
+        prefix[..8].copy_from_slice(&5_u64.to_le_bytes());
+        prefix[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        prefix[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        prefix[16..20].copy_from_slice(&10_u32.to_le_bytes());
+        bytes.extend_from_slice(&prefix);
+
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(bytes), 5).unwrap_err(),
+            ProtocolError::InvalidPayloadLength {
+                kind: MessageKind::DecodeSuccess,
+                observed: DECODE_SUCCESS_PREFIX_LEN + 100,
+                minimum: DECODE_SUCCESS_PREFIX_LEN + 10,
+                maximum: DECODE_SUCCESS_PREFIX_LEN + 10,
+            }
+        );
+    }
+
+    #[test]
+    fn truncated_success_png_reports_body_length_without_accepting_partial_render() {
+        let png = png_metadata(1, 1);
+        let mut response = Vec::new();
+        write_decode_success(&mut response, 5, 1, 1, &png).unwrap();
+        response.truncate(response.len() - 1);
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(response), 5).unwrap_err(),
+            ProtocolError::TruncatedPayload {
+                expected: png.len(),
+                bytes_read: png.len() - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn shutdown_is_an_empty_fixed_command() {
+        let mut bytes = Vec::new();
+        write_shutdown(&mut bytes).unwrap();
+        assert_eq!(
+            read_helper_command(&mut Cursor::new(bytes)).unwrap(),
+            HelperCommand::Shutdown
+        );
     }
 }
