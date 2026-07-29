@@ -103,7 +103,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-native.ps1 -Executable ".\release\ImgViewer-$version-windows-x64\ImgViewer.exe"
 ```
 
-此 smoke 覆蓋 CLI 開圖、自然排序、首尾停止、快速方向鍵、single-instance handoff、切圖過程 UIA 圖片不中斷，以及每次操作前後窗口 rect 完全相同。專案不含 WDIO／WebDriver dependency 或自動化 command；完整 PASS anchors 見 [scripts/VERIFYING.md](scripts/VERIFYING.md)。
+此 smoke 覆蓋 CLI 開圖、單次方向鍵自然排序、首尾停止、無等待 UIA
+連按的快速 latest-wins、single-instance handoff、切圖過程 UIA 圖片不中斷，
+以及每次操作前後窗口 rect 完全相同。快速 Arrow key 的同步事件與反序
+response 另由 Vitest 固定重現。專案不含 WDIO／WebDriver dependency 或
+自動化 command；完整 PASS anchors 見 [scripts/VERIFYING.md](scripts/VERIFYING.md)。
 
 正式 EXE 的 RAM smoke 同樣不使用 WDIO／WebDriver。它動態產生測試圖，循環走 single-instance 開圖，以 UI Automation 等待圖片，再統計 ImgViewer 與所有 WebView2 子程序的 peak／retained private bytes、working set、斜率與 p95 載入時間：
 
