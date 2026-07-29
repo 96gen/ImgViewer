@@ -326,6 +326,11 @@ describe("desktop security contract", () => {
     expect(read(".github/workflows/portable-release.yml")).toContain(
       "-SkipNativeSmoke -FreshNative",
     );
+    const portableVerify = read("scripts/verify-portable-release.ps1");
+    expect(portableVerify).toContain('"$artifactRoot/libx265.dll"');
+    expect(portableVerify).toContain(
+      'Assert-ExpectedFailure -Name "forbidden-codec-lib-prefix"',
+    );
   });
 
   it("preserves hard image and allocation limits in the Rust core", () => {
