@@ -36,10 +36,27 @@ describe("portable helper release contract", () => {
 
     expect(boundary).toContain("/dependents");
     expect(boundary).toMatch(
-      /ImgViewer\.exe must not import native HEIF codecs/,
+      /ImgViewer\.exe must not reach native HEIF codecs through its import graph/,
     );
     expect(boundary).toMatch(
-      /ImgViewer\.CodecHelper\.exe must directly import heif\.dll/,
+      /ImgViewer\.CodecHelper\.exe import graph must reach heif\.dll/,
+    );
+    expect(boundary).toContain("Get-ImportGraph");
+    expect(boundary).toContain("protectedCodecPaths");
+    expect(boundary).toContain("reachableImports");
+    for (const script of [
+      boundary,
+      read("scripts/build-portable.ps1"),
+      verify,
+    ]) {
+      expect(script).toMatch(/\(\?:lib\)\?/);
+      expect(script).toMatch(/x265\|aom\|avif\|dav1d\|rav1e/);
+    }
+    const build = read("scripts/build-portable.ps1");
+    expect(build).toContain("$forbiddenVcpkgPackagePattern");
+    expect(build).toContain("$installedPackageNames");
+    expect(build).toContain(
+      "vcpkg installed unapproved HEIF/AVIF codec packages",
     );
     expect(verify).toContain(
       '"$artifactRoot/ImgViewer.CodecHelper.exe"',
@@ -99,7 +116,7 @@ describe("portable helper release contract", () => {
         `${result.stdout}\n${result.stderr}`,
         `PowerShell release contract exited ${result.status}`,
       ).toContain(
-        "PASS release-contract schema=2 executables=2 helper-negative=2 import-boundary=3 sbom-required=7 helper-evidence=merged",
+        "PASS release-contract schema=2 executables=2 helper-negative=2 import-boundary=5 sbom-required=7 helper-evidence=merged",
       );
       expect(result.status).toBe(0);
     },

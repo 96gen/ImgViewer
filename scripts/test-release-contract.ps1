@@ -65,6 +65,7 @@ try {
     Write-TestFile -Name "ImgViewer.CodecHelper.exe" -Content "helper-test-binary"
     Write-TestFile -Name "heif.dll" -Content "heif-test-library"
     Write-TestFile -Name "libde265.dll" -Content "libde265-test-library"
+    Write-TestFile -Name "codec-shim.dll" -Content "shim-test-library"
     Write-TestFile -Name "vcruntime140.dll" -Content "msvc-test-runtime"
     Write-TestFile -Name "LICENSE" -Content "test"
     Write-TestFile -Name "README.md" -Content "test"
@@ -77,11 +78,26 @@ try {
 @echo off
 if /I "%~nx3"=="ImgViewer.exe" (
   if /I "%IMGVIEWER_BOUNDARY_TEST_MODE%"=="main-heif" echo     heif.dll
+  if /I "%IMGVIEWER_BOUNDARY_TEST_MODE%"=="main-shim-heif" echo     codec-shim.dll
   echo     KERNEL32.dll
   exit /b 0
 )
 if /I "%~nx3"=="ImgViewer.CodecHelper.exe" (
   if /I not "%IMGVIEWER_BOUNDARY_TEST_MODE%"=="helper-no-heif" echo     heif.dll
+  echo     KERNEL32.dll
+  exit /b 0
+)
+if /I "%~nx3"=="codec-shim.dll" (
+  if /I "%IMGVIEWER_BOUNDARY_TEST_MODE%"=="main-shim-heif" echo     heif.dll
+  echo     KERNEL32.dll
+  exit /b 0
+)
+if /I "%~nx3"=="heif.dll" (
+  echo     libde265.dll
+  echo     KERNEL32.dll
+  exit /b 0
+)
+if /I "%~nx3"=="libde265.dll" (
   echo     KERNEL32.dll
   exit /b 0
 )
@@ -100,10 +116,20 @@ exit /b 1
     Assert-TestFailure -Name "main-imports-heif" -Operation {
         & $boundaryScript -StageDirectory $stageDirectory | Out-Null
     }
+    $env:IMGVIEWER_BOUNDARY_TEST_MODE = "main-shim-heif"
+    Assert-TestFailure -Name "main-reaches-heif-through-shim" -Operation {
+        & $boundaryScript -StageDirectory $stageDirectory | Out-Null
+    }
     $env:IMGVIEWER_BOUNDARY_TEST_MODE = "helper-no-heif"
     Assert-TestFailure -Name "helper-does-not-import-heif" -Operation {
         & $boundaryScript -StageDirectory $stageDirectory | Out-Null
     }
+    $env:IMGVIEWER_BOUNDARY_TEST_MODE = "valid"
+    Write-TestFile -Name "libx265.dll" -Content "forbidden-codec-library"
+    Assert-TestFailure -Name "stage-contains-libx265" -Operation {
+        & $boundaryScript -StageDirectory $stageDirectory | Out-Null
+    }
+    Remove-Item -LiteralPath (Join-Path $stageDirectory "libx265.dll") -Force
     $env:IMGVIEWER_BOUNDARY_TEST_MODE = $previousBoundaryMode
 
     $metadata = [ordered]@{
@@ -277,7 +303,7 @@ exit /b 1
         throw "Release contract test SBOM did not merge helper payload evidence."
     }
 
-    Write-Host "PASS release-contract schema=2 executables=2 helper-negative=2 import-boundary=3 sbom-required=7 helper-evidence=merged"
+    Write-Host "PASS release-contract schema=2 executables=2 helper-negative=2 import-boundary=5 sbom-required=7 helper-evidence=merged"
 } finally {
     $env:DUMPBIN_EXE = $previousDumpbin
     $env:IMGVIEWER_BOUNDARY_TEST_MODE = $previousBoundaryMode

@@ -27,6 +27,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$forbiddenCodecFilePattern =
+    '^(?i:(?:lib)?(?:x265|aom|avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc))[^\\/]*\.(?:dll|exe)$'
+
 function Assert-SafeChildPath {
     param(
         [Parameter(Mandatory)] [string]$Parent,
@@ -388,8 +391,7 @@ try {
         }
         $forbiddenEntries = @(
             $entryNames | Where-Object {
-                [System.IO.Path]::GetFileName($_) -match
-                    '^(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
+                [System.IO.Path]::GetFileName($_) -match $forbiddenCodecFilePattern
             }
         )
         if ($forbiddenEntries.Count -gt 0) {

@@ -6,12 +6,18 @@ param(
     [switch]$SkipChecks,
     [switch]$SkipNativeSmoke,
     [switch]$KeepStage,
+    [switch]$FreshNative,
     [switch]$ReleaseMode,
     [string]$ExpectedTag
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+$forbiddenCodecFilePattern =
+    '^(?i:(?:lib)?(?:x265|aom|avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc))[^\\/]*\.(?:dll|exe)$'
+$forbiddenVcpkgPackagePattern =
+    '^(?i:(?:lib)?x265|(?:lib)?aom|(?:lib)?avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc)$'
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) "release"
@@ -242,7 +248,7 @@ if (-not $pnpm) {
 }
 
 $nativeInstallArguments = @{}
-if ($ReleaseMode) {
+if ($ReleaseMode -or $FreshNative) {
     $nativeInstallArguments.FreshInstall = $true
 }
 $runtimeBin = (& (Join-Path $PSScriptRoot "install-native-deps.ps1") @nativeInstallArguments |
@@ -268,10 +274,16 @@ $env:CI = "true"
 
 Push-Location $repoRoot
 try {
-    # libheif-sys copies heif.dll into Cargo OUT_DIR. Rust caches do not notice
-    # when vcpkg rebuilds that DLL, so remove only this package's stale native
-    # artifacts before using the HEIC test/build gate.
-    Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" libheif-sys
+    if ($ReleaseMode -or $FreshNative) {
+        # Release candidates and tags rebuild vcpkg from source. Never combine
+        # those DLLs with a restored Cargo target tree containing old native
+        # OUT_DIRs or downstream test executables.
+        Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml")
+    } else {
+        # Ordinary local packages keep the target cache, but libheif-sys still
+        # needs invalidation because Cargo does not observe a rebuilt DLL.
+        Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" libheif-sys
+    }
     Invoke-Checked $pnpm.Source install --frozen-lockfile
     if (-not $SkipChecks) {
         Invoke-Checked $pnpm.Source test
@@ -377,12 +389,10 @@ foreach ($requiredDll in @("heif.dll", "libde265.dll")) {
 
 $forbiddenCodecFiles = @(
     Get-ChildItem -LiteralPath $stageDirectory -Recurse -File |
-        Where-Object {
-            $_.Name -match '^(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
-        }
+        Where-Object { $_.Name -match $forbiddenCodecFilePattern }
 )
 if ($forbiddenCodecFiles.Count -gt 0) {
-    throw "Portable package contains a forbidden HEIF/AVIF codec: $($forbiddenCodecFiles.Name -join ', ')"
+    throw "Portable package contains an unapproved HEIF/AVIF codec: $($forbiddenCodecFiles.Name -join ', ')"
 }
 
 # A second pass deliberately has no external search roots. This proves that the
@@ -415,6 +425,22 @@ foreach ($package in @("libheif", "libde265")) {
 $installedPackages = @(& $vcpkgExe list "--x-install-root=$vcpkgInstallRoot")
 if ($LASTEXITCODE -ne 0) {
     throw "vcpkg list failed while collecting SOURCE_VERSIONS.txt metadata."
+}
+$installedPackageNames = @(
+    $installedPackages |
+        ForEach-Object {
+            if ($_ -match '^(?<package>[^:\s]+):(?<triplet>[^\s]+)\s+') {
+                [string]$Matches.package
+            }
+        } |
+        Sort-Object -Unique
+)
+$forbiddenInstalledPackages = @(
+    $installedPackageNames |
+        Where-Object { $_ -match $forbiddenVcpkgPackagePattern }
+)
+if ($forbiddenInstalledPackages.Count -gt 0) {
+    throw "vcpkg installed unapproved HEIF/AVIF codec packages: $($forbiddenInstalledPackages -join ', ')"
 }
 $libheifRow = ($installedPackages | Where-Object { $_ -match '^libheif:x64-windows\s+' } | Select-Object -First 1)
 $libde265Row = ($installedPackages | Where-Object { $_ -match '^libde265:x64-windows\s+' } | Select-Object -First 1)
@@ -627,7 +653,7 @@ try {
     }
     $forbiddenEntries = @(
         $entryNames | Where-Object {
-            [System.IO.Path]::GetFileName($_) -match '^(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
+            [System.IO.Path]::GetFileName($_) -match $forbiddenCodecFilePattern
         }
     )
     if ($forbiddenEntries.Count -gt 0) {

@@ -320,6 +320,12 @@ describe("desktop security contract", () => {
       'node_modules\\.bin\\tauri.cmd',
     );
     expect(portableBuild).not.toMatch(/\bpnpm(?:\.Source)?\s+exec\s+tauri\b/i);
+    expect(portableBuild).toMatch(
+      /if \(\$ReleaseMode -or \$FreshNative\) \{[\s\S]*?Invoke-Checked cargo clean --manifest-path \(Join-Path \$repoRoot "src-tauri\\Cargo\.toml"\)\s*\} else \{[\s\S]*?Invoke-Checked cargo clean --manifest-path \(Join-Path \$repoRoot "src-tauri\\Cargo\.toml"\) "--package" libheif-sys\s*\}/,
+    );
+    expect(read(".github/workflows/portable-release.yml")).toContain(
+      "-SkipNativeSmoke -FreshNative",
+    );
   });
 
   it("preserves hard image and allocation limits in the Rust core", () => {
