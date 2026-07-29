@@ -31,7 +31,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-native.p
 
 `build-portable.ps1` 預設會自行執行同一個 smoke；此處加入 `-SkipNativeSmoke`，是為了把建置與 smoke 的 PASS 輸出分開展示，避免重複執行。無互動式桌面的 CI 才應單獨略過此 gate。
 
-完整像素模式的 PASS anchor：輸出 `PASS switch-continuity ... uia-image-min=1 pixel=old-or-new ... webdriver=absent` 及 `PASS native-smoke formats=7 animations=2 navigation=4 continuity=1 error-recovery=1 webdriver=absent`。六種格式與 `.heif` 都須建立實際 `<img>`；GIF/WebP 各取樣到至少兩種 frame color；`1/2/10.jpg` 的中心像素須分別呈紅／綠／藍主色，快速切圖最後必須是藍色 `10.jpg`，不能只靠名稱。純紅 PNG 切到大型純綠 TIFF 時，每個 10 ms 樣本都至少要有一個 UIA Image，中心像素只能是舊紅或新綠，不可出現背景色／spinner；損壞檔後須能以方向鍵恢復。每項原生 window rect 都必須與基準完全相同。
+完整像素模式的 PASS anchor：輸出 `PASS switch-continuity ... uia-image-min=1 pixel=old-or-new ... webdriver=absent`、`PASS native-smoke formats=7 animations=2 navigation=4 continuity=1 error-recovery=1 webdriver=absent` 及關閉主程式後才產生的 `PASS codec-helper-runtime sibling=verified direct-child=1 persistent-pid=... orphan=absent webdriver=absent`。六種格式與 `.heif` 都須建立實際 `<img>`；HEIC 到 HEIF 解碼必須沿用同一個唯一 direct-child helper PID；GIF/WebP 各取樣到至少兩種 frame color；`1/2/10.jpg` 的中心像素須分別呈紅／綠／藍主色，快速切圖最後必須是藍色 `10.jpg`，不能只靠名稱。純紅 PNG 切到大型純綠 TIFF 時，每個 10 ms 樣本都至少要有一個 UIA Image，中心像素只能是舊紅或新綠，不可出現背景色／spinner；損壞檔後須能以方向鍵恢復。每項原生 window rect 都必須與基準完全相同。
 
 使用 `-SkipPixelChecks` 時只接受 `PASS switch-continuity ... uia-image-min=1 pixel=skipped ...` 及 `PASS native-ui-smoke formats=7 ... continuity=1 ... pixel-checks=skipped ...`。這代表切換期間 UIA 圖片元素不中斷、縮放控制與窗口 rect 已驗證，但不代表 framebuffer、動畫換幀或顏色連續性已通過；不可拿它取代有互動式桌面的完整 release gate。
 
@@ -53,7 +53,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-native.p
   -HandoffFormatsOnly -SkipPixelChecks
 ```
 
-它應輸出 `PASS handoff-format-smoke formats=7 animations-opened=2 rect=unchanged webdriver=absent`；此處的 `animations-opened` 只代表 animated GIF/WebP 成功建立圖片元素，不代表 framebuffer 換幀已驗證。
+它應輸出 `PASS handoff-format-smoke formats=7 animations-opened=2 rect=unchanged webdriver=absent` 與 `PASS codec-helper-runtime ... orphan=absent ...`；此處的 `animations-opened` 只代表 animated GIF/WebP 成功建立圖片元素，不代表 framebuffer 換幀已驗證。
 
 ### RAM／效能 smoke（無 WDIO／WebDriver）
 
@@ -63,7 +63,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-memory.p
   -Executable ".\release\ImgViewer-$version-windows-x64\ImgViewer.exe"
 ```
 
-腳本會循環以第二實例交接三張動態產生的 PNG，UI Automation 確認目標 `<img>` 後，遞迴合計主程式與全部 `msedgewebview2.exe` 子程序。CSV 包含每輪 load time、切圖期間 peak private/working set、固定 idle 後 retained private/working set。PASS anchor 為 `PASS memory-smoke ... webdriver=absent`；預設 gate 另檢查 retained growth、線性斜率與 p95 load。RAM 絕對值受 WebView2 版本、GPU、DPI 與螢幕影響，before／after 比較必須固定環境與參數。
+腳本先以固定 HEIC fixture 啟動唯一 direct-child helper，再循環以第二實例交接三張動態產生的 PNG。UI Automation 確認目標 `<img>` 後，總量會分別加總主程式、全部 `msedgewebview2.exe` 與 `ImgViewer.CodecHelper.exe`；CSV 另列 helper PID、private/working set 與 peak。PASS anchor 為 `PASS memory-smoke ... helper-processes=1 helper-pid=... helper-source=heic ... webdriver=absent`，以及關閉主程式後的 `PASS memory-helper-cleanup direct-child=1 persistent-pid=... orphan=absent webdriver=absent`；預設 gate另檢查包含 helper 的 retained growth、線性斜率與 p95 load。RAM 絕對值受 WebView2 版本、GPU、DPI 與螢幕影響，before／after比較必須固定環境與參數。
 
 ## 3. Portable release build
 

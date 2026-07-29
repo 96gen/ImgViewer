@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Executable,
 
+    [string]$FixtureDirectory,
+
     [ValidateRange(3, 10000)]
     [int]$Cycles = 100,
 
@@ -49,6 +51,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($FixtureDirectory)) {
+    $FixtureDirectory = Join-Path $PSScriptRoot '..\tests\fixtures'
+}
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName UIAutomationClient
@@ -262,6 +268,23 @@ function Resolve-OutputPath {
     return [IO.Path]::GetFullPath((Join-Path ([Environment]::CurrentDirectory) $Path))
 }
 
+function Test-NamedProcessRunning {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$ExpectedProcessName
+    )
+
+    $candidate = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    return (
+        $null -ne $candidate -and
+        [string]::Equals(
+            [string]$candidate.ProcessName,
+            $ExpectedProcessName,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    )
+}
+
 function Wait-Until {
     param(
         [Parameter(Mandatory = $true)][scriptblock]$Condition,
@@ -285,20 +308,27 @@ function Find-ViewerImage {
         [Parameter(Mandatory = $true)][string]$Name
     )
 
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
-    if ($null -eq $root) {
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
+        if ($null -eq $root) {
+            return $null
+        }
+        $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty,
+            $Name
+        )
+        $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Image
+        )
+        $condition = [System.Windows.Automation.AndCondition]::new($nameCondition, $typeCondition)
+        return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    }
+    catch {
+        # The WebView2 child HWND can be replaced during startup. A later poll
+        # is authoritative; an unavailable element is not a rendered image.
         return $null
     }
-    $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty,
-        $Name
-    )
-    $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Image
-    )
-    $condition = [System.Windows.Automation.AndCondition]::new($nameCondition, $typeCondition)
-    return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
 
 function Wait-ViewerImage {
@@ -406,12 +436,47 @@ function Get-ImgViewerProcessSample {
         }
     } while ($added)
 
+    $codecHelpers = @(
+        $snapshot | Where-Object {
+            $processId = [uint32]$_.ProcessId
+            $descendantIds.Contains($processId) -and
+                [string]::Equals(
+                    [string]$_.Name,
+                    'ImgViewer.CodecHelper.exe',
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+        }
+    )
+    $nonDirectHelpers = @(
+        $codecHelpers |
+            Where-Object { [uint32]$_.ParentProcessId -ne [uint32]$RootProcessId }
+    )
+    if ($nonDirectHelpers.Count -gt 0) {
+        $ids = @($nonDirectHelpers | ForEach-Object { $_.ProcessId })
+        throw "Codec helper must be a direct ImgViewer child; invalid PIDs: $($ids -join ', ')."
+    }
+    if ($codecHelpers.Count -gt 1) {
+        $ids = @($codecHelpers | ForEach-Object { $_.ProcessId })
+        throw "ImgViewer PID $RootProcessId has multiple codec helper children: $($ids -join ', ')."
+    }
+
     $selectedCandidates = @(
         $snapshot | Where-Object {
             $processId = [uint32]$_.ProcessId
             $processId -eq [uint32]$RootProcessId -or
                 ($descendantIds.Contains($processId) -and
-                    [string]::Equals($_.Name, 'msedgewebview2.exe', [StringComparison]::OrdinalIgnoreCase))
+                    (
+                        [string]::Equals(
+                            $_.Name,
+                            'msedgewebview2.exe',
+                            [StringComparison]::OrdinalIgnoreCase
+                        ) -or
+                        [string]::Equals(
+                            $_.Name,
+                            'ImgViewer.CodecHelper.exe',
+                            [StringComparison]::OrdinalIgnoreCase
+                        )
+                    ))
         }
     )
     $unreadable = @($selectedCandidates | Where-Object { -not $_.CountersAvailable })
@@ -421,9 +486,27 @@ function Get-ImgViewerProcessSample {
             return Get-ImgViewerProcessSample -RootProcessId $RootProcessId -Attempt ($Attempt + 1)
         }
         $unreadableNames = @($unreadable | ForEach-Object { "$($_.Name):$($_.ProcessId)" })
-        throw "Unable to read every ImgViewer/WebView2 memory counter: $($unreadableNames -join ', ')."
+        throw "Unable to read every ImgViewer/WebView2/helper memory counter: $($unreadableNames -join ', ')."
     }
     $selected = @($selectedCandidates | Where-Object { $_.CountersAvailable })
+    $webViews = @(
+        $selected | Where-Object {
+            [string]::Equals(
+                $_.Name,
+                'msedgewebview2.exe',
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        }
+    )
+    $helpers = @(
+        $selected | Where-Object {
+            [string]::Equals(
+                $_.Name,
+                'ImgViewer.CodecHelper.exe',
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        }
+    )
 
     [uint64]$workingSetBytes = 0
     [uint64]$privateBytes = 0
@@ -431,23 +514,34 @@ function Get-ImgViewerProcessSample {
         $workingSetBytes += [uint64]$item.WorkingSetSize
         $privateBytes += [uint64]$item.PrivatePageCount
     }
-    $webViewCount = @(
-        $selected | Where-Object {
-            [string]::Equals($_.Name, 'msedgewebview2.exe', [StringComparison]::OrdinalIgnoreCase)
-        }
-    ).Count
+    [uint64]$webViewWorkingSetBytes = 0
+    [uint64]$webViewPrivateBytes = 0
+    foreach ($item in $webViews) {
+        $webViewWorkingSetBytes += [uint64]$item.WorkingSetSize
+        $webViewPrivateBytes += [uint64]$item.PrivatePageCount
+    }
+    [uint64]$helperWorkingSetBytes = 0
+    [uint64]$helperPrivateBytes = 0
+    foreach ($item in $helpers) {
+        $helperWorkingSetBytes += [uint64]$item.WorkingSetSize
+        $helperPrivateBytes += [uint64]$item.PrivatePageCount
+    }
 
     return [pscustomobject]@{
         WorkingSetBytes = $workingSetBytes
         PrivateBytes = $privateBytes
         RootWorkingSetBytes = [uint64]$root.WorkingSetSize
         RootPrivateBytes = [uint64]$root.PrivatePageCount
-        WebViewWorkingSetBytes = $workingSetBytes - [uint64]$root.WorkingSetSize
-        WebViewPrivateBytes = $privateBytes - [uint64]$root.PrivatePageCount
+        WebViewWorkingSetBytes = $webViewWorkingSetBytes
+        WebViewPrivateBytes = $webViewPrivateBytes
+        HelperWorkingSetBytes = $helperWorkingSetBytes
+        HelperPrivateBytes = $helperPrivateBytes
         ProcessCount = $selected.Count
-        WebViewProcessCount = $webViewCount
+        WebViewProcessCount = $webViews.Count
+        HelperProcessCount = $helpers.Count
         DescendantProcessIds = [uint32[]]$descendantIds
         MeasuredProcessIds = [uint32[]]@($selected | ForEach-Object { [uint32]$_.ProcessId })
+        HelperProcessIds = [uint32[]]@($helpers | ForEach-Object { [uint32]$_.ProcessId })
     }
 }
 
@@ -465,6 +559,8 @@ function Open-ThroughExistingInstance {
     [uint64]$peakPrivateBytes = 0
     [uint64]$peakRootWorkingSetBytes = 0
     [uint64]$peakRootPrivateBytes = 0
+    [uint64]$peakHelperWorkingSetBytes = 0
+    [uint64]$peakHelperPrivateBytes = 0
     try {
         $handoff = Start-Process -FilePath $ExecutablePath `
             -ArgumentList ('"' + $ImagePath + '"') `
@@ -480,6 +576,14 @@ function Open-ThroughExistingInstance {
             $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $memory.PrivateBytes)
             $peakRootWorkingSetBytes = [Math]::Max($peakRootWorkingSetBytes, $memory.RootWorkingSetBytes)
             $peakRootPrivateBytes = [Math]::Max($peakRootPrivateBytes, $memory.RootPrivateBytes)
+            $peakHelperWorkingSetBytes = [Math]::Max(
+                $peakHelperWorkingSetBytes,
+                $memory.HelperWorkingSetBytes
+            )
+            $peakHelperPrivateBytes = [Math]::Max(
+                $peakHelperPrivateBytes,
+                $memory.HelperPrivateBytes
+            )
             if (-not $imageReady) {
                 $imageReady = $null -ne (Find-ViewerImage -Window $Window -Name ([IO.Path]::GetFileName($ImagePath)))
             }
@@ -504,12 +608,22 @@ function Open-ThroughExistingInstance {
         $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $memory.PrivateBytes)
         $peakRootWorkingSetBytes = [Math]::Max($peakRootWorkingSetBytes, $memory.RootWorkingSetBytes)
         $peakRootPrivateBytes = [Math]::Max($peakRootPrivateBytes, $memory.RootPrivateBytes)
+        $peakHelperWorkingSetBytes = [Math]::Max(
+            $peakHelperWorkingSetBytes,
+            $memory.HelperWorkingSetBytes
+        )
+        $peakHelperPrivateBytes = [Math]::Max(
+            $peakHelperPrivateBytes,
+            $memory.HelperPrivateBytes
+        )
         return [pscustomobject]@{
             LoadMilliseconds = [int][Math]::Ceiling($stopwatch.Elapsed.TotalMilliseconds)
             PeakWorkingSetBytes = $peakWorkingSetBytes
             PeakPrivateBytes = $peakPrivateBytes
             PeakRootWorkingSetBytes = $peakRootWorkingSetBytes
             PeakRootPrivateBytes = $peakRootPrivateBytes
+            PeakHelperWorkingSetBytes = $peakHelperWorkingSetBytes
+            PeakHelperPrivateBytes = $peakHelperPrivateBytes
         }
     }
     finally {
@@ -609,11 +723,29 @@ $executablePath = Resolve-ExistingFile -Path $Executable
 if (-not [string]::Equals([IO.Path]::GetExtension($executablePath), '.exe', [StringComparison]::OrdinalIgnoreCase)) {
     throw "Executable must point to an .exe file: $executablePath"
 }
+$helperExecutablePath = Resolve-ExistingFile -Path (
+    Join-Path ([IO.Path]::GetDirectoryName($executablePath)) 'ImgViewer.CodecHelper.exe'
+)
+$fixtureDirectoryPath = [IO.Path]::GetFullPath(
+    (Resolve-Path -LiteralPath $FixtureDirectory -ErrorAction Stop).Path
+)
+if (-not [IO.Directory]::Exists($fixtureDirectoryPath)) {
+    throw "Fixture directory does not exist: $FixtureDirectory"
+}
+$helperFixtureSource = Resolve-ExistingFile -Path (
+    Join-Path $fixtureDirectoryPath 'primary-second.heic'
+)
 $viewerProcessName = [IO.Path]::GetFileNameWithoutExtension($executablePath)
+$helperProcessName = [IO.Path]::GetFileNameWithoutExtension($helperExecutablePath)
 $existingViewers = @(Get-Process -Name $viewerProcessName -ErrorAction SilentlyContinue)
 if ($existingViewers.Count -gt 0) {
     $existingIds = @($existingViewers | ForEach-Object { $_.Id })
     throw "Close existing $viewerProcessName instances before running the memory smoke (PIDs: $($existingIds -join ', '))."
+}
+$existingHelpers = @(Get-Process -Name $helperProcessName -ErrorAction SilentlyContinue)
+if ($existingHelpers.Count -gt 0) {
+    $existingIds = @($existingHelpers | ForEach-Object { $_.Id })
+    throw "Close orphaned $helperProcessName instances before running the memory smoke (PIDs: $($existingIds -join ', '))."
 }
 $csvPath = Resolve-OutputPath -Path $OutputCsv
 $csvDirectory = [IO.Path]::GetDirectoryName($csvPath)
@@ -627,6 +759,10 @@ $runDirectory = Join-Path $tempRoot ("ImgViewer-memory-smoke-" + [Guid]::NewGuid
 $mainProcess = $null
 $window = [IntPtr]::Zero
 $lastTreeProcessIds = @()
+$helperProcessIds = @()
+$expectedHelperProcessId = $null
+$helperCleanupFailure = $null
+$memorySmokeCompleted = $false
 $rows = [Collections.Generic.List[object]]::new()
 
 try {
@@ -635,9 +771,11 @@ try {
     if ($images.Count -lt 3) {
         throw "Expected at least three generated images; got $($images.Count)."
     }
+    $helperFixturePath = Join-Path $runDirectory 'memory-helper-primary.heic'
+    [IO.File]::Copy($helperFixtureSource, $helperFixturePath, $false)
 
     $mainProcess = Start-Process -FilePath $executablePath `
-        -ArgumentList ('"' + $images[0] + '"') `
+        -ArgumentList ('"' + $helperFixturePath + '"') `
         -PassThru
     $window = Wait-Until -FailureMessage 'Timed out waiting for the visible ImgViewer window.' -Condition {
         $mainProcess.Refresh()
@@ -650,7 +788,34 @@ try {
         }
         return $candidate
     }
-    Wait-ViewerImage -Window $window -Name ([IO.Path]::GetFileName($images[0])) | Out-Null
+    Wait-ViewerImage `
+        -Window $window `
+        -Name ([IO.Path]::GetFileName($helperFixturePath)) | Out-Null
+    $initialSample = Get-ImgViewerProcessSample -RootProcessId $mainProcess.Id
+    if ($initialSample.WebViewProcessCount -lt 1) {
+        throw "No recursive msedgewebview2 descendant was found for ImgViewer PID $($mainProcess.Id)."
+    }
+    if ($initialSample.HelperProcessCount -ne 1) {
+        throw (
+            "HEIC startup must create exactly one direct codec helper child; " +
+            "found $($initialSample.HelperProcessCount)."
+        )
+    }
+    $expectedHelperProcessId = [int](@($initialSample.HelperProcessIds)[0])
+    $helperProcess = Get-Process -Id $expectedHelperProcessId -ErrorAction Stop
+    $actualHelperPath = [IO.Path]::GetFullPath([string]$helperProcess.Path)
+    if (-not [string]::Equals(
+            $actualHelperPath,
+            $helperExecutablePath,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw (
+            "HEIC helper was not launched from the packaged sibling: " +
+            "expected '$helperExecutablePath'; found '$actualHelperPath'."
+        )
+    }
+    $helperProcessIds = @($initialSample.HelperProcessIds)
+    $lastTreeProcessIds = @($initialSample.MeasuredProcessIds)
 
     for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
         $image = $images[$cycle % $images.Count]
@@ -668,6 +833,23 @@ try {
         if ($sample.WebViewProcessCount -lt 1) {
             throw "No recursive msedgewebview2 descendant was found for ImgViewer PID $($mainProcess.Id)."
         }
+        if ($sample.HelperProcessCount -ne 1) {
+            throw (
+                "Expected one persistent direct codec helper at cycle $cycle; " +
+                "found $($sample.HelperProcessCount)."
+            )
+        }
+        $observedHelperProcessId = [int](@($sample.HelperProcessIds)[0])
+        if ($observedHelperProcessId -ne $expectedHelperProcessId) {
+            throw (
+                "Codec helper PID changed during memory smoke at cycle ${cycle}: " +
+                "expected $expectedHelperProcessId; found $observedHelperProcessId."
+            )
+        }
+        $helperProcessIds = @(
+            @($helperProcessIds) + @($sample.HelperProcessIds) |
+                Sort-Object -Unique
+        )
         $row = [pscustomobject]@{
             TimestampUtc = [DateTime]::UtcNow.ToString('o')
             Cycle = $cycle
@@ -680,12 +862,18 @@ try {
             RootPrivatePageCountBytes = $sample.RootPrivateBytes
             WebViewWorkingSetSizeBytes = $sample.WebViewWorkingSetBytes
             WebViewPrivatePageCountBytes = $sample.WebViewPrivateBytes
+            HelperWorkingSetSizeBytes = $sample.HelperWorkingSetBytes
+            HelperPrivatePageCountBytes = $sample.HelperPrivateBytes
             PeakWorkingSetSizeBytes = $load.PeakWorkingSetBytes
             PeakPrivatePageCountBytes = $load.PeakPrivateBytes
             PeakRootWorkingSetSizeBytes = $load.PeakRootWorkingSetBytes
             PeakRootPrivatePageCountBytes = $load.PeakRootPrivateBytes
+            PeakHelperWorkingSetSizeBytes = $load.PeakHelperWorkingSetBytes
+            PeakHelperPrivatePageCountBytes = $load.PeakHelperPrivateBytes
             ProcessCount = $sample.ProcessCount
             WebViewProcessCount = $sample.WebViewProcessCount
+            HelperProcessCount = $sample.HelperProcessCount
+            HelperProcessId = $observedHelperProcessId
         }
         $rows.Add($row)
         if ($cycle -eq 1) {
@@ -715,6 +903,12 @@ try {
     [double]$peakRootWorkingSetMiB = (
         $measured | Measure-Object -Property PeakRootWorkingSetSizeBytes -Maximum
     ).Maximum / 1MB
+    [double]$peakHelperPrivateMiB = (
+        $measured | Measure-Object -Property PeakHelperPrivatePageCountBytes -Maximum
+    ).Maximum / 1MB
+    [double]$peakHelperWorkingSetMiB = (
+        $measured | Measure-Object -Property PeakHelperWorkingSetSizeBytes -Maximum
+    ).Maximum / 1MB
 
     $failures = [Collections.Generic.List[string]]::new()
     if ($retainedPrivateMiB -gt $MaxRetainedPrivateMiB) {
@@ -743,8 +937,10 @@ try {
         'retained-working-set-mib={7:F2} working-set-slope-mib-per-cycle={8:F3} ' +
         'peak-private-mib={9:F2} peak-working-set-mib={10:F2} ' +
         'peak-root-private-mib={11:F2} peak-root-working-set-mib={12:F2} ' +
-        'p95-load-ms={13:F0} processes={14} webview-processes={15} ' +
-        'measurement=peak-poll-plus-uia-image-then-fixed-idle webdriver=absent csv="{16}"'
+        'peak-helper-private-mib={13:F2} peak-helper-working-set-mib={14:F2} ' +
+        'p95-load-ms={15:F0} processes={16} webview-processes={17} ' +
+        'helper-processes={18} helper-pid={19} helper-source=heic ' +
+        'measurement=peak-poll-plus-uia-image-then-fixed-idle webdriver=absent csv="{20}"'
     )
     Write-Output ($summaryFormat -f
         $Cycles,
@@ -760,17 +956,26 @@ try {
         $peakWorkingSetMiB,
         $peakRootPrivateMiB,
         $peakRootWorkingSetMiB,
+        $peakHelperPrivateMiB,
+        $peakHelperWorkingSetMiB,
         $p95LoadMilliseconds,
         $finalSample.ProcessCount,
         $finalSample.WebViewProcessCount,
+        $finalSample.HelperProcessCount,
+        $finalSample.HelperProcessId,
         $csvPath
     )
+    $memorySmokeCompleted = $true
 }
 finally {
     if ($null -ne $mainProcess) {
         try {
             $cleanupSample = Get-ImgViewerProcessSample -RootProcessId $mainProcess.Id
             $lastTreeProcessIds = @($cleanupSample.MeasuredProcessIds)
+            $helperProcessIds = @(
+                @($helperProcessIds) + @($cleanupSample.HelperProcessIds) |
+                    Sort-Object -Unique
+            )
         }
         catch {}
     }
@@ -792,17 +997,46 @@ finally {
         catch {}
         $mainProcess.Dispose()
     }
+    foreach ($helperProcessId in @($helperProcessIds | Sort-Object -Unique)) {
+        $helperExitDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while ((Test-NamedProcessRunning `
+                -ProcessId ([int]$helperProcessId) `
+                -ExpectedProcessName $helperProcessName) -and
+            [DateTime]::UtcNow -lt $helperExitDeadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        if (Test-NamedProcessRunning `
+                -ProcessId ([int]$helperProcessId) `
+                -ExpectedProcessName $helperProcessName) {
+            $helperCleanupFailure = (
+                "Codec helper PID $helperProcessId remained alive after ImgViewer exited."
+            )
+            try {
+                Stop-Process -Id ([int]$helperProcessId) -Force -ErrorAction SilentlyContinue
+            }
+            catch {}
+        }
+    }
+    if (-not $helperCleanupFailure -and
+        $null -ne $expectedHelperProcessId -and
+        $memorySmokeCompleted) {
+        Write-Output (
+            "PASS memory-helper-cleanup direct-child=1 " +
+            "persistent-pid=$expectedHelperProcessId orphan=absent webdriver=absent"
+        )
+    }
     $allowedCleanupNames = @(
         [IO.Path]::GetFileName($executablePath),
-        'msedgewebview2.exe'
+        'msedgewebview2.exe',
+        [IO.Path]::GetFileName($helperExecutablePath)
+    )
+    $allowedProcessNames = @(
+        $allowedCleanupNames |
+            ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) }
     )
     foreach ($processId in @($lastTreeProcessIds | Sort-Object -Descending -Unique)) {
         try {
             $candidate = Get-Process -Id ([int]$processId) -ErrorAction SilentlyContinue
-            $allowedProcessNames = @(
-                [IO.Path]::GetFileNameWithoutExtension($allowedCleanupNames[0]),
-                [IO.Path]::GetFileNameWithoutExtension($allowedCleanupNames[1])
-            )
             if ($null -ne $candidate -and $allowedProcessNames -contains $candidate.ProcessName) {
                 Stop-Process -Id ([int]$processId) -Force -ErrorAction SilentlyContinue
             }
@@ -818,5 +1052,8 @@ finally {
         ) -and
         [IO.Directory]::Exists($resolvedRunDirectory)) {
         [IO.Directory]::Delete($resolvedRunDirectory, $true)
+    }
+    if ($helperCleanupFailure) {
+        throw $helperCleanupFailure
     }
 }
