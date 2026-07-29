@@ -104,6 +104,91 @@ function ConvertTo-SafeRepositoryUrl {
     return $null
 }
 
+function Get-MsvcRedistDirectories {
+    $results = [System.Collections.Generic.List[string]]::new()
+
+    if ($env:VCToolsRedistDir) {
+        Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir "x64") `
+            -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+            ForEach-Object { $results.Add($_.FullName) }
+    }
+
+    $vswhere = $null
+    if ($env:VSWHERE_EXE -and (Test-Path -LiteralPath $env:VSWHERE_EXE -PathType Leaf)) {
+        $vswhere = $env:VSWHERE_EXE
+    } elseif (${env:ProgramFiles(x86)}) {
+        $candidate = Join-Path ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $vswhere = $candidate
+        }
+    }
+
+    if ($vswhere) {
+        $installationPath = (
+            & $vswhere -latest -products * `
+                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                -property installationPath |
+                Select-Object -First 1
+        )
+        if ($installationPath) {
+            Get-ChildItem -LiteralPath (Join-Path $installationPath "VC\Redist\MSVC") `
+                -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending |
+                ForEach-Object {
+                    Get-ChildItem -LiteralPath (Join-Path $_.FullName "x64") `
+                        -Directory -Filter "Microsoft.VC*.CRT" `
+                        -ErrorAction SilentlyContinue |
+                        ForEach-Object { $results.Add($_.FullName) }
+                }
+        }
+    }
+
+    return @($results | Select-Object -Unique)
+}
+
+function Assert-NativeLibraryLoadable {
+    param([Parameter(Mandatory)] [string]$LibraryPath)
+
+    if (-not ("ImgViewerBuildNativeLoader" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ImgViewerBuildNativeLoader
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr LoadLibraryExW(
+        string fileName,
+        IntPtr file,
+        uint flags
+    );
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool FreeLibrary(IntPtr module);
+}
+'@
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($LibraryPath)
+    # LOAD_WITH_ALTERED_SEARCH_PATH starts dependency lookup beside the target
+    # DLL, then uses the inherited process search path containing the matching
+    # VC runtime directories selected above.
+    $module = [ImgViewerBuildNativeLoader]::LoadLibraryExW(
+        $fullPath,
+        [IntPtr]::Zero,
+        0x00000008
+    )
+    if ($module -eq [IntPtr]::Zero) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Native test DLL failed LoadLibraryExW before Cargo tests: $([IO.Path]::GetFileName($fullPath)) (Win32 $errorCode)."
+    }
+    if (-not [ImgViewerBuildNativeLoader]::FreeLibrary($module)) {
+        throw "Native test DLL failed FreeLibrary: $([IO.Path]::GetFileName($fullPath))."
+    }
+}
+
 $packageVersion = [string](Get-Content -LiteralPath (Join-Path $repoRoot "package.json") -Raw |
     ConvertFrom-Json).version
 $cargoVersion = Get-CargoPackageVersion -ManifestPath (Join-Path $repoRoot "src-tauri\Cargo.toml")
@@ -238,13 +323,33 @@ $previousVcpkgRsDynamic = $env:VCPKGRS_DYNAMIC
 $previousVcpkgRsTriplet = $env:VCPKGRS_TRIPLET
 $previousPath = $env:PATH
 $previousCi = $env:CI
+$msvcRuntimeDirectories = @(Get-MsvcRedistDirectories)
+if ($msvcRuntimeDirectories.Count -eq 0) {
+    throw "The matching MSVC x64 redistributable directory was not found before native tests."
+}
 $env:VCPKG_ROOT = $vcpkgRoot
 $env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
 $env:VCPKG_DEFAULT_HOST_TRIPLET = "x64-windows"
 $env:VCPKGRS_DYNAMIC = "1"
 $env:VCPKGRS_TRIPLET = "x64-windows"
-$env:PATH = "$runtimeBin$([System.IO.Path]::PathSeparator)$previousPath"
+$env:PATH = (
+    @($runtimeBin) + $msvcRuntimeDirectories + @($previousPath) -join
+        [System.IO.Path]::PathSeparator
+)
 $env:CI = "true"
+Write-Host "MSVC test runtime search: $($msvcRuntimeDirectories -join '; ')"
+foreach ($nativeTestDll in @("libde265.dll", "heif.dll")) {
+    $nativeTestDllPath = Join-Path $runtimeBin $nativeTestDll
+    if (-not (Test-Path -LiteralPath $nativeTestDllPath -PathType Leaf)) {
+        throw "Native dependency install did not produce $nativeTestDll."
+    }
+    $nativeTestDllHash = (
+        Get-FileHash -LiteralPath $nativeTestDllPath -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    Write-Host "Native test DLL: $nativeTestDll sha256=$nativeTestDllHash"
+    Assert-NativeLibraryLoadable -LibraryPath $nativeTestDllPath
+}
+Write-Host "PASS native-test-loader dlls=2 msvc-runtime=explicit"
 
 Push-Location $repoRoot
 try {

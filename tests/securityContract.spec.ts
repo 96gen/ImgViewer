@@ -163,6 +163,11 @@ describe("desktop security contract", () => {
     expect(read(".github/workflows/portable-release.yml")).toContain(
       "-SkipNativeSmoke -FreshNative",
     );
+    expect(portableBuild).toContain("Get-MsvcRedistDirectories");
+    expect(portableBuild).toContain("Assert-NativeLibraryLoadable");
+    expect(portableBuild).toContain(
+      "PASS native-test-loader dlls=2 msvc-runtime=explicit",
+    );
     const portableVerify = read("scripts/verify-portable-release.ps1");
     expect(portableVerify).toContain('"$artifactRoot/libx265.dll"');
     expect(portableVerify).toContain(
