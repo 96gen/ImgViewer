@@ -123,3 +123,6 @@ PASS anchor：兩台 VM 都不需安裝 ImgViewer 或 HEIF Extension即可解碼
   dependency scan 必須以 unresolved DLL 非零結束，不得誤報 PASS。
 - 將 PNG 改名成 `.jpg`：應回報格式偽裝，不得依副檔名直接顯示。
 - 暫時移走 `ImgViewer.CodecHelper.exe`，或修改其任一 byte：`verify-portable-release.ps1` 必須分別以 missing-helper 或 helper-hash-mismatch 拒絕。
+- 將 `BUILD_METADATA.json` 的 `native.platformToolset` 改成 `v145`：
+  `verify-portable-release.ps1` 與 SBOM 產生器都必須拒絕，不能把 runner
+  自動選到的新 toolset 當成已審核的 VC143 產物。

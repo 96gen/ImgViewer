@@ -233,6 +233,39 @@ describe("desktop security contract", () => {
     }
   });
 
+  it("pins native codec builds and packaged runtimes to MSVC v143", () => {
+    const triplet = read("vcpkg-triplets/x64-windows.cmake");
+    const configuration = JSON.parse(read("vcpkg-configuration.json"));
+    const installer = read("scripts/install-native-deps.ps1");
+    const build = read("scripts/build-portable.ps1");
+    const dependencyResolver = read(
+      "scripts/Resolve-NativeDependencies.ps1",
+    );
+    const releaseWorkflow = read(".github/workflows/portable-release.yml");
+
+    expect(configuration["overlay-triplets"]).toEqual([
+      "vcpkg-triplets",
+    ]);
+    expect(triplet).toMatch(
+      /^set\(VCPKG_PLATFORM_TOOLSET v143\)$/m,
+    );
+    expect(triplet).toMatch(/^set\(VCPKG_CRT_LINKAGE dynamic\)$/m);
+    expect(triplet).toMatch(/^set\(VCPKG_LIBRARY_LINKAGE dynamic\)$/m);
+    expect(installer).toContain('"--overlay-triplets=$overlayTriplets"');
+    expect(installer).toContain(
+      "VCPKG_PLATFORM_TOOLSET\\s+v143",
+    );
+    expect(build).toContain('"Microsoft.VC143.CRT"');
+    expect(build).toContain("& $vswhere -all -products *");
+    expect(build).toContain('platformToolset = "v143"');
+    expect(build).toContain("app-local=1");
+    expect(dependencyResolver).toContain('"Microsoft.VC143.CRT"');
+    expect(dependencyResolver).toContain("& $vswhere -all -products *");
+    expect(releaseWorkflow).toContain(
+      "'vcpkg-configuration.json', 'vcpkg-triplets/**'",
+    );
+  });
+
   it("keeps unsafe Rust inside reviewed Win32 and codec FFI adapters", () => {
     const rustPaths = [
       ...filesBelow("src-tauri/src"),
@@ -329,7 +362,7 @@ describe("desktop security contract", () => {
     expect(portableBuild).toContain("Get-MsvcRedistDirectories");
     expect(portableBuild).toContain("Assert-NativeLibraryLoadable");
     expect(portableBuild).toContain(
-      "PASS native-test-loader dlls=2 msvc-runtime=explicit",
+      "PASS native-test-loader dlls=2 msvc-runtime=v143 app-local=1",
     );
     const portableVerify = read("scripts/verify-portable-release.ps1");
     expect(portableVerify).toContain('"$artifactRoot/libx265.dll"');

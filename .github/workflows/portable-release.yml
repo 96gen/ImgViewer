@@ -78,7 +78,7 @@ jobs:
         uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1
         with:
           workspaces: src-tauri -> target
-          key: native-${{ hashFiles('vcpkg.json', 'vcpkg-overlays/ports/libheif/**') }}
+          key: native-v143-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-triplets/**', 'vcpkg-overlays/ports/libheif/**') }}
 
       - name: Cache vcpkg downloads and binary archives
         # actions/cache v4.3.0.
@@ -87,7 +87,7 @@ jobs:
           path: |
             .tools/vcpkg-downloads
             ~/AppData/Local/vcpkg/archives
-          key: vcpkg-2026.05.25-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-overlays/ports/libheif/**') }}
+          key: vcpkg-2026.05.25-x64-windows-v143-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-triplets/**', 'vcpkg-overlays/ports/libheif/**') }}
 
       - name: Build package once
         id: package
@@ -425,6 +425,9 @@ jobs:
           Write-Host "PASS expected-failure=attestation-source-digest-mismatch"
           $sbom = Get-Content -LiteralPath "./release-assets/$artifactName.cdx.json" -Raw | ConvertFrom-Json
           $buildMetadata = Get-Content -LiteralPath "./release-assets/$artifactName.build.json" -Raw | ConvertFrom-Json
+          if ([string]$buildMetadata.native.platformToolset -cne "v143") {
+            throw "Release metadata does not use the pinned MSVC v143 toolset."
+          }
           $componentNames = @($sbom.components | ForEach-Object { [string]$_.name })
           $requiredComponents = @(
             "imgviewer",
@@ -437,6 +440,22 @@ jobs:
           foreach ($required in $requiredComponents) {
             if ($componentNames -cnotcontains $required) {
               throw "CycloneDX SBOM is missing $required."
+            }
+          }
+          $nativeComponents = @(
+            $sbom.components |
+              Where-Object { [string]$_.name -in $requiredComponents[4..($requiredComponents.Count - 1)] }
+          )
+          foreach ($component in $nativeComponents) {
+            $toolsetProperty = @(
+              $component.properties |
+                Where-Object {
+                  [string]$_.name -ceq "imgviewer:msvc-platform-toolset" -and
+                  [string]$_.value -ceq "v143"
+                }
+            )
+            if ($toolsetProperty.Count -ne 1) {
+              throw "CycloneDX component '$($component.name)' is missing the pinned MSVC v143 property."
             }
           }
           $assetHashes = @($assetFiles | ForEach-Object {

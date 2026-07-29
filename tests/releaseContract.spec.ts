@@ -140,7 +140,7 @@ describe("portable helper release contract", () => {
         `${result.stdout}\n${result.stderr}`,
         `PowerShell release contract exited ${result.status}`,
       ).toContain(
-        "PASS release-contract schema=2 executables=2 helper-negative=2 import-boundary=5 sbom-required=7 helper-evidence=merged",
+        "PASS release-contract schema=2 executables=2 helper-negative=2 toolset-negative=1 import-boundary=5 sbom-required=7 helper-evidence=merged",
       );
       expect(result.status).toBe(0);
     },

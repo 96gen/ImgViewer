@@ -75,11 +75,47 @@ try {
     $targetDirectory = [string]($metadata | ConvertFrom-Json).target_directory
     $helperSource = Join-Path $targetDirectory "debug\imgviewer-codec-helper.exe"
     $testDirectory = Join-Path $targetDirectory "debug\deps"
+    $nativeStage = Join-Path $targetDirectory "debug\native-test-v143"
     $helperTarget = Join-Path $testDirectory "ImgViewer.CodecHelper.exe"
     if (-not (Test-Path -LiteralPath $helperSource)) {
         throw "Built helper was not found at $helperSource."
     }
+    $targetRoot = [IO.Path]::GetFullPath($targetDirectory).TrimEnd('\', '/') +
+        [IO.Path]::DirectorySeparatorChar
+    $nativeStageFull = [IO.Path]::GetFullPath($nativeStage)
+    if (-not $nativeStageFull.StartsWith(
+        $targetRoot,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Refusing to stage native test DLLs outside Cargo target: $nativeStageFull"
+    }
+    if (Test-Path -LiteralPath $nativeStageFull) {
+        $nativeStageItem = Get-Item -LiteralPath $nativeStageFull -Force
+        if (($nativeStageItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing to replace a native test runtime reparse point: $nativeStageFull"
+        }
+        Remove-Item -LiteralPath $nativeStageFull -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $nativeStageFull | Out-Null
+    foreach ($nativeCodecDll in @("heif.dll", "libde265.dll")) {
+        Copy-Item -LiteralPath (Join-Path $nativeBin $nativeCodecDll) `
+            -Destination (Join-Path $nativeStageFull $nativeCodecDll)
+    }
+    & (Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1") `
+        -StageDirectory $nativeStageFull `
+        -SearchDirectory $nativeBin `
+        -CopyDependencies `
+        -RequireBundledMsvcRuntime | Write-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to stage the app-local MSVC v143 helper test runtime."
+    }
+
     New-Item -ItemType Directory -Force -Path $testDirectory | Out-Null
+    Get-ChildItem -LiteralPath $nativeStageFull -File -Filter "*.dll" |
+        ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName `
+                -Destination (Join-Path $testDirectory $_.Name) -Force
+        }
     Copy-Item -LiteralPath $helperSource -Destination $helperTarget -Force
 
     & cargo test --locked --manifest-path $manifestPath --package imgviewer `
@@ -92,7 +128,7 @@ try {
 
     Write-Output (
         "PASS codec-helper-process primary=3x5 persistent=2 crash-recovery=1 " +
-        "handle-release=4 helper=$helperTarget"
+        "handle-release=4 app-local-v143=1 helper=$helperTarget"
     )
 } finally {
     foreach ($entry in $savedEnvironment.GetEnumerator()) {

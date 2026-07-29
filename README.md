@@ -156,7 +156,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 腳本會依序：
 
 1. 驗證並 bootstrap 固定版 vcpkg。
-2. 以 dynamic `x64-windows` 安裝 `libheif[core]`；`default-features: false` 排除 x265 與非必要 codec，overlay 關閉 runtime plugin loading。
+2. 以 dynamic `x64-windows` 安裝 `libheif[core]`，overlay triplet 固定 MSVC `v143`，避免 hosted runner 新增 Visual Studio toolset 後悄悄改變 native ABI；`default-features: false` 排除 x265 與非必要 codec，overlay port 關閉 runtime plugin loading。
 3. 對全 Rust workspace 跑無 HEIC 測試，再對 codec core／helper 跑
    HEIC 測試；Tauri 主程式以 `--no-bundle` 且不含 HEIC 建置，helper
    另以 `--features heic` 建置。

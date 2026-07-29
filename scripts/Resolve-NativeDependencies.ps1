@@ -45,9 +45,10 @@ function Get-DumpbinPath {
 
 function Get-MsvcRedistDirectories {
     $results = [System.Collections.Generic.List[string]]::new()
+    $runtimeDirectoryName = "Microsoft.VC143.CRT"
 
     if ($env:VCToolsRedistDir) {
-        Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir "x64") -Directory -Filter $runtimeDirectoryName -ErrorAction SilentlyContinue |
             ForEach-Object { $results.Add($_.FullName) }
     }
 
@@ -62,18 +63,40 @@ function Get-MsvcRedistDirectories {
     }
 
     if ($vswhere) {
-        $installationPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
-        if ($installationPath) {
+        $installationPaths = @(
+            & $vswhere -all -products * `
+                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                -property installationPath
+        )
+        foreach ($installationPath in $installationPaths) {
             Get-ChildItem -LiteralPath (Join-Path $installationPath "VC\Redist\MSVC") -Directory -ErrorAction SilentlyContinue |
                 Sort-Object Name -Descending |
                 ForEach-Object {
-                    Get-ChildItem -LiteralPath (Join-Path $_.FullName "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+                    Get-ChildItem -LiteralPath (Join-Path $_.FullName "x64") -Directory -Filter $runtimeDirectoryName -ErrorAction SilentlyContinue |
                         ForEach-Object { $results.Add($_.FullName) }
                 }
         }
     }
 
-    return @($results | Select-Object -Unique)
+    return @(
+        $results |
+            Select-Object -Unique |
+            Sort-Object {
+                $runtimePath = Join-Path $_ "VCRUNTIME140.dll"
+                if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+                    return [version]"0.0"
+                }
+                try {
+                    return [version](
+                        [Diagnostics.FileVersionInfo]::GetVersionInfo(
+                            $runtimePath
+                        ).FileVersion
+                    )
+                } catch {
+                    return [version]"0.0"
+                }
+            } -Descending
+    )
 }
 
 function Get-ImportedDlls {

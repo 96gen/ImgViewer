@@ -18,6 +18,9 @@
 
 ### Security
 
+- vcpkg `x64-windows` 改由 overlay triplet 固定 MSVC `v143`，native probe、
+  Cargo tests 與 portable DLL 收集只使用同代 VC143 runtime，避免 Windows
+  runner 同時安裝 VS 2026 `v145` 後產生不可重現或無法載入的 `heif.dll`。
 - helper timeout、取消、pipe 中斷、codec crash 或不合法回應都會終止整個
   Job；不重試同一張不可信圖片，下一次選取才建立乾淨 helper。
 - Rust `unsafe` 收斂到明列的 Win32 與 codec FFI adapter；契約測試要求每個

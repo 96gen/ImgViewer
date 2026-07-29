@@ -111,10 +111,11 @@ function ConvertTo-SafeRepositoryUrl {
 
 function Get-MsvcRedistDirectories {
     $results = [System.Collections.Generic.List[string]]::new()
+    $runtimeDirectoryName = "Microsoft.VC143.CRT"
 
     if ($env:VCToolsRedistDir) {
         Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir "x64") `
-            -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+            -Directory -Filter $runtimeDirectoryName -ErrorAction SilentlyContinue |
             ForEach-Object { $results.Add($_.FullName) }
     }
 
@@ -130,26 +131,43 @@ function Get-MsvcRedistDirectories {
     }
 
     if ($vswhere) {
-        $installationPath = (
-            & $vswhere -latest -products * `
+        $installationPaths = @(
+            & $vswhere -all -products * `
                 -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-                -property installationPath |
-                Select-Object -First 1
+                -property installationPath
         )
-        if ($installationPath) {
+        foreach ($installationPath in $installationPaths) {
             Get-ChildItem -LiteralPath (Join-Path $installationPath "VC\Redist\MSVC") `
                 -Directory -ErrorAction SilentlyContinue |
                 Sort-Object Name -Descending |
                 ForEach-Object {
                     Get-ChildItem -LiteralPath (Join-Path $_.FullName "x64") `
-                        -Directory -Filter "Microsoft.VC*.CRT" `
+                        -Directory -Filter $runtimeDirectoryName `
                         -ErrorAction SilentlyContinue |
                         ForEach-Object { $results.Add($_.FullName) }
                 }
         }
     }
 
-    return @($results | Select-Object -Unique)
+    return @(
+        $results |
+            Select-Object -Unique |
+            Sort-Object {
+                $runtimePath = Join-Path $_ "VCRUNTIME140.dll"
+                if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+                    return [version]"0.0"
+                }
+                try {
+                    return [version](
+                        [Diagnostics.FileVersionInfo]::GetVersionInfo(
+                            $runtimePath
+                        ).FileVersion
+                    )
+                } catch {
+                    return [version]"0.0"
+                }
+            } -Descending
+    )
 }
 
 function Assert-NativeLibraryLoadable {
@@ -178,8 +196,8 @@ public static class ImgViewerBuildNativeLoader
 
     $fullPath = [System.IO.Path]::GetFullPath($LibraryPath)
     # LOAD_WITH_ALTERED_SEARCH_PATH starts dependency lookup beside the target
-    # DLL, then uses the inherited process search path containing the matching
-    # VC runtime directories selected above.
+    # DLL. The probe directory deliberately contains the codec closure and the
+    # pinned VC143 runtime, matching the final portable application directory.
     $module = [ImgViewerBuildNativeLoader]::LoadLibraryExW(
         $fullPath,
         [IntPtr]::Zero,
@@ -331,6 +349,7 @@ if (-not $pnpm) {
 if (-not $pnpm) {
     throw "pnpm is required. Install the version declared by packageManager in package.json."
 }
+$cargoCommand = Get-Command cargo.exe -ErrorAction Stop
 
 $nativeInstallArguments = @{}
 if ($ReleaseMode -or $FreshNative) {
@@ -351,21 +370,40 @@ $previousPath = $env:PATH
 $previousCi = $env:CI
 $msvcRuntimeDirectories = @(Get-MsvcRedistDirectories)
 if ($msvcRuntimeDirectories.Count -eq 0) {
-    throw "The matching MSVC x64 redistributable directory was not found before native tests."
+    throw "The pinned MSVC v143 x64 redistributable directory was not found before native tests."
+}
+$nativeTestDirectory = Join-Path $repoRoot ".tools\native-test-v143"
+Assert-SafeChildPath -Parent (Join-Path $repoRoot ".tools") -Child $nativeTestDirectory
+if (Test-Path -LiteralPath $nativeTestDirectory) {
+    $nativeTestItem = Get-Item -LiteralPath $nativeTestDirectory -Force
+    if (($nativeTestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to replace a native test runtime reparse point: $nativeTestDirectory"
+    }
+    Remove-Item -LiteralPath $nativeTestDirectory -Recurse -Force
+}
+New-Item -ItemType Directory -Path $nativeTestDirectory | Out-Null
+foreach ($nativeCodecDll in @("libde265.dll", "heif.dll")) {
+    Copy-Item -LiteralPath (Join-Path $runtimeBin $nativeCodecDll) `
+        -Destination (Join-Path $nativeTestDirectory $nativeCodecDll)
+}
+& (Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1") `
+    -StageDirectory $nativeTestDirectory `
+    -SearchDirectory (@($runtimeBin) + $msvcRuntimeDirectories) `
+    -CopyDependencies `
+    -RequireBundledMsvcRuntime | Write-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to stage the isolated MSVC v143 native test runtime."
 }
 $env:VCPKG_ROOT = $vcpkgRoot
 $env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
 $env:VCPKG_DEFAULT_HOST_TRIPLET = "x64-windows"
 $env:VCPKGRS_DYNAMIC = "1"
 $env:VCPKGRS_TRIPLET = "x64-windows"
-$env:PATH = (
-    @($runtimeBin) + $msvcRuntimeDirectories + @($previousPath) -join
-        [System.IO.Path]::PathSeparator
-)
+$env:PATH = @($nativeTestDirectory, $previousPath) -join [IO.Path]::PathSeparator
 $env:CI = "true"
-Write-Host "MSVC test runtime search: $($msvcRuntimeDirectories -join '; ')"
+Write-Host "MSVC v143 test runtime search: $($msvcRuntimeDirectories -join '; ')"
 foreach ($nativeTestDll in @("libde265.dll", "heif.dll")) {
-    $nativeTestDllPath = Join-Path $runtimeBin $nativeTestDll
+    $nativeTestDllPath = Join-Path $nativeTestDirectory $nativeTestDll
     if (-not (Test-Path -LiteralPath $nativeTestDllPath -PathType Leaf)) {
         throw "Native dependency install did not produce $nativeTestDll."
     }
@@ -375,7 +413,7 @@ foreach ($nativeTestDll in @("libde265.dll", "heif.dll")) {
     Write-Host "Native test DLL: $nativeTestDll sha256=$nativeTestDllHash"
     Assert-NativeLibraryLoadable -LibraryPath $nativeTestDllPath
 }
-Write-Host "PASS native-test-loader dlls=2 msvc-runtime=explicit"
+Write-Host "PASS native-test-loader dlls=2 msvc-runtime=v143 app-local=1"
 
 Push-Location $repoRoot
 try {
@@ -394,8 +432,27 @@ try {
         Invoke-Checked $pnpm.Source test
         Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --all-targets --no-default-features "--" "-Dwarnings"
         Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --no-default-features
-        foreach ($codecPackage in @("imgviewer-codec-core", "imgviewer-codec-helper")) {
+        $codecPackages = @("imgviewer-codec-core", "imgviewer-codec-helper")
+        foreach ($codecPackage in $codecPackages) {
             Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --all-targets --no-default-features --features heic "--" "-Dwarnings"
+            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic --no-run
+        }
+        $cargoMetadata = Invoke-Captured -FilePath $cargoCommand.Source -Arguments @(
+            "metadata", "--locked", "--manifest-path",
+            (Join-Path $repoRoot "src-tauri\Cargo.toml"),
+            "--format-version", "1", "--no-deps"
+        )
+        $cargoTestDirectory = Join-Path (
+            [string]($cargoMetadata | ConvertFrom-Json).target_directory
+        ) "debug\deps"
+        New-Item -ItemType Directory -Path $cargoTestDirectory -Force | Out-Null
+        Get-ChildItem -LiteralPath $nativeTestDirectory -File -Filter "*.dll" |
+            ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName `
+                    -Destination (Join-Path $cargoTestDirectory $_.Name) -Force
+            }
+        Write-Host "PASS native-test-stage target=debug/deps app-local-dlls=$(@(Get-ChildItem -LiteralPath $nativeTestDirectory -File -Filter '*.dll').Count)"
+        foreach ($codecPackage in $codecPackages) {
             Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic
         }
     }
@@ -479,7 +536,7 @@ Copy-Item -LiteralPath $builtHelper -Destination (
 
 & (Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1") `
     -StageDirectory $stageDirectory `
-    -SearchDirectory $runtimeBin `
+    -SearchDirectory (@($runtimeBin) + $msvcRuntimeDirectories) `
     -CopyDependencies `
     -RequireBundledMsvcRuntime | Write-Host
 if ($LASTEXITCODE -ne 0) {
@@ -591,6 +648,7 @@ vcpkg checkout / builtin baseline: d015e31e90838a4c9dfa3eed45979bc70d9357fc
 vcpkg-tool release: 2026-04-08
 vcpkg-tool SHA-256: $vcpkgToolSha256
 $vcpkgToolVersion
+MSVC platform toolset: v143
 libheif overlay: upstream pinned port with ENABLE_PLUGIN_LOADING=OFF
 $libheifRow
 $libde265Row
@@ -609,7 +667,6 @@ $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 
 $nodeCommand = Get-Command node.exe -ErrorAction Stop
 $rustcCommand = Get-Command rustc.exe -ErrorAction Stop
-$cargoCommand = Get-Command cargo.exe -ErrorAction Stop
 $vcpkgRevision = if ($git) {
     Invoke-Captured -FilePath $git.Source -Arguments @(
         "-C", $vcpkgRoot, "rev-parse", "--verify", "HEAD"
@@ -700,6 +757,7 @@ $buildMetadata = [ordered]@{
             ConvertFrom-Json).devDependencies.'@tauri-apps/cli'
     }
     native = [ordered]@{
+        platformToolset = "v143"
         vcpkgReleaseTag = "2026.05.25"
         vcpkgTagObject = "baddcee32f29086c2c1c1f002df5078e371f7934"
         vcpkgBuiltinBaseline = [string]$vcpkgManifest.'builtin-baseline'

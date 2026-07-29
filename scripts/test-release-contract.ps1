@@ -189,6 +189,7 @@ exit /b 1
         }
         toolchains = [ordered]@{}
         native = [ordered]@{
+            platformToolset = "v143"
             codecs = @(
                 [ordered]@{
                     name = "libheif"
@@ -251,6 +252,12 @@ exit /b 1
         -ExpectedVersion $version `
         -SkipDllClosure `
         -NegativeMode HelperHashMismatch | Out-Null
+    & $verifyScript `
+        -ArtifactPath $artifactPath `
+        -ChecksumPath $checksumPath `
+        -ExpectedVersion $version `
+        -SkipDllClosure `
+        -NegativeMode NativeToolsetMismatch | Out-Null
 
     $baseSbom = [ordered]@{
         bomFormat = "CycloneDX"
@@ -319,7 +326,22 @@ exit /b 1
         throw "Release contract test SBOM did not merge helper payload evidence."
     }
 
-    Write-Host "PASS release-contract schema=2 executables=2 helper-negative=2 import-boundary=5 sbom-required=7 helper-evidence=merged"
+    $toolsetProperties = @(
+        $resultSbom.components |
+            Where-Object {
+                [string]$_.name -in @("libheif", "libde265", "vcruntime140.dll")
+            } |
+            ForEach-Object { @($_.properties) } |
+            Where-Object {
+                [string]$_.name -ceq "imgviewer:msvc-platform-toolset" -and
+                [string]$_.value -ceq "v143"
+            }
+    )
+    if ($toolsetProperties.Count -ne 3) {
+        throw "Release contract test SBOM did not preserve the pinned v143 toolset."
+    }
+
+    Write-Host "PASS release-contract schema=2 executables=2 helper-negative=2 toolset-negative=1 import-boundary=5 sbom-required=7 helper-evidence=merged"
 } finally {
     $env:DUMPBIN_EXE = $previousDumpbin
     $env:IMGVIEWER_BOUNDARY_TEST_MODE = $previousBoundaryMode

@@ -148,6 +148,9 @@ try {
     if ([int]$metadata.schemaVersion -ne 2) {
         throw "Unsupported BUILD_METADATA schemaVersion: $($metadata.schemaVersion)"
     }
+    if ([string]$metadata.native.platformToolset -cne "v143") {
+        throw "BUILD_METADATA native platform toolset is not the pinned v143."
+    }
 
     $components = [System.Collections.ArrayList]::new()
     foreach ($component in @($bom.components)) {
@@ -269,6 +272,7 @@ try {
             hashes = @([pscustomobject]@{ alg = "SHA-256"; content = $codecHash })
             properties = @(
                 [pscustomobject]@{ name = "imgviewer:vcpkg-triplet"; value = [string]$codec.triplet },
+                [pscustomobject]@{ name = "imgviewer:msvc-platform-toolset"; value = [string]$metadata.native.platformToolset },
                 [pscustomobject]@{ name = "imgviewer:bundled-file"; value = [string]$codec.fileName },
                 [pscustomobject]@{ name = "imgviewer:vcpkg-port-row"; value = [string]$codec.installedRow }
             )
@@ -295,6 +299,7 @@ try {
             hashes = @([pscustomobject]@{ alg = "SHA-256"; content = $hash })
             properties = @(
                 [pscustomobject]@{ name = "imgviewer:distribution"; value = "bundled-msvc-runtime" },
+                [pscustomobject]@{ name = "imgviewer:msvc-platform-toolset"; value = [string]$metadata.native.platformToolset },
                 [pscustomobject]@{ name = "imgviewer:architecture"; value = "x86_64" }
             )
         }

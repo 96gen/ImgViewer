@@ -16,6 +16,7 @@ param(
         "None",
         "ChecksumMismatch",
         "MetadataVersionMismatch",
+        "NativeToolsetMismatch",
         "NativeHashMismatch",
         "MissingDll",
         "MissingHelper",
@@ -178,6 +179,9 @@ function Assert-Metadata {
     }
     if ($CleanSource -and [bool]$Metadata.source.dirty) {
         throw "Release metadata reports a dirty source tree."
+    }
+    if ([string]$Metadata.native.platformToolset -cne "v143") {
+        throw "BUILD_METADATA native platform toolset is not the pinned v143."
     }
     if ($CleanSource) {
         $expectedNativeProvenance = [ordered]@{
@@ -424,6 +428,15 @@ try {
         }
         return
     }
+    if ($NegativeMode -eq "NativeToolsetMismatch") {
+        $metadata.native.platformToolset = "v145"
+        Assert-ExpectedFailure -Name "native-toolset-mismatch" -Operation {
+            Assert-Metadata -Metadata $metadata -ArtifactFileName $artifactFileName `
+                -Version $metadataVersion -Commit $ExpectedCommit -Tag $ExpectedTag `
+                -CleanSource:$RequireCleanSource
+        }
+        return
+    }
 
     Assert-Metadata -Metadata $metadata -ArtifactFileName $artifactFileName `
         -Version $metadataVersion -Commit $ExpectedCommit -Tag $ExpectedTag `
@@ -521,6 +534,14 @@ try {
                 -Version "999.999.999" -Commit $ExpectedCommit -Tag $ExpectedTag `
                 -CleanSource:$RequireCleanSource
         }
+        $originalPlatformToolset = [string]$metadata.native.platformToolset
+        $metadata.native.platformToolset = "v145"
+        Assert-ExpectedFailure -Name "native-toolset-mismatch" -Operation {
+            Assert-Metadata -Metadata $metadata -ArtifactFileName $artifactFileName `
+                -Version $ExpectedVersion -Commit $ExpectedCommit -Tag $ExpectedTag `
+                -CleanSource:$RequireCleanSource
+        }
+        $metadata.native.platformToolset = $originalPlatformToolset
         $negativeHashStage = Join-Path $temporaryRoot "native-hash-mismatch"
         Copy-Item -LiteralPath $stageDirectory -Destination $negativeHashStage -Recurse
         $tamperedPath = Join-Path $negativeHashStage "heif.dll"

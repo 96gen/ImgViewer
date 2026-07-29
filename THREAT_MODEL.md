@@ -66,7 +66,7 @@
   仍只會讀取原 handle，工作完成後立即釋放。
 - window-state 外掛執行前先以 64 KiB 上限讀取及驗證狀態 JSON；無效或
   超限檔會移除，無法安全處理時則拒絕啟動，錯誤記錄不含完整路徑。
-- vcpkg baseline、Cargo、pnpm 與 codec 版本固定；release 檢查 DLL
+- vcpkg baseline、MSVC `v143` overlay triplet、Cargo、pnpm 與 codec 版本固定；release 檢查 DLL
   dependency closure，主 EXE 不得匯入 HEIF codec，helper 必須匯入
   `heif.dll`，兩個 EXE 的 hash 與 protocol version 都寫入 metadata。
 
@@ -82,7 +82,7 @@
 | render token 猜測或重播 | opaque、一次性、generation 驗證 | 持續測試重播、猜測與資源回收 |
 | reparse point、UNC、權限或刪除競態 | root-to-leaf 驗證、開檔前重查與 final no-follow；catalog 後父 junction 置換、權限、刪除與置換為可恢復錯誤 | 檢查到開檔的狹窄主動 race 仍需 component-handle/broker；持續擴充 ACL 與特殊檔案系統 corpus |
 | 巨型或毀損 window-state | 64 KiB preflight 在上游 plugin setup 前驗證／移除；記錄不含路徑 | 追蹤上游是否加入原生 read limit |
-| 依賴或 CI Action 遭置換 | 鎖檔、固定版本、Action SHA、DLL closure、SBOM 與 attestation workflow | installer/updater 前加入 Authenticode 簽章 |
+| 依賴、runner toolset 或 CI Action 遭置換 | 鎖檔、固定版本、MSVC `v143` overlay triplet、app-local native probe、Action SHA、DLL closure、SBOM 與 attestation workflow | installer/updater 前加入 Authenticode 簽章 |
 | 診斷洩漏隱私 | 無遙測；UI 不顯示完整路徑 | 診斷匯出預設去識別化，禁止圖片 bytes |
 
 ## 不屬安全邊界
