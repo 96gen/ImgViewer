@@ -13,7 +13,7 @@ use moxcms::{
     Transform8BitExecutor, Transform16BitExecutor, XyY, curve_from_gamma,
 };
 
-use crate::{DecodedRender, SupportedFormat, ViewerError, code as error_code};
+use crate::{DecodedRender, DecodedRgba8, SupportedFormat, ViewerError, code as error_code};
 
 pub const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_SIDE: u32 = 32_768;
@@ -84,6 +84,15 @@ fn decode_open_file(path: &Path, file: File) -> Result<DecodedRender, ViewerErro
 /// magic validation, and native decoding all operate on that same handle and
 /// its owned byte snapshot; no path is accepted or reopened.
 pub fn decode_heif_file(file: File) -> Result<DecodedRender, ViewerError> {
+    encode_rgba8_png(decode_heif_file_rgba8(file)?)
+}
+
+/// Decodes a HEIC/HEIF image to canonical, unpremultiplied RGBA8 without
+/// encoding it into another file format.
+///
+/// This is the private codec-helper boundary: the helper returns only bounded
+/// fixed-stride pixels, while the trusted main process performs PNG encoding.
+pub fn decode_heif_file_rgba8(file: File) -> Result<DecodedRgba8, ViewerError> {
     let bytes = read_limited(file)?;
     if sniff_format(&bytes) != Some(SupportedFormat::Heif) {
         return Err(ViewerError::new(
@@ -91,7 +100,7 @@ pub fn decode_heif_file(file: File) -> Result<DecodedRender, ViewerError> {
             "檔案內容不是有效的 HEIC/HEIF 格式。",
         ));
     }
-    decode_heif(bytes)
+    decode_heif_rgba8(bytes)
 }
 
 fn read_limited(file: File) -> Result<Vec<u8>, ViewerError> {
@@ -831,6 +840,24 @@ fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, View
     Ok(output)
 }
 
+/// Encodes canonical RGBA8 into the application's display PNG.
+///
+/// The raw plane and conservative PNG encoder reserve are budgeted together
+/// before allocation so moving encoding out of the native helper does not
+/// weaken the 512 MiB aggregate working-set contract.
+pub fn encode_rgba8_png(decoded: DecodedRgba8) -> Result<DecodedRender, ViewerError> {
+    validate_dimensions(decoded.width, decoded.height)?;
+    validate_rgba_png_working_set(decoded.width, decoded.height)?;
+    let png = encode_rgba_png(decoded.width, decoded.height, &decoded.rgba)?;
+    Ok(DecodedRender {
+        bytes: png,
+        mime_type: "image/png",
+        width: decoded.width,
+        height: decoded.height,
+        animated: false,
+    })
+}
+
 fn decode_limits() -> Limits {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
@@ -928,10 +955,7 @@ fn normalization_working_set_bytes(
     let pixels = u64::from(width).checked_mul(u64::from(height))?;
     let native_bytes = pixels.checked_mul(native_bytes_per_pixel)?;
     let rgba_bytes = pixels.checked_mul(4)?;
-    let filtered_png_bytes = rgba_bytes.checked_add(u64::from(height))?;
-    let png_deflate_reserve = filtered_png_bytes
-        .checked_add(filtered_png_bytes.div_ceil(16))?
-        .checked_add(PNG_ENCODE_FIXED_RESERVE)?;
+    let png_deflate_reserve = png_encode_reserve_bytes(rgba_bytes, height)?;
     let row_workspace = u64::from(width)
         .checked_mul(native_bytes_per_pixel)?
         .checked_mul(2)?;
@@ -942,6 +966,37 @@ fn normalization_working_set_bytes(
         png_deflate_reserve,
         row_workspace,
     ])
+}
+
+fn validate_rgba_png_working_set(width: u32, height: u32) -> Result<(), ViewerError> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "圖片尺寸計算溢位。"))?;
+    let rgba_bytes = pixels
+        .checked_mul(4)
+        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "RGBA8 大小計算溢位。"))?;
+    let png_reserve = png_encode_reserve_bytes(rgba_bytes, height)
+        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "PNG 工作集大小計算溢位。"))?;
+    let estimated_bytes = rgba_bytes
+        .checked_add(png_reserve)
+        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "PNG 工作集大小計算溢位。"))?;
+    if estimated_bytes > MAX_DECODE_BYTES {
+        return Err(ViewerError::limit(
+            "decode_limit_exceeded",
+            "RGBA8 與 PNG 編碼的總工作集需要超過 512 MiB。",
+        )
+        .with_parameter("phase", "png_encode")
+        .with_parameter("estimatedBytes", estimated_bytes)
+        .with_parameter("maxBytes", MAX_DECODE_BYTES));
+    }
+    Ok(())
+}
+
+fn png_encode_reserve_bytes(rgba_bytes: u64, height: u32) -> Option<u64> {
+    let filtered_png_bytes = rgba_bytes.checked_add(u64::from(height))?;
+    filtered_png_bytes
+        .checked_add(filtered_png_bytes.div_ceil(16))?
+        .checked_add(PNG_ENCODE_FIXED_RESERVE)
 }
 
 fn checked_component_total(components: &[u64]) -> Option<u64> {
@@ -1323,13 +1378,17 @@ fn heif_source_color_profile(
 
 #[cfg(feature = "heic")]
 fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
+    encode_rgba8_png(decode_heif_rgba8(bytes)?)
+}
+
+#[cfg(feature = "heic")]
+fn decode_heif_rgba8(bytes: Vec<u8>) -> Result<DecodedRgba8, ViewerError> {
     use libheif_rs::{
         ColorSpace, DecodingOptions, HeifContext, LibHeif, RgbChroma, SecurityLimits,
     };
 
-    // Keep libheif's context and native decoded plane inside a narrow scope.
-    // They are released before PNG encoding allocates its output buffer, which
-    // avoids retaining two full RGBA planes plus the compressed result.
+    // Keep libheif's context and native decoded plane inside a narrow scope so
+    // only the canonical RGBA8 plane crosses the helper wire boundary.
     let source_bytes = bytes.len() as u64;
     let (width, height, rgba) = {
         let mut context = HeifContext::new()
@@ -1512,13 +1571,10 @@ fn decode_heif(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
         (width, height, rgba)
     };
     drop(bytes);
-    let png = encode_rgba_png(width, height, &rgba)?;
-    Ok(DecodedRender {
-        bytes: png,
-        mime_type: "image/png",
+    Ok(DecodedRgba8 {
+        rgba,
         width,
         height,
-        animated: false,
     })
 }
 
@@ -1529,6 +1585,14 @@ fn validate_heif_dimensions(width: u32, height: u32) -> Result<(), ViewerError> 
 
 #[cfg(not(feature = "heic"))]
 fn decode_heif(_bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
+    Err(ViewerError::new(
+        "heic_unavailable",
+        "這個開發版本未啟用 HEIC/HEIF 解碼；正式 Windows ZIP 會包含此功能。",
+    ))
+}
+
+#[cfg(not(feature = "heic"))]
+fn decode_heif_rgba8(_bytes: Vec<u8>) -> Result<DecodedRgba8, ViewerError> {
     Err(ViewerError::new(
         "heic_unavailable",
         "這個開發版本未啟用 HEIC/HEIF 解碼；正式 Windows ZIP 會包含此功能。",
@@ -1752,6 +1816,35 @@ mod tests {
         assert_eq!(error.parameters["maxBytes"], MAX_DECODE_BYTES);
         assert!(error.parameters["estimatedBytes"].as_u64().unwrap() > MAX_DECODE_BYTES);
         assert!(!error.parameters.contains_key("path"));
+    }
+
+    #[test]
+    fn trusted_png_encoder_validates_raw_length_and_aggregate_working_set() {
+        let render = encode_rgba8_png(DecodedRgba8 {
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255],
+            width: 2,
+            height: 1,
+        })
+        .unwrap();
+        assert_eq!((render.width, render.height), (2, 1));
+        assert_eq!(render.mime_type, "image/png");
+        assert!(render.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let invalid = encode_rgba8_png(DecodedRgba8 {
+            rgba: vec![0; 7],
+            width: 2,
+            height: 1,
+        })
+        .unwrap_err();
+        assert_eq!(invalid.code, "decode_limit_exceeded");
+        assert!(!invalid.parameters.contains_key("path"));
+
+        assert!(validate_rgba_png_working_set(5_000, 5_000).is_ok());
+        let over_budget = validate_rgba_png_working_set(10_000, 10_000).unwrap_err();
+        assert_eq!(over_budget.code, "decode_limit_exceeded");
+        assert_eq!(over_budget.parameters["phase"], "png_encode");
+        assert_eq!(over_budget.parameters["maxBytes"], MAX_DECODE_BYTES);
+        assert!(over_budget.parameters["estimatedBytes"].as_u64().unwrap() > MAX_DECODE_BYTES);
     }
 
     #[test]
@@ -2340,9 +2433,16 @@ mod tests {
         let path = directory.path().join("owned-handle.heic");
         fs::copy(fixture("primary-second.heic"), &path).unwrap();
 
-        let decoded = decode_heif_file(File::open(&path).unwrap()).unwrap();
+        let decoded = decode_heif_file_rgba8(File::open(&path).unwrap()).unwrap();
         assert_eq!((decoded.width, decoded.height), (3, 5));
-        assert!(decoded.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(decoded.rgba.len(), 3 * 5 * 4);
+        let primary_pixel = &decoded.rgba[..4];
+        assert!(
+            primary_pixel[2] > 150
+                && primary_pixel[2] > primary_pixel[0]
+                && primary_pixel[2] > primary_pixel[1],
+            "expected the blue designated primary item, got {primary_pixel:?}"
+        );
         fs::remove_file(path).unwrap();
     }
 }

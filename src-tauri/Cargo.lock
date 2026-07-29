@@ -1806,6 +1806,8 @@ version = "0.3.0"
 dependencies = [
  "imgviewer-codec-core",
  "imgviewer-codec-protocol",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

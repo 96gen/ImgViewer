@@ -13,8 +13,8 @@ use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use imgviewer_codec_core::{
-    DecodedRender, MAX_DECODE_BYTES, MAX_INPUT_BYTES, ViewerError, code as viewer_error_code,
-    decode_heif_file,
+    DecodedRgba8, MAX_DECODE_BYTES, MAX_INPUT_BYTES, ViewerError, code as viewer_error_code,
+    decode_heif_file_rgba8,
 };
 use imgviewer_codec_protocol::{
     DecodeError, DecodeHeifRequest, HelperCommand, ProtocolError, WireErrorCode, read_hello,
@@ -169,19 +169,19 @@ impl From<windows_handle::HandleError> for WireFailure {
 }
 
 #[cfg(windows)]
-fn decode_request(request: DecodeHeifRequest) -> Result<DecodedRender, WireFailure> {
+fn decode_request(request: DecodeHeifRequest) -> Result<DecodedRgba8, WireFailure> {
     let file = windows_handle::take_disk_file(request.duplicated_handle, request.expected_length)?;
-    decode_heif_file(file).map_err(WireFailure::from)
+    decode_heif_file_rgba8(file).map_err(WireFailure::from)
 }
 
 #[cfg(not(windows))]
-fn decode_request(_request: DecodeHeifRequest) -> Result<DecodedRender, WireFailure> {
+fn decode_request(_request: DecodeHeifRequest) -> Result<DecodedRgba8, WireFailure> {
     Err(WireFailure::new(WireErrorCode::InvalidHandle, 0, 0))
 }
 
 fn catch_decoder(
-    operation: impl FnOnce() -> Result<DecodedRender, WireFailure>,
-) -> Result<DecodedRender, WireFailure> {
+    operation: impl FnOnce() -> Result<DecodedRgba8, WireFailure>,
+) -> Result<DecodedRgba8, WireFailure> {
     catch_unwind(AssertUnwindSafe(operation))
         .unwrap_or_else(|_| Err(WireFailure::internal_decoder_error()))
 }
@@ -189,7 +189,7 @@ fn catch_decoder(
 fn write_decode_result(
     output: &mut (impl Write + ?Sized),
     request_id: u64,
-    result: Result<DecodedRender, WireFailure>,
+    result: Result<DecodedRgba8, WireFailure>,
 ) -> Result<(), HelperError> {
     match result {
         Ok(render) => {
@@ -198,7 +198,7 @@ fn write_decode_result(
                 request_id,
                 render.width,
                 render.height,
-                &render.bytes,
+                &render.rgba,
             )?;
         }
         Err(error) => {
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn decoder_panic_is_caught_as_internal_numeric_error() {
-        let result = catch_decoder(|| -> Result<DecodedRender, WireFailure> {
+        let result = catch_decoder(|| -> Result<DecodedRgba8, WireFailure> {
             panic!("native decoder panic with private details")
         });
         assert_eq!(result.unwrap_err(), WireFailure::internal_decoder_error());
@@ -408,15 +408,26 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn transferred_fixture_request(request_id: u64) -> (DecodeHeifRequest, u64) {
-        use std::fs::File;
+    fn transferred_fixture_request(
+        request_id: u64,
+    ) -> (DecodeHeifRequest, tempfile::TempDir, std::path::PathBuf) {
+        use std::fs::{self, OpenOptions};
+        use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::IntoRawHandle;
         use std::path::Path;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tests/fixtures")
             .join("primary-second.heic");
-        let file = File::open(path).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transferred.heic");
+        fs::copy(fixture, &path).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
         let expected_length = file.metadata().unwrap().len();
         let duplicated_handle = file.into_raw_handle() as usize as u64;
         (
@@ -425,14 +436,15 @@ mod tests {
                 duplicated_handle,
                 expected_length,
             },
-            duplicated_handle,
+            directory,
+            path,
         )
     }
 
     #[cfg(all(windows, not(feature = "heic")))]
     #[test]
     fn valid_owned_handle_reports_not_implemented_without_heic_feature_and_closes() {
-        let (request, raw) = transferred_fixture_request(31);
+        let (request, _directory, path) = transferred_fixture_request(31);
         let mut input = Vec::new();
         write_hello(&mut input).unwrap();
         write_decode_request(&mut input, request).unwrap();
@@ -451,13 +463,13 @@ mod tests {
                 arg1: 0,
             })
         );
-        assert!(!windows_handle::handle_is_open(raw));
+        std::fs::remove_file(path).expect("helper must release the transferred file handle");
     }
 
     #[cfg(all(windows, feature = "heic"))]
     #[test]
     fn valid_owned_handle_decodes_heif_fixture_and_closes() {
-        let (request, raw) = transferred_fixture_request(32);
+        let (request, _directory, path) = transferred_fixture_request(32);
         let mut input = Vec::new();
         write_hello(&mut input).unwrap();
         write_decode_request(&mut input, request).unwrap();
@@ -473,7 +485,14 @@ mod tests {
             panic!("expected HEIF fixture decode success");
         };
         assert_eq!((success.width, success.height), (3, 5));
-        assert!(success.png.starts_with(b"\x89PNG\r\n\x1a\n"));
-        assert!(!windows_handle::handle_is_open(raw));
+        assert_eq!(success.rgba.len(), 3 * 5 * 4);
+        let primary_pixel = &success.rgba[..4];
+        assert!(
+            primary_pixel[2] > 150
+                && primary_pixel[2] > primary_pixel[0]
+                && primary_pixel[2] > primary_pixel[1],
+            "expected the blue designated primary item, got {primary_pixel:?}"
+        );
+        std::fs::remove_file(path).expect("helper must release the transferred file handle");
     }
 }

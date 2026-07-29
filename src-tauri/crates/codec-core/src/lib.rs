@@ -11,7 +11,10 @@ mod format;
 mod heif_ffi_adapter;
 mod model;
 
-pub use decode::{MAX_DECODE_BYTES, MAX_INPUT_BYTES, ProductionDecoder, decode_heif_file};
+pub use decode::{
+    MAX_DECODE_BYTES, MAX_INPUT_BYTES, ProductionDecoder, decode_heif_file, decode_heif_file_rgba8,
+    encode_rgba8_png,
+};
 pub use error::{ViewerError, code};
 pub use format::SupportedFormat;
-pub use model::DecodedRender;
+pub use model::{DecodedRender, DecodedRgba8};

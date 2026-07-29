@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use imgviewer_codec_core::{DecodedRgba8, encode_rgba8_png};
 use imgviewer_codec_protocol::{DecodeResponse, WireErrorCode};
 use parking_lot::Mutex;
 
@@ -220,12 +221,10 @@ fn remaining(limit: Duration, started: Instant) -> Result<Duration, ViewerError>
 
 fn response_to_render(response: DecodeResponse) -> Result<DecodedRender, ViewerError> {
     match response {
-        DecodeResponse::Success(success) => Ok(DecodedRender {
-            bytes: success.png,
-            mime_type: "image/png",
+        DecodeResponse::Success(success) => encode_rgba8_png(DecodedRgba8 {
+            rgba: success.rgba,
             width: success.width,
             height: success.height,
-            animated: false,
         }),
         DecodeResponse::Error(error) => Err(wire_viewer_error(error.code, error.arg0, error.arg1)),
     }
@@ -383,7 +382,7 @@ mod tests {
                     request_id,
                     width: 1,
                     height: 1,
-                    png: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01".to_vec(),
+                    rgba: vec![12, 34, 56, 255],
                 })),
                 Behavior::Crash => Err(TransportError::Disconnected),
                 Behavior::Timeout => Err(TransportError::Timeout),

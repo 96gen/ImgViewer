@@ -10,7 +10,9 @@
 - HEIC／HEIF 原生解碼移入固定同目錄的私有 helper process；主程式只傳
   duplicated read-only handle，不傳本機路徑、任意 command line 或輸出路徑。
 - helper 與主程式使用固定版本、固定欄位、大小受限的 binary protocol，
-  支援同一 session 多次解碼與嚴格 request ID／PNG 結果驗證。
+  支援同一 session 多次解碼；wire protocol v2 僅傳 exact-size RGBA8，
+  主程式驗證 request ID、尺寸、像素數、長度及 reserved bytes 後才配置，
+  再由 safe Rust encoder 產生顯示 PNG。
 - helper 啟動時先套用 Windows Job Object，再恢復執行；限制單一 process、
   768 MiB 記憶體及 30 秒硬 deadline。
 

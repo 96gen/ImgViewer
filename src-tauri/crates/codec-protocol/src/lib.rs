@@ -4,7 +4,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const PROTOCOL_MAGIC: [u8; 8] = *b"IMGVC001";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 16;
 pub const MAX_CONTROL_PAYLOAD_BYTES: u32 = 64 * 1024;
 pub const MAX_RENDER_BYTES: u32 = 512 * 1024 * 1024;
@@ -14,9 +14,6 @@ pub const DECODE_REQUEST_LEN: u32 = 24;
 pub const DECODE_SUCCESS_PREFIX_LEN: u32 = 24;
 pub const DECODE_ERROR_LEN: u32 = 32;
 pub const MAX_RENDER_PAYLOAD_BYTES: u32 = MAX_RENDER_BYTES + DECODE_SUCCESS_PREFIX_LEN;
-
-const PNG_METADATA_LEN: usize = 24;
-const PNG_SIGNATURE: [u8; 8] = *b"\x89PNG\r\n\x1a\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -225,7 +222,7 @@ pub struct DecodeSuccess {
     pub request_id: u64,
     pub width: u32,
     pub height: u32,
-    pub png: Vec<u8>,
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,13 +276,9 @@ pub enum ProtocolError {
         width: u32,
         height: u32,
     },
-    InvalidPngSignature,
-    InvalidPngHeader,
-    PngDimensionMismatch {
-        declared_width: u32,
-        declared_height: u32,
-        png_width: u32,
-        png_height: u32,
+    InvalidRgbaLength {
+        expected: u32,
+        observed: u32,
     },
     NonCanonicalReservedBytes,
 }
@@ -347,16 +340,9 @@ impl fmt::Display for ProtocolError {
             Self::InvalidRenderDimensions { width, height } => {
                 write!(formatter, "invalid render dimensions {width}x{height}")
             }
-            Self::InvalidPngSignature => formatter.write_str("invalid PNG signature"),
-            Self::InvalidPngHeader => formatter.write_str("invalid PNG IHDR"),
-            Self::PngDimensionMismatch {
-                declared_width,
-                declared_height,
-                png_width,
-                png_height,
-            } => write!(
+            Self::InvalidRgbaLength { expected, observed } => write!(
                 formatter,
-                "PNG dimensions {png_width}x{png_height} do not match declared {declared_width}x{declared_height}"
+                "RGBA8 payload length {observed} does not match expected {expected}"
             ),
             Self::NonCanonicalReservedBytes => {
                 formatter.write_str("non-zero reserved protocol bytes")
@@ -448,24 +434,29 @@ pub fn write_decode_success(
     request_id: u64,
     width: u32,
     height: u32,
-    png: &[u8],
+    rgba: &[u8],
 ) -> Result<(), ProtocolError> {
-    validate_render_dimensions(width, height)?;
-    let png_len = u32::try_from(png.len()).map_err(|_| ProtocolError::PayloadTooLarge {
+    let expected_rgba_len = validate_render_dimensions(width, height)?;
+    let rgba_len = u32::try_from(rgba.len()).map_err(|_| ProtocolError::PayloadTooLarge {
         kind: MessageKind::DecodeSuccess,
         observed: u32::MAX,
         maximum: MAX_RENDER_BYTES,
     })?;
-    if png_len > MAX_RENDER_BYTES {
+    if rgba_len > MAX_RENDER_BYTES {
         return Err(ProtocolError::PayloadTooLarge {
             kind: MessageKind::DecodeSuccess,
-            observed: png_len,
+            observed: rgba_len,
             maximum: MAX_RENDER_BYTES,
         });
     }
-    validate_png_metadata(png, width, height)?;
+    if rgba_len != expected_rgba_len {
+        return Err(ProtocolError::InvalidRgbaLength {
+            expected: expected_rgba_len,
+            observed: rgba_len,
+        });
+    }
     let payload_len = DECODE_SUCCESS_PREFIX_LEN
-        .checked_add(png_len)
+        .checked_add(rgba_len)
         .expect("bounded render payload fits u32");
     write_header(
         writer,
@@ -476,10 +467,10 @@ pub fn write_decode_success(
     prefix[..8].copy_from_slice(&request_id.to_le_bytes());
     prefix[8..12].copy_from_slice(&width.to_le_bytes());
     prefix[12..16].copy_from_slice(&height.to_le_bytes());
-    prefix[16..20].copy_from_slice(&png_len.to_le_bytes());
+    prefix[16..20].copy_from_slice(&rgba_len.to_le_bytes());
     writer
         .write_all(&prefix)
-        .and_then(|_| writer.write_all(png))
+        .and_then(|_| writer.write_all(rgba))
         .map_err(|error| ProtocolError::Io(error.kind()))
 }
 
@@ -507,17 +498,24 @@ pub fn read_decode_response(
             validate_request_id(expected_request_id, request_id)?;
             let width = u32::from_le_bytes(prefix[8..12].try_into().expect("fixed width"));
             let height = u32::from_le_bytes(prefix[12..16].try_into().expect("fixed height"));
-            validate_render_dimensions(width, height)?;
-            let png_len = u32::from_le_bytes(prefix[16..20].try_into().expect("fixed PNG length"));
-            if png_len > MAX_RENDER_BYTES {
+            let expected_rgba_len = validate_render_dimensions(width, height)?;
+            let rgba_len =
+                u32::from_le_bytes(prefix[16..20].try_into().expect("fixed RGBA length"));
+            if rgba_len > MAX_RENDER_BYTES {
                 return Err(ProtocolError::PayloadTooLarge {
                     kind: MessageKind::DecodeSuccess,
-                    observed: png_len,
+                    observed: rgba_len,
                     maximum: MAX_RENDER_BYTES,
                 });
             }
+            if rgba_len != expected_rgba_len {
+                return Err(ProtocolError::InvalidRgbaLength {
+                    expected: expected_rgba_len,
+                    observed: rgba_len,
+                });
+            }
             let expected_payload_len = DECODE_SUCCESS_PREFIX_LEN
-                .checked_add(png_len)
+                .checked_add(rgba_len)
                 .expect("bounded render payload fits u32");
             if header.payload_len() != expected_payload_len {
                 return Err(ProtocolError::InvalidPayloadLength {
@@ -528,19 +526,20 @@ pub fn read_decode_response(
                 });
             }
 
-            let png_capacity =
-                usize::try_from(png_len).expect("u32 render length fits supported hosts");
-            let mut png = Vec::new();
-            png.try_reserve_exact(png_capacity)
-                .map_err(|_| ProtocolError::AllocationFailed { requested: png_len })?;
-            png.resize(png_capacity, 0);
-            read_exact_counted(reader, &mut png, false)?;
-            validate_png_metadata(&png, width, height)?;
+            let rgba_capacity =
+                usize::try_from(rgba_len).expect("u32 render length fits supported hosts");
+            let mut rgba = Vec::new();
+            rgba.try_reserve_exact(rgba_capacity)
+                .map_err(|_| ProtocolError::AllocationFailed {
+                    requested: rgba_len,
+                })?;
+            rgba.resize(rgba_capacity, 0);
+            read_exact_counted(reader, &mut rgba, false)?;
             Ok(DecodeResponse::Success(DecodeSuccess {
                 request_id,
                 width,
                 height,
-                png,
+                rgba,
             }))
         }
         observed => Err(ProtocolError::UnexpectedMessage { observed }),
@@ -596,8 +595,10 @@ fn validate_request_id(expected: u64, observed: u64) -> Result<(), ProtocolError
     Ok(())
 }
 
-fn validate_render_dimensions(width: u32, height: u32) -> Result<(), ProtocolError> {
-    let pixels = u64::from(width).saturating_mul(u64::from(height));
+fn validate_render_dimensions(width: u32, height: u32) -> Result<u32, ProtocolError> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or(ProtocolError::InvalidRenderDimensions { width, height })?;
     if width == 0
         || height == 0
         || width > MAX_RENDER_SIDE
@@ -606,31 +607,11 @@ fn validate_render_dimensions(width: u32, height: u32) -> Result<(), ProtocolErr
     {
         return Err(ProtocolError::InvalidRenderDimensions { width, height });
     }
-    Ok(())
-}
-
-fn validate_png_metadata(
-    png: &[u8],
-    declared_width: u32,
-    declared_height: u32,
-) -> Result<(), ProtocolError> {
-    if png.len() < PNG_METADATA_LEN || png[..8] != PNG_SIGNATURE {
-        return Err(ProtocolError::InvalidPngSignature);
-    }
-    if png[8..12] != 13_u32.to_be_bytes() || png[12..16] != *b"IHDR" {
-        return Err(ProtocolError::InvalidPngHeader);
-    }
-    let png_width = u32::from_be_bytes(png[16..20].try_into().expect("fixed PNG width"));
-    let png_height = u32::from_be_bytes(png[20..24].try_into().expect("fixed PNG height"));
-    if png_width != declared_width || png_height != declared_height {
-        return Err(ProtocolError::PngDimensionMismatch {
-            declared_width,
-            declared_height,
-            png_width,
-            png_height,
-        });
-    }
-    Ok(())
+    let rgba_len = pixels
+        .checked_mul(4)
+        .filter(|length| *length <= u64::from(MAX_RENDER_BYTES))
+        .ok_or(ProtocolError::InvalidRenderDimensions { width, height })?;
+    u32::try_from(rgba_len).map_err(|_| ProtocolError::InvalidRenderDimensions { width, height })
 }
 
 fn read_exact_counted(
@@ -661,13 +642,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn png_metadata(width: u32, height: u32) -> Vec<u8> {
-        let mut png = Vec::from(PNG_SIGNATURE);
-        png.extend_from_slice(&13_u32.to_be_bytes());
-        png.extend_from_slice(b"IHDR");
-        png.extend_from_slice(&width.to_be_bytes());
-        png.extend_from_slice(&height.to_be_bytes());
-        png
+    fn rgba(width: u32, height: u32) -> Vec<u8> {
+        vec![0x5a; (width * height * 4) as usize]
     }
 
     #[test]
@@ -764,17 +740,17 @@ mod tests {
     }
 
     #[test]
-    fn success_round_trip_validates_png_signature_ihdr_dimensions_and_request_id() {
-        let png = png_metadata(3, 2);
+    fn success_round_trip_validates_rgba_dimensions_length_and_request_id() {
+        let rgba = rgba(3, 2);
         let mut response = Vec::new();
-        write_decode_success(&mut response, 77, 3, 2, &png).unwrap();
+        write_decode_success(&mut response, 77, 3, 2, &rgba).unwrap();
         assert_eq!(
             read_decode_response(&mut Cursor::new(response.clone()), 77).unwrap(),
             DecodeResponse::Success(DecodeSuccess {
                 request_id: 77,
                 width: 3,
                 height: 2,
-                png,
+                rgba,
             })
         );
         assert_eq!(
@@ -787,44 +763,65 @@ mod tests {
     }
 
     #[test]
-    fn fake_png_and_mismatched_ihdr_are_rejected() {
-        let fake = vec![0_u8; PNG_METADATA_LEN];
+    fn mismatched_rgba_length_is_rejected_before_body_read_or_allocation() {
         assert_eq!(
-            write_decode_success(&mut Vec::new(), 1, 1, 1, &fake).unwrap_err(),
-            ProtocolError::InvalidPngSignature
-        );
-
-        let mismatched = png_metadata(2, 1);
-        assert_eq!(
-            write_decode_success(&mut Vec::new(), 1, 1, 1, &mismatched).unwrap_err(),
-            ProtocolError::PngDimensionMismatch {
-                declared_width: 1,
-                declared_height: 1,
-                png_width: 2,
-                png_height: 1,
+            write_decode_success(&mut Vec::new(), 1, 1, 1, &[0_u8; 8]).unwrap_err(),
+            ProtocolError::InvalidRgbaLength {
+                expected: 4,
+                observed: 8,
             }
         );
 
         let mut malicious_response = Vec::new();
         write_header(
             &mut malicious_response,
-            Header::new(
-                MessageKind::DecodeSuccess,
-                DECODE_SUCCESS_PREFIX_LEN + PNG_METADATA_LEN as u32,
-            )
-            .unwrap(),
+            Header::new(MessageKind::DecodeSuccess, DECODE_SUCCESS_PREFIX_LEN + 8).unwrap(),
         )
         .unwrap();
         let mut prefix = [0_u8; DECODE_SUCCESS_PREFIX_LEN as usize];
         prefix[..8].copy_from_slice(&1_u64.to_le_bytes());
         prefix[8..12].copy_from_slice(&1_u32.to_le_bytes());
         prefix[12..16].copy_from_slice(&1_u32.to_le_bytes());
-        prefix[16..20].copy_from_slice(&(PNG_METADATA_LEN as u32).to_le_bytes());
+        prefix[16..20].copy_from_slice(&8_u32.to_le_bytes());
         malicious_response.extend_from_slice(&prefix);
-        malicious_response.extend_from_slice(&fake);
         assert_eq!(
             read_decode_response(&mut Cursor::new(malicious_response), 1).unwrap_err(),
-            ProtocolError::InvalidPngSignature
+            ProtocolError::InvalidRgbaLength {
+                expected: 4,
+                observed: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn request_id_and_reserved_bytes_are_checked_before_rgba_body_read() {
+        let response = |request_id: u64, reserved: u32| {
+            let mut bytes = Vec::new();
+            write_header(
+                &mut bytes,
+                Header::new(MessageKind::DecodeSuccess, DECODE_SUCCESS_PREFIX_LEN + 4).unwrap(),
+            )
+            .unwrap();
+            let mut prefix = [0_u8; DECODE_SUCCESS_PREFIX_LEN as usize];
+            prefix[..8].copy_from_slice(&request_id.to_le_bytes());
+            prefix[8..12].copy_from_slice(&1_u32.to_le_bytes());
+            prefix[12..16].copy_from_slice(&1_u32.to_le_bytes());
+            prefix[16..20].copy_from_slice(&4_u32.to_le_bytes());
+            prefix[20..24].copy_from_slice(&reserved.to_le_bytes());
+            bytes.extend_from_slice(&prefix);
+            bytes
+        };
+
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(response(8, 0)), 7).unwrap_err(),
+            ProtocolError::RequestIdMismatch {
+                expected: 7,
+                observed: 8,
+            }
+        );
+        assert_eq!(
+            read_decode_response(&mut Cursor::new(response(7, 1)), 7).unwrap_err(),
+            ProtocolError::NonCanonicalReservedBytes
         );
     }
 
@@ -852,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn success_body_length_must_match_bounded_png_length_before_allocation() {
+    fn success_body_length_must_match_exact_rgba_length_before_allocation() {
         let mut bytes = Vec::new();
         write_header(
             &mut bytes,
@@ -863,7 +860,7 @@ mod tests {
         prefix[..8].copy_from_slice(&5_u64.to_le_bytes());
         prefix[8..12].copy_from_slice(&1_u32.to_le_bytes());
         prefix[12..16].copy_from_slice(&1_u32.to_le_bytes());
-        prefix[16..20].copy_from_slice(&10_u32.to_le_bytes());
+        prefix[16..20].copy_from_slice(&4_u32.to_le_bytes());
         bytes.extend_from_slice(&prefix);
 
         assert_eq!(
@@ -871,25 +868,46 @@ mod tests {
             ProtocolError::InvalidPayloadLength {
                 kind: MessageKind::DecodeSuccess,
                 observed: DECODE_SUCCESS_PREFIX_LEN + 100,
-                minimum: DECODE_SUCCESS_PREFIX_LEN + 10,
-                maximum: DECODE_SUCCESS_PREFIX_LEN + 10,
+                minimum: DECODE_SUCCESS_PREFIX_LEN + 4,
+                maximum: DECODE_SUCCESS_PREFIX_LEN + 4,
             }
         );
     }
 
     #[test]
-    fn truncated_success_png_reports_body_length_without_accepting_partial_render() {
-        let png = png_metadata(1, 1);
+    fn truncated_success_rgba_reports_body_length_without_accepting_partial_render() {
+        let rgba = rgba(1, 1);
         let mut response = Vec::new();
-        write_decode_success(&mut response, 5, 1, 1, &png).unwrap();
+        write_decode_success(&mut response, 5, 1, 1, &rgba).unwrap();
         response.truncate(response.len() - 1);
         assert_eq!(
             read_decode_response(&mut Cursor::new(response), 5).unwrap_err(),
             ProtocolError::TruncatedPayload {
-                expected: png.len(),
-                bytes_read: png.len() - 1,
+                expected: rgba.len(),
+                bytes_read: rgba.len() - 1,
             }
         );
+    }
+
+    #[test]
+    fn invalid_dimensions_and_pixel_limit_are_rejected_before_rgba_body_read() {
+        for (width, height) in [(0_u32, 1_u32), (MAX_RENDER_SIDE + 1, 1), (10_001, 10_000)] {
+            let mut bytes = Vec::new();
+            write_header(
+                &mut bytes,
+                Header::new(MessageKind::DecodeSuccess, DECODE_SUCCESS_PREFIX_LEN).unwrap(),
+            )
+            .unwrap();
+            let mut prefix = [0_u8; DECODE_SUCCESS_PREFIX_LEN as usize];
+            prefix[..8].copy_from_slice(&9_u64.to_le_bytes());
+            prefix[8..12].copy_from_slice(&width.to_le_bytes());
+            prefix[12..16].copy_from_slice(&height.to_le_bytes());
+            bytes.extend_from_slice(&prefix);
+            assert_eq!(
+                read_decode_response(&mut Cursor::new(bytes), 9).unwrap_err(),
+                ProtocolError::InvalidRenderDimensions { width, height }
+            );
+        }
     }
 
     #[test]
