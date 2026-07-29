@@ -9,7 +9,10 @@ ImgViewer 是 Windows x64 專用的免安裝圖片瀏覽器。介面以 Vue 3 �
 - Microsoft Edge WebView2 Evergreen Runtime。支援版本的 Windows 通常已安裝；若系統提示缺少 runtime，請使用 Microsoft 的 [WebView2 Runtime 下載頁](https://developer.microsoft.com/microsoft-edge/webview2/consumer/) 安裝 Evergreen Runtime。
 - 不需要 Windows HEIF Image Extensions；ZIP 已包含 `libheif` 與 `libde265`。
 
-解壓縮 `ImgViewer-{version}-windows-x64.zip` 後，直接執行資料夾內的 `ImgViewer.exe`。請保留 EXE、DLL、授權文件在同一資料夾。
+解壓縮 `ImgViewer-{version}-windows-x64.zip` 後，直接執行資料夾內的
+`ImgViewer.exe`。請保留 `ImgViewer.CodecHelper.exe`、DLL 與授權文件在
+同一資料夾；helper 缺少或被移動時，其他格式仍可使用，但 HEIC／HEIF 會
+顯示可恢復錯誤。
 
 ## 操作
 
@@ -53,12 +56,19 @@ WebView2 播放；結構型 frame／累計像素限制可先拒絕 frame bomb，
 helper process 能硬中止 WebView2 的動畫解碼，因此仍不宣稱已完全隔離
 animation CPU／codec hang DoS。
 
-解碼工作目前有 30 秒 soft deadline：超時返回的結果不會覆蓋畫面，但
-同 process 內卡死的 native codec 仍無法安全強制中止。TIFF／HEIF helper
-process 與 Windows Job Object 硬隔離列在 [Roadmap](ROADMAP.md)，此限制
-也記錄於 [威脅模型](THREAT_MODEL.md)。漏洞請依 [安全政策](SECURITY.md)
-私下回報；維護頻率與支援邊界分別見 [維護節奏](MAINTENANCE.md)、
-[支援政策](SUPPORT.md)。
+HEIC／HEIF 解碼已移入固定同目錄的私有 helper process。主程式只把已開啟
+的 read-only handle 複製給 helper，不傳來源路徑、任意 command line 或
+輸出路徑；helper 啟動後先受 Windows Job Object 約束，限制單一 process、
+768 MiB 記憶體與每張 30 秒硬期限。timeout、取消、pipe 中斷、codec crash
+或不合法回應都會終止該 Job；同一張不自動重試，下一次選取才建立乾淨
+helper。
+
+TIFF 與其他同 process 解碼仍只有 30 秒 soft deadline：超時返回的結果不會
+覆蓋畫面，但卡死的 codec thread 無法安全強制中止。TIFF 隔離、parent
+junction race 與 WebView2 動畫解碼隔離仍列在 [Roadmap](ROADMAP.md)，
+並記錄於 [威脅模型](THREAT_MODEL.md)。漏洞請依
+[安全政策](SECURITY.md) 私下回報；維護頻率與支援邊界分別見
+[維護節奏](MAINTENANCE.md)、[支援政策](SUPPORT.md)。
 
 HDR 的 PQ/HLG transfer 與廣色域原色會轉進有限的 8-bit sRGB 顯示範圍；超出 SDR／sRGB 範圍的值會截斷，第一版不輸出 HDR，也不提供可調整的感知式 tone mapping。
 
@@ -106,16 +116,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-memory.p
 
 0.1.1 的固定環境 before／after 數據，以及 0.1.2 無閃切圖的 100／160 輪 RAM 回收結果與解讀限制，見 [PERFORMANCE.md](PERFORMANCE.md)。
 
-要在開發模式測試 HEIC，先佈署固定版 vcpkg 依賴，再啟用 `heic` feature：
+要測試 HEIC helper，先佈署固定版 vcpkg 依賴，再建置 helper。Tauri 主
+process 不得啟用 HEIC feature：
 
 ```powershell
 $nativeBin = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-native-deps.ps1 | Select-Object -Last 1
-cargo clean --manifest-path .\src-tauri\Cargo.toml -p libheif-sys
+cargo clean --manifest-path .\src-tauri\Cargo.toml --package libheif-sys
 $env:VCPKG_ROOT = "$PWD\.tools\vcpkg"
+$env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
+$env:VCPKG_DEFAULT_HOST_TRIPLET = "x64-windows"
 $env:VCPKGRS_DYNAMIC = "1"
 $env:VCPKGRS_TRIPLET = "x64-windows"
 $env:PATH = "$nativeBin;$env:PATH"
-pnpm run tauri dev --features heic
+cargo build --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --features heic
+Copy-Item .\src-tauri\target\debug\imgviewer-codec-helper.exe .\src-tauri\target\debug\ImgViewer.CodecHelper.exe -Force
+pnpm run tauri dev
+```
+
+真正的 broker／Job Object／duplicated-handle process 測試可直接執行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-codec-helper-process.ps1
 ```
 
 `.tools/vcpkg` 固定為 tag `2026.05.25`。這是 annotated tag：tag object 是 `baddcee32f29086c2c1c1f002df5078e371f7934`，實際 checkout 與 `builtin-baseline` 必須使用 peeled commit `d015e31e90838a4c9dfa3eed45979bc70d9357fc`。專案內的 `vcpkg-overlays/ports/libheif` 保留該版本 port，僅在編譯時停用 libheif runtime plugin loading；HEIC 仍由內建註冊的 libde265 decoder 解碼，程式不會掃描外部 codec DLL。
@@ -132,11 +153,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 
 1. 驗證並 bootstrap 固定版 vcpkg。
 2. 以 dynamic `x64-windows` 安裝 `libheif[core]`；`default-features: false` 排除 x265 與非必要 codec，overlay 關閉 runtime plugin loading。
-3. 執行前端、Rust 測試，然後執行 Tauri `--no-bundle --features heic` release build。
-4. 用 `dumpbin /DEPENDENTS` 遞迴收集 vcpkg DLL 與必要 MSVC runtime。
-5. 移除外部搜尋路徑後再檢查 dependency closure 與禁止 codec 清單；任何未封裝的非系統 DLL 都會使發佈失敗。
+3. 對全 Rust workspace 跑無 HEIC 測試，再對 codec core／helper 跑
+   HEIC 測試；Tauri 主程式以 `--no-bundle` 且不含 HEIC 建置，helper
+   另以 `--features heic` 建置。
+4. 將 `ImgViewer.exe` 與 `ImgViewer.CodecHelper.exe` 一起放入 stage，
+   用 `dumpbin /DEPENDENTS` 遞迴收集 vcpkg DLL 與必要 MSVC runtime。
+5. 驗證主 EXE 不匯入 `heif.dll`／`libde265.dll`、helper 必須匯入
+   `heif.dll`；移除外部搜尋路徑後再檢查 dependency closure。
 6. 對 stage binary 執行無 WebDriver 的 native smoke。
-7. 加入 README、MIT/LGPL 授權、來源版本通知與 `BUILD_METADATA.json`，
+7. 加入 README、MIT/LGPL 授權、來源版本通知與 schema v2
+   `BUILD_METADATA.json`（含兩個 EXE 的 role、protocol version 與 SHA-256），
    輸出 ZIP、SHA-256 manifest 與 build metadata sidecar。
 
 GitHub 的 tag workflow 只建置一次並建立 draft release；CI 另產生並補強

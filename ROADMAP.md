@@ -21,9 +21,15 @@ active；未排程項目不代表承諾。
 
 ## 0.3–0.5 — 原生解碼隔離
 
-- [ ] 將 TIFF／HEIF 解碼移至獨立 helper process。
-- [ ] 以 Windows Job Object 限制預設 768 MiB RAM 與 30 秒硬期限。
-- [ ] 只傳 duplicated read-only handle，不傳任意輸出路徑或 command。
+- [x] 將 HEIF 解碼移至獨立 helper process；TIFF 仍待後續搬移。
+- [x] 對 HEIF helper 以 Windows Job Object 限制 768 MiB RAM、單一
+  process、kill-on-close 與每張 30 秒硬期限。
+- [x] helper 只接收 duplicated read-only handle，不接受來源路徑、任意
+  輸出路徑或額外 command line。
+- [x] 固定 codec binary protocol、request ID、payload／PNG 尺寸上限，
+  並驗證 crash 後下一張 lazy restart 與 parent／child handle 釋放。
+- [ ] 將 TIFF 解碼移至同等隔離 helper，補齊 hang／OOM corpus 與至少
+  20 次連續 helper 重建壓力測試。
 - [ ] helper／broker 以逐層 component handle 或等價 no-reparse 核心語意
   消除 `validate_source_path` 到 `CreateFile` 間的 parent-junction race。
 - [ ] catalog 背景化，涵蓋大型本機資料夾、進度與取消；UNC／reparse point

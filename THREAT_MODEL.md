@@ -1,6 +1,6 @@
 # ImgViewer 威脅模型
 
-最後檢視：2026-07-23
+最後檢視：2026-07-29
 
 ## 保護目標
 
@@ -19,8 +19,9 @@
    open 與 event listen。一次性 render token 取代把檔案路徑當圖片 URL。
 4. **Rust catalog / decode**：檔名、目錄項目、magic、metadata、尺寸及
    壓縮資料全部不可信。
-5. **原生 codec 與 DLL**：libheif、libde265、MSVC runtime 具有 native
-   code 風險；目前仍和主程序同一個 process，是已知殘餘風險。
+5. **原生 codec helper 與 DLL**：libheif、libde265、MSVC runtime 具有
+   native code 風險。HEIC／HEIF 已移入私有 helper process；TIFF 與其他
+   `image` crate 解碼仍在主程序 worker，是已知殘餘風險。
 6. **建置與發布**：npm、Cargo、vcpkg、GitHub Actions、runner 與 ZIP
    stage 都是供應鏈邊界。
 
@@ -50,8 +51,14 @@
 - render token 一次性使用；過期 generation 不能覆蓋目前畫面；Blob URL
   在換圖、錯誤、取消及卸載時回收。
 - 解碼排程最多一個執行中與一個可覆蓋 pending 工作。
-- 每個解碼工作帶 30 秒軟期限；超時後的結果不會發布。這不是對卡死
-  native codec 的硬中止，硬隔離仍由後續 helper process 負責。
+- 每個同 process 解碼工作帶 30 秒軟期限；超時後的結果不會發布。HEIC／
+  HEIF 另由固定同目錄的 helper 處理：啟動時先加入 kill-on-close Job
+  Object，限制單一 process、768 MiB 記憶體與每張 30 秒硬期限。
+- helper 只接受 duplicated read-only handle、預期長度與 request ID，
+  不接受路徑、額外 command line 或輸出位置。固定 binary protocol 限制
+  control／render payload，主程式驗證 request ID、PNG signature、IHDR
+  與尺寸；timeout、取消、pipe 中斷、crash 或不合法回應都會終止 Job，
+  同一輸入不自動重試，下一次選取才 lazy restart。
 - 解碼管線只開啟來源一次；檔案大小檢查及有上限的讀取使用同一個唯讀
   handle，magic、probe 與 decode 再從該次取得的 bounded bytes 進行，
   避免檢查後路徑遭替換而改讀另一份內容。
@@ -60,15 +67,16 @@
 - window-state 外掛執行前先以 64 KiB 上限讀取及驗證狀態 JSON；無效或
   超限檔會移除，無法安全處理時則拒絕啟動，錯誤記錄不含完整路徑。
 - vcpkg baseline、Cargo、pnpm 與 codec 版本固定；release 檢查 DLL
-  dependency closure 和禁止 codec。
+  dependency closure，主 EXE 不得匯入 HEIF codec，helper 必須匯入
+  `heif.dll`，兩個 EXE 的 hash 與 protocol version 都寫入 metadata。
 
 ## 主要威脅與處理
 
 | 威脅 | 現有處理 | 後續必要工作 |
 |---|---|---|
-| 壓縮炸彈、巨大靜態尺寸 | 輸入、尺寸、像素上限；mandatory normalization 以 checked arithmetic 預檢已知 aggregate working set；30 秒 soft deadline 拒絕發布過期結果 | helper process 的實際 working-set cap、強制期限與 codec fuzz |
+| 壓縮炸彈、巨大靜態尺寸 | 輸入、尺寸、像素上限；mandatory normalization 以 checked arithmetic 預檢已知 aggregate working set；HEIF helper 另有 768 MiB Job cap 與 30 秒硬期限 | TIFF 等同 process codec 的硬隔離與 codec fuzz |
 | GIF/WebP animation frame bomb | Rust 完整掃描 GIF image descriptor／WebP `ANMF`，限制 10,000 frames 與 10 億累計 frame pixels；動畫仍保留原始 bytes | WebView 動畫工作不受 Rust soft deadline 約束；helper hard-kill、fixture corpus 與 fuzz 仍是殘餘 DoS 工作 |
-| native codec crash、hang 或 OOM | 錯誤可恢復；固定 native 版本 | 將 TIFF/HEIF 移入受 Job Object 限制的 helper process |
+| native codec crash、hang 或 OOM | HEIF helper crash／timeout／OOM 會被 Job 終止，主窗口可在下一張重建；固定 native 版本 | 將 TIFF 移入同等 helper；補齊 hang／OOM corpus 與重建壓力測試 |
 | 檢查後檔案被替換（TOCTOU） | 每次 open 前重新驗證 drive/reparse；排程時固定單一唯讀 handle，大小檢查與 bounded read 共用該 handle，後續只用該份 bytes | `validate_source_path` 與 `CreateFile` 間仍有主動 parent-junction race；helper/broker 以 component handles／等價 `OBJ_DONT_REPARSE` 策略消除後，再傳 duplicated read-only handle |
 | WebView 呼叫未授權能力或導覽到遠端內容 | 主窗口 Capability、嚴格 CSP、原生頂層導覽白名單與負向測試 | 每次安全邊界變更持續擴充測試 |
 | render token 猜測或重播 | opaque、一次性、generation 驗證 | 持續測試重播、猜測與資源回收 |
@@ -82,7 +90,10 @@
 - 選檔器與拖放不是檔案存取 sandbox；`open_path` 會接受 WebView 傳入的
   支援圖片路徑。真正的限制是 IPC 白名單、唯讀行為、格式驗證和資源上限。
 - CSP 不能保護 Rust 或 native codec 自身的記憶體安全問題。
-- 目前沒有 helper process，因此單一惡意 TIFF/HEIF 仍可能拖垮主程序。
+- HEIF helper 降低 libheif／libde265 拖垮主窗口的風險，但不是 OS sandbox；
+  它仍與使用者同權限，安全邊界依賴只讀 handle、無路徑協定與 Job limits。
+- TIFF 與 WebView2 動畫尚無可強制終止的 helper；單一惡意輸入仍可能造成
+  主 process 或 WebView2 的永久 DoS。
 - 無網路與無 updater 降低攻擊面，但使用者仍需自行取得安全更新。
 
 ## 變更規則

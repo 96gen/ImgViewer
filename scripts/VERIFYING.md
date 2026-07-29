@@ -13,6 +13,7 @@ cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --workspace --all-t
 cargo test --locked --manifest-path .\src-tauri\Cargo.toml --workspace --no-default-features
 cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --all-targets --no-default-features --features heic -- -D warnings
 cargo test --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --no-default-features --features heic
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-codec-helper-process.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-release-contract.ps1
 ```
 
