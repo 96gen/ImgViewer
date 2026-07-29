@@ -12,6 +12,11 @@
 - 正式 tag 在 fresh vcpkg 安裝後完整清除 Cargo target，避免候選建置快取中的舊 native artifacts 與新 HEIC DLL 混用，造成測試程序以 `STATUS_DLL_INIT_FAILED` 結束。
 - workflow_dispatch 候選建置改走相同的 fresh native/full-clean gate，並禁止帶有 `lib` 前綴的 x265 等未核准 codec DLL。
 
+### Security
+
+- 更新 `serde_with` 至 3.21.0，修補空序列或 map entry 可能觸發 panic
+  的 Dependabot advisory。
+
 ## [0.2.1] - 2026-07-29
 
 ### Fixed
