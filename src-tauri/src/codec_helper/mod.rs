@@ -42,6 +42,11 @@ trait HelperSession: Send {
         expected_length: u64,
         timeout: Duration,
     ) -> Result<DecodeResponse, TransportError>;
+
+    #[cfg(all(test, windows))]
+    fn terminate_process_for_test(&self) -> Result<(), TransportError> {
+        Err(TransportError::Unavailable)
+    }
 }
 
 trait SessionLauncher: Send + Sync {
@@ -321,10 +326,18 @@ mod tests {
     use super::*;
     use imgviewer_codec_protocol::{DecodeError, DecodeSuccess};
     use std::collections::VecDeque;
+    #[cfg(windows)]
+    use std::fs::{self, OpenOptions};
     use std::io::Write;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::mpsc;
     use std::thread;
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     #[derive(Clone, Copy)]
     enum Behavior {
@@ -494,5 +507,142 @@ mod tests {
         assert_eq!(error.parameters["maxBytes"], 512);
         assert!(!error.message.contains('\\'));
         assert!(!error.message.contains('/'));
+    }
+
+    #[cfg(windows)]
+    #[derive(Default)]
+    struct CountingWindowsLauncher {
+        launches: AtomicUsize,
+        killers: Mutex<Vec<Arc<dyn SessionKiller>>>,
+    }
+
+    #[cfg(windows)]
+    impl SessionLauncher for CountingWindowsLauncher {
+        fn launch(&self, timeout: Duration) -> Result<Box<dyn HelperSession>, TransportError> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            let session = windows::WindowsLauncher.launch(timeout)?;
+            self.killers.lock().push(session.killer());
+            Ok(session)
+        }
+    }
+
+    #[cfg(windows)]
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures")
+            .join(name)
+    }
+
+    #[cfg(windows)]
+    fn decode_fixture_with_delete_guard(
+        client: &HeifHelperClient,
+        directory: &Path,
+        copy_name: &str,
+    ) -> Result<DecodedRender, ViewerError> {
+        let path = directory.join(copy_name);
+        fs::copy(fixture("primary-second.heic"), &path).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            // Omitting FILE_SHARE_DELETE makes removal a direct proof that
+            // both the broker handle and its child duplicate were released.
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let result = client.decode(file);
+        fs::remove_file(&path).expect("helper and broker must release the read-only file handle");
+        result
+    }
+
+    #[cfg(windows)]
+    fn assert_primary_second_render(render: &DecodedRender) {
+        assert_eq!(render.mime_type, "image/png");
+        assert_eq!((render.width, render.height), (3, 5));
+        assert!(!render.animated);
+        assert!(render.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let pixels = image::load_from_memory(&render.bytes).unwrap().to_rgb8();
+        let primary_pixel = pixels.get_pixel(0, 0).0;
+        assert!(
+            primary_pixel[2] > 150
+                && primary_pixel[2] > primary_pixel[0]
+                && primary_pixel[2] > primary_pixel[1],
+            "expected the blue designated primary item, got {primary_pixel:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a HEIC-enabled ImgViewer.CodecHelper.exe staged beside the test binary"]
+    fn real_helper_process_decodes_persistently_and_recovers_after_crash() {
+        let helper_path = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(windows::TEST_HELPER_FILE_NAME);
+        assert!(
+            helper_path.is_file(),
+            "stage the real helper at {}",
+            helper_path.display()
+        );
+
+        let launcher = Arc::new(CountingWindowsLauncher::default());
+        let client = HeifHelperClient::with_launcher(launcher.clone(), Duration::from_secs(10));
+        let directory = tempfile::tempdir().unwrap();
+
+        let first =
+            decode_fixture_with_delete_guard(&client, directory.path(), "first-primary.heic")
+                .unwrap();
+        assert_primary_second_render(&first);
+        let second =
+            decode_fixture_with_delete_guard(&client, directory.path(), "second-primary.heic")
+                .unwrap();
+        assert_primary_second_render(&second);
+        assert_eq!(
+            launcher.launches.load(Ordering::SeqCst),
+            1,
+            "two successful requests must share one persistent helper"
+        );
+
+        client
+            .session
+            .lock()
+            .as_ref()
+            .expect("successful decodes retain the helper session")
+            .terminate_process_for_test()
+            .unwrap();
+        let crash_error =
+            decode_fixture_with_delete_guard(&client, directory.path(), "after-crash.heic")
+                .unwrap_err();
+        assert!(
+            matches!(
+                crash_error.code.as_str(),
+                "codec_helper_io_error" | "codec_helper_crashed"
+            ),
+            "unexpected crash error: {}",
+            crash_error.code
+        );
+        assert_eq!(
+            launcher.launches.load(Ordering::SeqCst),
+            1,
+            "the failed image must not be retried automatically"
+        );
+
+        let recovered =
+            decode_fixture_with_delete_guard(&client, directory.path(), "recovered.heic").unwrap();
+        assert_primary_second_render(&recovered);
+        assert_eq!(
+            launcher.launches.load(Ordering::SeqCst),
+            2,
+            "the next decode must lazily launch a clean helper"
+        );
+
+        client.shutdown();
+        assert!(
+            launcher
+                .killers
+                .lock()
+                .iter()
+                .all(|killer| killer.is_killed()),
+            "every helper Job Object must be terminated before test exit"
+        );
     }
 }

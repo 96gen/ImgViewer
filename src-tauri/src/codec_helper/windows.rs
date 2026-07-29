@@ -17,12 +17,12 @@ use imgviewer_codec_protocol::{
     DecodeHeifRequest, DecodeResponse, ProtocolError, read_decode_response, read_ready,
     write_decode_request, write_hello,
 };
-#[cfg(test)]
-use windows_sys::Win32::Foundation::GetHandleInformation;
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, SetHandleInformation, TRUE,
 };
+#[cfg(test)]
+use windows_sys::Win32::Foundation::{GetHandleInformation, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -35,6 +35,8 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+#[cfg(test)]
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
@@ -46,7 +48,11 @@ use super::{HelperSession, SessionKiller, SessionLauncher, TransportError};
 
 const JOB_MEMORY_LIMIT_BYTES: usize = 768 * 1024 * 1024;
 const HELPER_FILE_NAME: &str = "ImgViewer.CodecHelper.exe";
+#[cfg(test)]
+pub(super) const TEST_HELPER_FILE_NAME: &str = HELPER_FILE_NAME;
 const HELPER_FAILURE_EXIT_CODE: u32 = 70;
+#[cfg(test)]
+const PROCESS_EXIT_WAIT_MS: u32 = 5_000;
 
 pub(super) struct WindowsLauncher;
 
@@ -264,6 +270,24 @@ impl HelperSession for WindowsSession {
                 Err(TransportError::Disconnected)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn terminate_process_for_test(&self) -> Result<(), TransportError> {
+        // SAFETY: process is a live owned process handle. This deliberately
+        // bypasses JobControl's killed flag so the next transaction observes
+        // an unexpected child death through the real broker transport.
+        if unsafe { TerminateProcess(raw_handle(&self.process), HELPER_FAILURE_EXIT_CODE) } == FALSE
+        {
+            return Err(TransportError::Io);
+        }
+        // SAFETY: waiting on the owned process handle is read-only and bounded.
+        if unsafe { WaitForSingleObject(raw_handle(&self.process), PROCESS_EXIT_WAIT_MS) }
+            != WAIT_OBJECT_0
+        {
+            return Err(TransportError::Timeout);
+        }
+        Ok(())
     }
 }
 
