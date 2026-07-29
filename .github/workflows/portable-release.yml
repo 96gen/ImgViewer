@@ -98,7 +98,7 @@ jobs:
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             ./scripts/build-portable.ps1 -SkipNativeSmoke -ReleaseMode -ExpectedTag $env:GITHUB_REF_NAME
           } else {
-            ./scripts/build-portable.ps1 -SkipNativeSmoke
+            ./scripts/build-portable.ps1 -SkipNativeSmoke -FreshNative
           }
 
       - name: Generate and validate CycloneDX SBOM

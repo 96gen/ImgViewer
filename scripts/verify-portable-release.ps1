@@ -255,6 +255,20 @@ function Assert-ExpectedFailure {
     Write-Host "PASS expected-failure=$Name"
 }
 
+function Assert-NoForbiddenCodecEntries {
+    param([Parameter(Mandatory)] [string[]]$EntryNames)
+
+    $forbiddenEntries = @(
+        $EntryNames | Where-Object {
+            [System.IO.Path]::GetFileName($_) -match
+                '^(?:lib)?(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
+        }
+    )
+    if ($forbiddenEntries.Count -gt 0) {
+        throw "ZIP verification found a forbidden codec: $($forbiddenEntries -join ', ')"
+    }
+}
+
 $ArtifactPath = [System.IO.Path]::GetFullPath($ArtifactPath)
 if (-not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) {
     throw "Portable artifact does not exist: $ArtifactPath"
@@ -316,15 +330,7 @@ try {
                 throw "ZIP verification failed; missing entry: $requiredEntry"
             }
         }
-        $forbiddenEntries = @(
-            $entryNames | Where-Object {
-                [System.IO.Path]::GetFileName($_) -match
-                    '^(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
-            }
-        )
-        if ($forbiddenEntries.Count -gt 0) {
-            throw "ZIP verification found a forbidden codec: $($forbiddenEntries -join ', ')"
-        }
+        Assert-NoForbiddenCodecEntries -EntryNames $entryNames
     } finally {
         $archive.Dispose()
     }
@@ -397,6 +403,12 @@ try {
     }
 
     if ($RunNegativeTests) {
+        Assert-ExpectedFailure -Name "forbidden-codec-lib-prefix" -Operation {
+            Assert-NoForbiddenCodecEntries -EntryNames @(
+                "$artifactRoot/ImgViewer.exe",
+                "$artifactRoot/libx265.dll"
+            )
+        }
         Assert-ExpectedFailure -Name "checksum-mismatch" -Operation {
             Assert-ArtifactChecksum -Artifact $ArtifactPath -Manifest $ChecksumPath `
                 -IndependentExpectedHash ("0" * 64) | Out-Null

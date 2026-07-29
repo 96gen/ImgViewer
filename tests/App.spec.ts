@@ -338,7 +338,7 @@ describe("App keyboard and navigation", () => {
 
     await wrapper.get('button[aria-label="關於 ImgViewer"]').trigger("click");
     const dialog = wrapper.get('[role="dialog"]');
-    expect(dialog.text()).toContain("ImgViewer 0.2.1");
+    expect(dialog.text()).toContain("ImgViewer 0.2.2");
     expect(dialog.text()).toContain("不含遙測");
     expect(dialog.get("input").attributes("value")).toBe(
       "https://github.com/96gen/ImgViewer/releases",

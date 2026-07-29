@@ -6,6 +6,7 @@ param(
     [switch]$SkipChecks,
     [switch]$SkipNativeSmoke,
     [switch]$KeepStage,
+    [switch]$FreshNative,
     [switch]$ReleaseMode,
     [string]$ExpectedTag
 )
@@ -221,7 +222,7 @@ if (-not $pnpm) {
 }
 
 $nativeInstallArguments = @{}
-if ($ReleaseMode) {
+if ($ReleaseMode -or $FreshNative) {
     $nativeInstallArguments.FreshInstall = $true
 }
 $runtimeBin = (& (Join-Path $PSScriptRoot "install-native-deps.ps1") @nativeInstallArguments |
@@ -247,10 +248,18 @@ $env:CI = "true"
 
 Push-Location $repoRoot
 try {
-    # libheif-sys copies heif.dll into Cargo OUT_DIR. Rust caches do not notice
-    # when vcpkg rebuilds that DLL, so remove only this package's stale native
-    # artifacts before using the HEIC test/build gate.
-    Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" libheif-sys
+    if ($ReleaseMode -or $FreshNative) {
+        # A tagged release fresh-installs vcpkg. Never combine those newly built
+        # DLLs with a restored Cargo target tree containing old native OUT_DIRs
+        # or downstream test artifacts. FreshNative gives release candidates the
+        # same native/test isolation without claiming tag provenance.
+        Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml")
+    } else {
+        # libheif-sys copies heif.dll into Cargo OUT_DIR. Rust caches do not
+        # notice when vcpkg rebuilds that DLL, so invalidate its native outputs
+        # while retaining the faster target cache for ordinary candidate builds.
+        Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" libheif-sys
+    }
     Invoke-Checked $pnpm.Source install --frozen-lockfile
     if (-not $SkipChecks) {
         Invoke-Checked $pnpm.Source test
@@ -343,7 +352,7 @@ foreach ($requiredDll in @("heif.dll", "libde265.dll")) {
 $forbiddenCodecFiles = @(
     Get-ChildItem -LiteralPath $stageDirectory -Recurse -File |
         Where-Object {
-            $_.Name -match '^(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
+            $_.Name -match '^(?:lib)?(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
         }
 )
 if ($forbiddenCodecFiles.Count -gt 0) {
@@ -567,7 +576,7 @@ try {
     }
     $forbiddenEntries = @(
         $entryNames | Where-Object {
-            [System.IO.Path]::GetFileName($_) -match '^(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
+            [System.IO.Path]::GetFileName($_) -match '^(?:lib)?(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
         }
     )
     if ($forbiddenEntries.Count -gt 0) {

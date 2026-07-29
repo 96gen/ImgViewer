@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "imgviewer-native-dependencies",
-  "version-string": "0.2.1",
+  "version-string": "0.2.2",
   "description": "Pinned native runtime dependencies for the ImgViewer Windows x64 portable build",
   "builtin-baseline": "d015e31e90838a4c9dfa3eed45979bc70d9357fc",
   "dependencies": [
