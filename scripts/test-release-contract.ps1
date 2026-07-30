@@ -38,20 +38,22 @@ function Write-TestFile {
 function Get-Sha256 {
     param([Parameter(Mandatory)] [string]$Path)
 
-    $stream = [System.IO.File]::OpenRead(
-        [System.IO.Path]::GetFullPath($Path)
-    )
     $hasher = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return (
-            [System.BitConverter]::ToString(
-                $hasher.ComputeHash($stream)
-            ).Replace("-", "")
+        $stream = [System.IO.File]::OpenRead(
+            [System.IO.Path]::GetFullPath($Path)
         )
-    }
-    finally {
+        try {
+            return (
+                [System.BitConverter]::ToString(
+                    $hasher.ComputeHash($stream)
+                ).Replace("-", "")
+            )
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
         $hasher.Dispose()
-        $stream.Dispose()
     }
 }
 

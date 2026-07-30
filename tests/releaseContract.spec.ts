@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const root = join(import.meta.dirname, "..");
@@ -96,29 +96,24 @@ describe("portable helper release contract", () => {
   windowsIt(
     "passes the synthetic schema, helper negative, and SBOM script checks",
     () => {
-      const contractScript = read("scripts/test-release-contract.ps1");
-      expect(contractScript).toContain(
-        "[System.Security.Cryptography.SHA256]::Create()",
-      );
-      expect(contractScript).not.toContain("Get-FileHash");
+      const hashScripts = [
+        "scripts/test-release-contract.ps1",
+        "scripts/verify-portable-release.ps1",
+        "scripts/add-native-sbom-components.ps1",
+        "scripts/bootstrap-vcpkg.ps1",
+        "scripts/build-portable.ps1",
+      ].map(read);
+      for (const script of hashScripts) {
+        expect(script).toContain(
+          "[System.Security.Cryptography.SHA256]::Create()",
+        );
+        expect(script).not.toContain("Get-FileHash");
+      }
 
-      // GitHub's pwsh runner prepends PowerShell 7 module paths. A nested
-      // Windows PowerShell 5.1 process inherits that value, so its own module
-      // root must come first; appending it still makes autoload stop at the
-      // incompatible PowerShell 7 Microsoft.PowerShell.Utility module.
-      const windowsPowerShellModules = join(
-        process.env.SystemRoot ?? "C:\\Windows",
-        "System32",
-        "WindowsPowerShell",
-        "v1.0",
-        "Modules",
-      );
-      const psModulePath = [windowsPowerShellModules, process.env.PSModulePath]
-        .filter((value): value is string => Boolean(value))
-        .join(delimiter);
-      expect(psModulePath.split(delimiter)[0]).toBe(
-        windowsPowerShellModules,
-      );
+      // Keep the hosted runner's inherited PSModulePath unchanged. In
+      // particular, a nested Windows PowerShell 5.1 process may inherit
+      // PowerShell 7 module paths, so release hashing must not depend on
+      // Microsoft.PowerShell.Utility autoloading.
       const result = spawnSync(
         "powershell.exe",
         [
@@ -132,10 +127,6 @@ describe("portable helper release contract", () => {
           cwd: root,
           encoding: "utf8",
           timeout: 60_000,
-          env: {
-            ...process.env,
-            PSModulePath: psModulePath,
-          },
         },
       );
 

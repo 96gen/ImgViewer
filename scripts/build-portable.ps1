@@ -19,6 +19,29 @@ $forbiddenCodecFilePattern =
 $forbiddenVcpkgPackagePattern =
     '^(?i:(?:lib)?x265|(?:lib)?aom|(?:lib)?avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc)$'
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            [System.IO.Path]::GetFullPath($Path),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            return [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) "release"
 }
@@ -407,9 +430,7 @@ foreach ($nativeTestDll in @("libde265.dll", "heif.dll")) {
     if (-not (Test-Path -LiteralPath $nativeTestDllPath -PathType Leaf)) {
         throw "Native dependency install did not produce $nativeTestDll."
     }
-    $nativeTestDllHash = (
-        Get-FileHash -LiteralPath $nativeTestDllPath -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
+    $nativeTestDllHash = (Get-Sha256Hex -Path $nativeTestDllPath).ToLowerInvariant()
     Write-Host "Native test DLL: $nativeTestDll sha256=$nativeTestDllHash"
     Assert-NativeLibraryLoadable -LibraryPath $nativeTestDllPath
 }
@@ -620,7 +641,7 @@ $libde265Version = $Matches.version
 $vcpkgToolVersion = Invoke-Captured -FilePath $vcpkgExe -Arguments @(
     "version", "--disable-metrics"
 )
-$vcpkgToolSha256 = (Get-FileHash -LiteralPath $vcpkgExe -Algorithm SHA256).Hash.ToLowerInvariant()
+$vcpkgToolSha256 = (Get-Sha256Hex -Path $vcpkgExe).ToLowerInvariant()
 if ($vcpkgToolSha256 -cne "f1edbf3a39de350e2bb065214fdc057111aa87a2e2ed9a7dcb8ddc86e17751b9") {
     throw "Pinned vcpkg.exe digest changed after native dependency installation."
 }
@@ -681,7 +702,7 @@ $codecMetadata = @(
         triplet = "x64-windows"
         installedRow = [string]$libheifRow
         fileName = "heif.dll"
-        sha256 = (Get-FileHash -LiteralPath (Join-Path $stageDirectory "heif.dll") -Algorithm SHA256).Hash
+        sha256 = Get-Sha256Hex -Path (Join-Path $stageDirectory "heif.dll")
     },
     [ordered]@{
         name = "libde265"
@@ -689,7 +710,7 @@ $codecMetadata = @(
         triplet = "x64-windows"
         installedRow = [string]$libde265Row
         fileName = "libde265.dll"
-        sha256 = (Get-FileHash -LiteralPath (Join-Path $stageDirectory "libde265.dll") -Algorithm SHA256).Hash
+        sha256 = Get-Sha256Hex -Path (Join-Path $stageDirectory "libde265.dll")
     }
 )
 $msvcRuntimeMetadata = @(
@@ -701,7 +722,7 @@ $msvcRuntimeMetadata = @(
             [ordered]@{
                 fileName = $_.Name
                 fileVersion = [string]$fileVersion
-                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+                sha256 = Get-Sha256Hex -Path $_.FullName
             }
         }
 )
@@ -710,17 +731,17 @@ $executableMetadata = @(
         role = "main"
         fileName = "ImgViewer.exe"
         protocolVersion = $codecProtocolVersion
-        sha256 = (Get-FileHash -LiteralPath (
+        sha256 = Get-Sha256Hex -Path (
             Join-Path $stageDirectory "ImgViewer.exe"
-        ) -Algorithm SHA256).Hash
+        )
     },
     [ordered]@{
         role = "codec-helper"
         fileName = "ImgViewer.CodecHelper.exe"
         protocolVersion = $codecProtocolVersion
-        sha256 = (Get-FileHash -LiteralPath (
+        sha256 = Get-Sha256Hex -Path (
             Join-Path $stageDirectory "ImgViewer.CodecHelper.exe"
-        ) -Algorithm SHA256).Hash
+        )
     }
 )
 $buildMetadata = [ordered]@{
@@ -826,7 +847,7 @@ try {
     $archive.Dispose()
 }
 
-$artifactHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$artifactHash = (Get-Sha256Hex -Path $zipPath).ToLowerInvariant()
 $checksumLine = "$artifactHash  $([System.IO.Path]::GetFileName($zipPath))`n"
 [System.IO.File]::WriteAllText($checksumPath, $checksumLine, $utf8WithoutBom)
 

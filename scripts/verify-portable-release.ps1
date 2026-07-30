@@ -31,6 +31,29 @@ $ErrorActionPreference = "Stop"
 $forbiddenCodecFilePattern =
     '^(?i:(?:lib)?(?:x265|aom|avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc))[^\\/]*\.(?:dll|exe)$'
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            [System.IO.Path]::GetFullPath($Path),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            return [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
 function Assert-SafeChildPath {
     param(
         [Parameter(Mandatory)] [string]$Parent,
@@ -78,7 +101,7 @@ function Assert-ArtifactChecksum {
 
     $fileName = [System.IO.Path]::GetFileName($Artifact)
     $manifestHash = Read-ChecksumManifest -Path $Manifest -ExpectedFileName $fileName
-    $actualHash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = (Get-Sha256Hex -Path $Artifact).ToLowerInvariant()
     if ($manifestHash -cne $actualHash) {
         throw "SHA-256 mismatch for $fileName. Manifest=$manifestHash Actual=$actualHash"
     }
@@ -249,7 +272,7 @@ function Assert-ExecutablePayloadHashes {
         if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
             throw "Executable payload named by BUILD_METADATA is missing: $fileName"
         }
-        $actualHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        $actualHash = (Get-Sha256Hex -Path $payloadPath).ToUpperInvariant()
         if ($actualHash -cne $expectedHash) {
             throw "Executable payload hash mismatch for $fileName. Metadata=$expectedHash Actual=$actualHash"
         }
@@ -292,7 +315,7 @@ function Assert-NativePayloadHashes {
         if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
             throw "Native payload named by BUILD_METADATA is missing: $fileName"
         }
-        $actualHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        $actualHash = (Get-Sha256Hex -Path $payloadPath).ToUpperInvariant()
         if ($actualHash -cne $expectedHash) {
             throw "Native payload hash mismatch for $fileName. Metadata=$expectedHash Actual=$actualHash"
         }
@@ -449,8 +472,8 @@ try {
         if (-not (Test-Path -LiteralPath $MetadataPath -PathType Leaf)) {
             throw "BUILD_METADATA sidecar does not exist: $MetadataPath"
         }
-        $insideHash = (Get-FileHash -LiteralPath $insideMetadataPath -Algorithm SHA256).Hash
-        $outsideHash = (Get-FileHash -LiteralPath $MetadataPath -Algorithm SHA256).Hash
+        $insideHash = Get-Sha256Hex -Path $insideMetadataPath
+        $outsideHash = Get-Sha256Hex -Path $MetadataPath
         if ($insideHash -cne $outsideHash) {
             throw "BUILD_METADATA sidecar differs from the copy inside the ZIP."
         }

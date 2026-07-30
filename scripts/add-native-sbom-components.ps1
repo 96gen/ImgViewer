@@ -10,6 +10,29 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            [System.IO.Path]::GetFullPath($Path),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            return [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
 function Add-ComponentIfMissing {
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.ArrayList]$Components,
@@ -112,7 +135,7 @@ function Get-VerifiedPayloadHash {
     if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
         throw "File named by BUILD_METADATA is missing from the ZIP: $fileName"
     }
-    $actualHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    $actualHash = (Get-Sha256Hex -Path $payloadPath).ToUpperInvariant()
     if ($actualHash -cne $metadataHash) {
         throw "File hash does not match BUILD_METADATA: $fileName"
     }
