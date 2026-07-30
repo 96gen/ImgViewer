@@ -103,9 +103,9 @@ describe("portable helper release contract", () => {
       expect(contractScript).not.toContain("Get-FileHash");
 
       // GitHub's pwsh runner prepends PowerShell 7 module paths. A nested
-      // Windows PowerShell 5.1 process inherits that value and otherwise
-      // cannot auto-load built-in Windows modules such as
-      // Microsoft.PowerShell.Utility (Get-FileHash).
+      // Windows PowerShell 5.1 process inherits that value, so its own module
+      // root must come first; appending it still makes autoload stop at the
+      // incompatible PowerShell 7 Microsoft.PowerShell.Utility module.
       const windowsPowerShellModules = join(
         process.env.SystemRoot ?? "C:\\Windows",
         "System32",
@@ -113,9 +113,12 @@ describe("portable helper release contract", () => {
         "v1.0",
         "Modules",
       );
-      const psModulePath = [process.env.PSModulePath, windowsPowerShellModules]
+      const psModulePath = [windowsPowerShellModules, process.env.PSModulePath]
         .filter((value): value is string => Boolean(value))
         .join(delimiter);
+      expect(psModulePath.split(delimiter)[0]).toBe(
+        windowsPowerShellModules,
+      );
       const result = spawnSync(
         "powershell.exe",
         [
