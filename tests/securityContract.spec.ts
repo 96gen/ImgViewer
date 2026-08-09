@@ -450,6 +450,10 @@ describe("desktop security contract", () => {
     expect(verifyJob).not.toContain("gh release download");
     expect(verifyJob).toContain("$workflowRunsJson = gh run list");
     expect(verifyJob).toContain("./scripts/select-portable-tag-workflow-run.ps1");
+    expect(verifyJob).toContain(
+      "$attestationMismatchExitCode = $LASTEXITCODE",
+    );
+    expect(verifyJob).toContain("$global:LASTEXITCODE = 0");
     expect(publishJob).toContain("contents: write");
     expect(publishJob).not.toContain("actions/checkout@");
     expect(publishJob).toContain("gh release download");
@@ -497,7 +501,29 @@ describe("desktop security contract", () => {
     expect(select(runs)).toBe("4");
     expect(() => select(runs.slice(0, 3))).toThrow();
     expect(() => select([...runs, { ...exact, databaseId: 5 }])).toThrow();
-  });
+  }, 20_000);
+
+  it("clears a handled native negative-test exit code before the step ends", () => {
+    if (process.platform !== "win32") return;
+
+    const output = execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        [
+          "cmd.exe /c exit 23",
+          "$negativeExitCode = $LASTEXITCODE",
+          "if ($negativeExitCode -ne 23) { throw 'unexpected exit code' }",
+          "$global:LASTEXITCODE = 0",
+          "Write-Output 'PASS handled-native-negative-exit'",
+        ].join("; "),
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    expect(output.trim()).toBe("PASS handled-native-negative-exit");
+  }, 20_000);
 
   it("keeps packaged keyboard smoke focused and rapid navigation deterministic", () => {
     const smoke = read("scripts/smoke-native.ps1");

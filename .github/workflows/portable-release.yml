@@ -443,9 +443,11 @@ jobs:
             --source-digest $zeroDigest `
             --source-ref $sourceRef `
             --deny-self-hosted-runners *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $attestationMismatchExitCode = $LASTEXITCODE
+          if ($attestationMismatchExitCode -eq 0) {
             throw "Attestation verification unexpectedly accepted an incorrect source digest."
           }
+          $global:LASTEXITCODE = 0
           Write-Host "PASS expected-failure=attestation-source-digest-mismatch"
           $sbom = Get-Content -LiteralPath "./release-assets/$artifactName.cdx.json" -Raw | ConvertFrom-Json
           $buildMetadata = Get-Content -LiteralPath "./release-assets/$artifactName.build.json" -Raw | ConvertFrom-Json
