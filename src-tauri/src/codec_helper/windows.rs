@@ -14,12 +14,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use imgviewer_codec_protocol::{
-    DecodeHeifRequest, DecodeResponse, ProtocolError, read_decode_response, read_ready,
-    write_decode_request, write_hello,
+    CODEC_HELPER_MEMORY_LIMIT_BYTES, CodecFormat, DecodeRequest, DecodeResponse, ProtocolError,
+    read_decode_response, read_ready, write_decode_request, write_hello,
 };
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, SetHandleInformation, TRUE,
+    INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation, TRUE,
 };
 #[cfg(test)]
 use windows_sys::Win32::Foundation::{GetHandleInformation, WAIT_OBJECT_0};
@@ -39,14 +39,14 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute,
 };
 
 use super::{HelperSession, SessionKiller, SessionLauncher, TransportError};
 
-const JOB_MEMORY_LIMIT_BYTES: usize = 768 * 1024 * 1024;
 const HELPER_FILE_NAME: &str = "ImgViewer.CodecHelper.exe";
 #[cfg(test)]
 pub(super) const TEST_HELPER_FILE_NAME: &str = HELPER_FILE_NAME;
@@ -54,11 +54,38 @@ const HELPER_FAILURE_EXIT_CODE: u32 = 70;
 #[cfg(test)]
 const PROCESS_EXIT_WAIT_MS: u32 = 5_000;
 
-pub(super) struct WindowsLauncher;
+pub(super) struct WindowsLauncher {
+    helper_file_name: &'static str,
+    job_memory_limit_bytes: usize,
+}
+
+impl WindowsLauncher {
+    pub(super) const fn production() -> Self {
+        Self {
+            helper_file_name: HELPER_FILE_NAME,
+            job_memory_limit_bytes: CODEC_HELPER_MEMORY_LIMIT_BYTES,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn for_test(
+        helper_file_name: &'static str,
+        job_memory_limit_bytes: usize,
+    ) -> Self {
+        Self {
+            helper_file_name,
+            job_memory_limit_bytes,
+        }
+    }
+}
 
 impl SessionLauncher for WindowsLauncher {
     fn launch(&self, timeout: Duration) -> Result<Box<dyn HelperSession>, TransportError> {
-        Ok(Box::new(WindowsSession::launch(timeout)?))
+        Ok(Box::new(WindowsSession::launch(
+            timeout,
+            self.helper_file_name,
+            self.job_memory_limit_bytes,
+        )?))
     }
 }
 
@@ -70,14 +97,18 @@ struct WindowsSession {
 }
 
 impl WindowsSession {
-    fn launch(timeout: Duration) -> Result<Self, TransportError> {
+    fn launch(
+        timeout: Duration,
+        helper_file_name: &str,
+        job_memory_limit_bytes: usize,
+    ) -> Result<Self, TransportError> {
         let executable = std::env::current_exe().map_err(|_| TransportError::Unavailable)?;
-        let helper_path = helper_path_from_executable(&executable)?;
+        let helper_path = helper_path_from_executable(&executable, helper_file_name)?;
         let helper_directory = helper_path
             .parent()
             .ok_or(TransportError::Unavailable)?
             .to_path_buf();
-        let job = create_job()?;
+        let job = create_job(job_memory_limit_bytes)?;
         let input_pipe = create_pipe()?;
         let output_pipe = create_pipe()?;
         // The explicit process handle list is the primary inheritance
@@ -164,14 +195,21 @@ impl WindowsSession {
             process,
             killer,
         };
-        write_hello(&mut session.stdin).map_err(map_protocol_error)?;
-        session.stdin.flush().map_err(|_| TransportError::Io)?;
+        if let Err(error) = write_hello(&mut session.stdin).map_err(map_protocol_error) {
+            return Err(session.classify_transport_failure(error));
+        }
+        if session.stdin.flush().is_err() {
+            return Err(session.classify_transport_failure(TransportError::Io));
+        }
         session.read_ready_with_timeout(timeout)?;
         Ok(session)
     }
 
     fn read_ready_with_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
-        let mut stdout = self.stdout.take().ok_or(TransportError::Protocol)?;
+        let mut stdout = self
+            .stdout
+            .take()
+            .ok_or_else(|| self.classify_transport_failure(TransportError::Protocol))?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let reader = spawn_reader("imgviewer-helper-handshake", move || {
             let result = read_ready(&mut stdout);
@@ -179,9 +217,13 @@ impl WindowsSession {
         })?;
         match receiver.recv_timeout(timeout) {
             Ok((stdout, result)) => {
-                join_reader(reader)?;
+                if join_reader(reader).is_err() {
+                    return Err(self.classify_transport_failure(TransportError::Protocol));
+                }
                 self.stdout = Some(stdout);
-                result.map_err(map_protocol_error)
+                result
+                    .map_err(map_protocol_error)
+                    .map_err(|error| self.classify_transport_failure(error))
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.killer.kill();
@@ -189,9 +231,10 @@ impl WindowsSession {
                 Err(TransportError::Timeout)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let error = self.classify_transport_failure(TransportError::Protocol);
                 self.killer.kill();
                 let _ = join_reader(reader);
-                Err(TransportError::Disconnected)
+                Err(error)
             }
         }
     }
@@ -217,6 +260,33 @@ impl WindowsSession {
         }
         Ok(remote_handle as usize as u64)
     }
+
+    fn classify_transport_failure(&self, error: TransportError) -> TransportError {
+        if !matches!(
+            error,
+            TransportError::Io | TransportError::Protocol | TransportError::Disconnected
+        ) {
+            return error;
+        }
+
+        let mut exit_code = 0_u32;
+        // SAFETY: process is a live owned process handle and exit_code is a
+        // valid output pointer. Query failure leaves the original transport
+        // classification intact.
+        let queried = unsafe { GetExitCodeProcess(raw_handle(&self.process), &mut exit_code) };
+        classify_transport_failure_with_exit_code(error, (queried != FALSE).then_some(exit_code))
+    }
+}
+
+fn classify_transport_failure_with_exit_code(
+    error: TransportError,
+    exit_code: Option<u32>,
+) -> TransportError {
+    if exit_code.is_some_and(|exit_code| exit_code != STILL_ACTIVE as u32) {
+        TransportError::Disconnected
+    } else {
+        error
+    }
 }
 
 impl HelperSession for WindowsSession {
@@ -226,6 +296,7 @@ impl HelperSession for WindowsSession {
 
     fn transact(
         &mut self,
+        format: CodecFormat,
         file: File,
         request_id: u64,
         expected_length: u64,
@@ -234,20 +305,31 @@ impl HelperSession for WindowsSession {
         if self.killer.is_killed() {
             return Err(TransportError::Cancelled);
         }
-        let duplicated_handle = self.duplicate_file_into_child(&file)?;
-        write_decode_request(
+        let duplicated_handle = self
+            .duplicate_file_into_child(&file)
+            .map_err(|error| self.classify_transport_failure(error))?;
+        if let Err(error) = write_decode_request(
             &mut self.stdin,
-            DecodeHeifRequest {
+            DecodeRequest {
                 request_id,
                 duplicated_handle,
                 expected_length,
+                format,
             },
         )
-        .map_err(map_protocol_error)?;
-        self.stdin.flush().map_err(|_| TransportError::Io)?;
+        .map_err(map_protocol_error)
+        {
+            return Err(self.classify_transport_failure(error));
+        }
+        if self.stdin.flush().is_err() {
+            return Err(self.classify_transport_failure(TransportError::Io));
+        }
         drop(file);
 
-        let mut stdout = self.stdout.take().ok_or(TransportError::Protocol)?;
+        let mut stdout = self
+            .stdout
+            .take()
+            .ok_or_else(|| self.classify_transport_failure(TransportError::Protocol))?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let reader = spawn_reader("imgviewer-helper-response", move || {
             let result = read_decode_response(&mut stdout, request_id);
@@ -255,9 +337,13 @@ impl HelperSession for WindowsSession {
         })?;
         match receiver.recv_timeout(timeout) {
             Ok((stdout, result)) => {
-                join_reader(reader)?;
+                if join_reader(reader).is_err() {
+                    return Err(self.classify_transport_failure(TransportError::Protocol));
+                }
                 self.stdout = Some(stdout);
-                result.map_err(map_protocol_error)
+                result
+                    .map_err(map_protocol_error)
+                    .map_err(|error| self.classify_transport_failure(error))
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.killer.kill();
@@ -265,9 +351,10 @@ impl HelperSession for WindowsSession {
                 Err(TransportError::Timeout)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let error = self.classify_transport_failure(TransportError::Protocol);
                 self.killer.kill();
                 let _ = join_reader(reader);
-                Err(TransportError::Disconnected)
+                Err(error)
             }
         }
     }
@@ -382,7 +469,7 @@ fn open_inheritable_null() -> Result<OwnedHandle, TransportError> {
     owned_handle(handle)
 }
 
-fn create_job() -> Result<OwnedHandle, TransportError> {
+fn create_job(memory_limit_bytes: usize) -> Result<OwnedHandle, TransportError> {
     // SAFETY: null security/name requests an unnamed job with defaults.
     let raw_job = unsafe { CreateJobObjectW(null(), null()) };
     let job = owned_handle(raw_job)?;
@@ -391,7 +478,7 @@ fn create_job() -> Result<OwnedHandle, TransportError> {
         | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     limits.BasicLimitInformation.ActiveProcessLimit = 1;
-    limits.ProcessMemoryLimit = JOB_MEMORY_LIMIT_BYTES;
+    limits.ProcessMemoryLimit = memory_limit_bytes;
     // SAFETY: limits points to a correctly sized structure for the requested
     // JobObjectExtendedLimitInformation information class.
     let configured = unsafe {
@@ -490,10 +577,13 @@ fn raw_handle(handle: &OwnedHandle) -> HANDLE {
     handle.as_raw_handle()
 }
 
-fn helper_path_from_executable(executable: &Path) -> Result<PathBuf, TransportError> {
+fn helper_path_from_executable(
+    executable: &Path,
+    helper_file_name: &str,
+) -> Result<PathBuf, TransportError> {
     executable
         .parent()
-        .map(|directory| directory.join(HELPER_FILE_NAME))
+        .map(|directory| directory.join(helper_file_name))
         .ok_or(TransportError::Unavailable)
 }
 
@@ -554,20 +644,43 @@ mod tests {
     fn helper_path_is_fixed_next_to_the_main_executable() {
         let executable = Path::new(r"C:\Portable\ImgViewer.exe");
         assert_eq!(
-            helper_path_from_executable(executable).unwrap(),
+            helper_path_from_executable(executable, HELPER_FILE_NAME).unwrap(),
             PathBuf::from(r"C:\Portable\ImgViewer.CodecHelper.exe")
         );
     }
 
     #[test]
     fn job_contract_uses_exact_memory_and_process_limits() {
-        assert_eq!(JOB_MEMORY_LIMIT_BYTES, 768 * 1024 * 1024);
+        let launcher = WindowsLauncher::production();
+        assert_eq!(
+            launcher.job_memory_limit_bytes,
+            CODEC_HELPER_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(launcher.helper_file_name, HELPER_FILE_NAME);
         let flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
             | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         assert_ne!(flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY, 0);
         assert_ne!(flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS, 0);
         assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+    }
+
+    #[test]
+    fn process_exit_classification_preserves_live_failures_and_maps_dead_children() {
+        for error in [TransportError::Io, TransportError::Protocol] {
+            assert_eq!(
+                classify_transport_failure_with_exit_code(error, Some(STILL_ACTIVE as u32)),
+                error
+            );
+            assert_eq!(
+                classify_transport_failure_with_exit_code(error, None),
+                error
+            );
+            assert_eq!(
+                classify_transport_failure_with_exit_code(error, Some(HELPER_FAILURE_EXIT_CODE)),
+                TransportError::Disconnected
+            );
+        }
     }
 
     #[test]

@@ -21,15 +21,15 @@ active；未排程項目不代表承諾。
 
 ## 0.3–0.5 — 原生解碼隔離
 
-- [x] 將 HEIF 解碼移至獨立 helper process；TIFF 仍待後續搬移。
-- [x] 對 HEIF helper 以 Windows Job Object 限制 768 MiB RAM、單一
+- [x] 將 HEIF 與 TIFF 解碼移至同一個獨立 helper process。
+- [x] 對 codec helper 以 Windows Job Object 限制 768 MiB RAM、單一
   process、kill-on-close 與每張 30 秒硬期限。
 - [x] helper 只接收 duplicated read-only handle，不接受來源路徑、任意
   輸出路徑或額外 command line。
 - [x] 固定 codec binary protocol、request ID、payload／PNG 尺寸上限，
   並驗證 crash 後下一張 lazy restart 與 parent／child handle 釋放。
-- [ ] 將 TIFF 解碼移至同等隔離 helper，補齊 hang／OOM corpus 與至少
-  20 次連續 helper 重建壓力測試。
+- [x] 以 test-only fault helper 覆蓋 hang／128 MiB Job OOM，並完成至少
+  20 次連續真實 helper crash／lazy restart 壓力測試。
 - [ ] helper／broker 以逐層 component handle 或等價 no-reparse 核心語意
   消除 `validate_source_path` 到 `CreateFile` 間的 parent-junction race。
 - [ ] catalog 背景化，涵蓋大型本機資料夾、進度與取消；UNC／reparse point
@@ -43,7 +43,9 @@ active；未排程項目不代表承諾。
 
 - [ ] 六類格式、動畫、惡意 corpus、RAM、競態、無閃切換與窗口幾何
   全部通過 release gate。
-- [ ] 乾淨 Windows 11 VM 能驗證 release checksum、SBOM 與 attestation。
+- [ ] GitHub hosted clean tag build 的 checksum、SBOM 與 attestation 通過，
+  並由目前維護的互動式 Windows 11 實機驗證同一份 ZIP digest；VM 永久
+  不列入 release 或 1.0 gate。
 - [ ] installer 或 updater 若存在，ImgViewer 自有 EXE 必須先有持續可用的
   Authenticode 簽章；否則 portable ZIP 保持唯一發行方式。
 

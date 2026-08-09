@@ -15,7 +15,7 @@ on:
           - build-candidate
           - promote-draft
       release_tag:
-        description: Tag to promote, for example v0.2.0 (promote-draft only)
+        description: Tag to promote, for example v0.4.0 (promote-draft only)
         required: false
         type: string
       verified_sha256:
@@ -100,6 +100,11 @@ jobs:
           } else {
             ./scripts/build-portable.ps1 -SkipNativeSmoke -FreshNative
           }
+
+      - name: Verify real codec helper crash, hang, and OOM containment
+        shell: powershell
+        run: |
+          ./scripts/test-codec-helper-process.ps1
 
       - name: Generate and validate CycloneDX SBOM
         id: sbom
@@ -319,7 +324,7 @@ jobs:
           VERIFIED_SHA256: ${{ inputs.verified_sha256 }}
         run: |
           if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
-            throw "release_tag must be an exact semver tag such as v0.2.0."
+            throw "release_tag must be an exact semver tag such as v0.4.0."
           }
           if ($env:VERIFIED_SHA256 -notmatch '^[0-9A-Fa-f]{64}$') {
             throw "verified_sha256 must be the 64-character digest of the ZIP that passed native UI smoke."
@@ -434,6 +439,7 @@ jobs:
             "imgviewer-codec-core",
             "imgviewer-codec-helper",
             "imgviewer-codec-protocol",
+            "tiff",
             "libheif",
             "libde265"
           ) + @($buildMetadata.native.msvcRuntime | ForEach-Object { [string]$_.fileName })
@@ -442,9 +448,12 @@ jobs:
               throw "CycloneDX SBOM is missing $required."
             }
           }
+          $nativeComponentNames = @("libheif", "libde265") + @(
+            $buildMetadata.native.msvcRuntime | ForEach-Object { [string]$_.fileName }
+          )
           $nativeComponents = @(
             $sbom.components |
-              Where-Object { [string]$_.name -in $requiredComponents[4..($requiredComponents.Count - 1)] }
+              Where-Object { [string]$_.name -in $nativeComponentNames }
           )
           foreach ($component in $nativeComponents) {
             $toolsetProperty = @(

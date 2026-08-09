@@ -13,7 +13,7 @@ mod model;
 
 pub use decode::{
     MAX_DECODE_BYTES, MAX_INPUT_BYTES, ProductionDecoder, decode_heif_file, decode_heif_file_rgba8,
-    encode_rgba8_png,
+    decode_tiff_file_rgba8, encode_rgba8_png, encode_rgba8_png_checked,
 };
 pub use error::{ViewerError, code};
 pub use format::SupportedFormat;

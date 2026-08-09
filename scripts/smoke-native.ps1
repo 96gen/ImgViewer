@@ -267,7 +267,7 @@ function Assert-PersistentCodecHelper {
     $helper = Wait-SingleCodecHelper -RootProcessId $RootProcessId
     if ([int]$helper.ProcessId -ne $ExpectedProcessId) {
         throw (
-            "Codec helper was replaced between HEIC and HEIF decode: " +
+            "Codec helper was replaced between isolated-format decodes: " +
             "expected PID $ExpectedProcessId; found PID $($helper.ProcessId)."
         )
     }
@@ -1032,7 +1032,7 @@ try {
             @{ Name = 'single.heif'; Format = 'HEIF' }
         )) {
             Open-ThroughExistingInstance (Join-Path $formatDirectory $case.Name) $window | Out-Null
-            if ($case.Format -eq 'HEIC') {
+            if ($case.Format -eq 'TIFF') {
                 $helper = Wait-SingleCodecHelper -RootProcessId $process.Id
                 $helperProcessId = [int]$helper.ProcessId
                 $helperProcessIds = @($helperProcessId)
@@ -1040,20 +1040,22 @@ try {
                     -ProcessId $helperProcessId `
                     -ExpectedPath $helperExecutablePath
             }
-            elseif ($case.Format -eq 'HEIF') {
+            elseif ($case.Format -in @('HEIC', 'HEIF')) {
                 if ($null -eq $helperProcessId) {
-                    throw 'HEIF decoded before the codec helper PID was captured.'
+                    throw "$($case.Format) decoded before the TIFF helper PID was captured."
                 }
                 Assert-PersistentCodecHelper `
                     -RootProcessId $process.Id `
                     -ExpectedProcessId $helperProcessId | Out-Null
-                $helperPersistenceVerified = $true
+                if ($case.Format -eq 'HEIF') {
+                    $helperPersistenceVerified = $true
+                }
             }
             Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) "$($case.Format) handoff"
             Write-Output "PASS format=$($case.Format) file=$($case.Name) rect=unchanged"
         }
         if (-not $helperPersistenceVerified) {
-            throw 'The HEIC-to-HEIF codec helper persistence check did not run.'
+            throw 'The TIFF-to-HEIC-to-HEIF codec helper persistence check did not run.'
         }
         $nativeSmokeCompleted = $true
         Write-Output 'PASS handoff-format-smoke formats=7 animations-opened=2 rect=unchanged webdriver=absent'
@@ -1111,7 +1113,7 @@ try {
         @{ Name = 'single.heif'; Format = 'HEIF' }
     )) {
         $image = Open-ThroughExistingInstance (Join-Path $formatDirectory $case.Name) $window
-        if ($case.Format -eq 'HEIC') {
+        if ($case.Format -eq 'TIFF') {
             $helper = Wait-SingleCodecHelper -RootProcessId $process.Id
             $helperProcessId = [int]$helper.ProcessId
             $helperProcessIds = @($helperProcessId)
@@ -1119,20 +1121,22 @@ try {
                 -ProcessId $helperProcessId `
                 -ExpectedPath $helperExecutablePath
         }
-        elseif ($case.Format -eq 'HEIF') {
+        elseif ($case.Format -in @('HEIC', 'HEIF')) {
             if ($null -eq $helperProcessId) {
-                throw 'HEIF decoded before the codec helper PID was captured.'
+                throw "$($case.Format) decoded before the TIFF helper PID was captured."
             }
             Assert-PersistentCodecHelper `
                 -RootProcessId $process.Id `
                 -ExpectedProcessId $helperProcessId | Out-Null
-            $helperPersistenceVerified = $true
+            if ($case.Format -eq 'HEIF') {
+                $helperPersistenceVerified = $true
+            }
         }
         Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) "$($case.Format) handoff"
         Write-Output "PASS format=$($case.Format) file=$($case.Name) rect=unchanged"
     }
     if (-not $helperPersistenceVerified) {
-        throw 'The HEIC-to-HEIF codec helper persistence check did not run.'
+        throw 'The TIFF-to-HEIC-to-HEIF codec helper persistence check did not run.'
     }
 
     Open-ThroughExistingInstance (Join-Path $formatDirectory 'animated.gif') $window | Out-Null

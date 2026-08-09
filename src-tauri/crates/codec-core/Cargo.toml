@@ -1,6 +1,6 @@
 [package]
 name = "imgviewer-codec-core"
-version = "0.3.0"
+version = "0.4.0"
 description = "Path-independent bounded image decode engine for ImgViewer"
 license = "MIT"
 edition = "2024"
@@ -10,9 +10,10 @@ publish = false
 [features]
 default = []
 heic = ["dep:libheif-rs", "dep:libheif-sys"]
+tiff = ["image/tiff"]
 
 [dependencies]
-image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "tiff", "webp"] }
+image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 libheif-rs = { version = "=2.7.0", optional = true, default-features = false, features = ["v1_21"] }
 libheif-sys = { version = "=5.2.0", optional = true, default-features = false, features = ["v1_21"] }
 moxcms = "=0.8.1"

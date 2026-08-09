@@ -19,7 +19,7 @@ ImgViewer 的正式產物只由 tag workflow 建置一次。Tag push 會產生�
 .\scripts\build-portable.ps1 -SkipNativeSmoke
 ```
 
-正式模式要求四個 manifest 版本相同、Git tree 完全乾淨、`v{version}` tag 指向
+正式模式要求七個版本來源相同、Git tree 完全乾淨、`v{version}` tag 指向
 HEAD，且 GitHub tag ref 與 checkout commit 一致：
 
 ```powershell
@@ -32,15 +32,24 @@ $version = (Get-Content .\src-tauri\tauri.conf.json -Raw | ConvertFrom-Json).ver
 port hash 驗證的 source downloads 可以重用。
 
 `verify-portable-release.ps1` 會重新計算 SHA-256、檢查 ZIP 路徑安全、版本與來源
-metadata、禁止的 codec、必要檔案與完整 DLL closure。`-RunNegativeTests` 另證明
-錯誤 checksum、錯誤 metadata 版本、竄改 native DLL hash 與移除
-`libde265.dll` 都會被拒絕。
+metadata、禁止的 codec、必要檔案與完整 DLL closure。Portable stage 與下載後驗證
+都會拒絕 fault-helper／test-hooks 產物。`-RunNegativeTests` 另證明錯誤 checksum、
+錯誤 metadata 版本、竄改 native DLL hash 與移除 `libde265.dll` 都會被拒絕。
+
+`BUILD_METADATA.json` schema 3 將隔離邊界寫成可驗證合約：helper role 是
+`codec-helper`、Rust codec protocol 是 3、隔離格式是 `heif,tiff`、Cargo features
+是 `heic,tiff`、Job Object 記憶體上限是 805306368 bytes，單次 decode deadline
+是 30000 ms。build script 從 runtime 共用的 codec-protocol constants 讀取
+兩項限制，並拒絕 schema 3 的固定值漂移；兩個 executable 的 protocol version
+也必須和這份合約相同。
 
 ## Tag 發布與 UI gate
 
-1. 在乾淨 commit 建立並 push 精確的 `v{version}` tag。
-2. 等待 `Portable Windows release` 建置完成；workflow 只建立 draft。
-3. 從 draft Release 或 workflow artifact 下載 ZIP 與 `.sha256`，先執行：
+1. 將候選變更經 CI 合併到 `main`，再對該 commit dispatch `build-candidate`；驗證
+   workflow artifact 的 ZIP、checksum、metadata、SBOM 及 feature boundary 後才可標記。
+2. 在通過上述 preflight 的 `main` commit 建立並 push 精確的 `v{version}` tag。
+3. 等待 `Portable Windows release` 建置完成；tag workflow 只建立 draft。
+4. 從 draft Release 下載 ZIP 與 `.sha256`，先執行：
 
    ```powershell
    $version = (Get-Content .\src-tauri\tauri.conf.json -Raw | ConvertFrom-Json).version
@@ -48,7 +57,8 @@ metadata、禁止的 codec、必要檔案與完整 DLL closure。`-RunNegativeTe
    Get-FileHash -LiteralPath $zip -Algorithm SHA256
    ```
 
-4. 解壓同一個 ZIP，在互動式 Windows 11 桌面執行：
+5. 解壓同一個 ZIP，在目前維護的互動式 Windows 11 實機執行；不要求 VM
+   或乾淨作業系統映像：
 
    ```powershell
    .\scripts\smoke-native.ps1 `
@@ -56,7 +66,7 @@ metadata、禁止的 codec、必要檔案與完整 DLL closure。`-RunNegativeTe
      -FixtureDirectory ".\tests\fixtures"
    ```
 
-5. 使用 GitHub CLI 驗證 ZIP 的 build provenance（將 `OWNER/REPO` 換成正式
+6. 使用 GitHub CLI 驗證 ZIP 的 build provenance（將 `OWNER/REPO` 換成正式
    repository）：
 
    ```powershell
@@ -71,9 +81,9 @@ metadata、禁止的 codec、必要檔案與完整 DLL closure。`-RunNegativeTe
      --deny-self-hosted-runners
    ```
 
-6. 在 workflow dispatch 選擇 `promote-draft`，輸入 tag 與剛通過 UI smoke 的
+7. 在 workflow dispatch 選擇 `promote-draft`，輸入 tag 與剛通過 UI smoke 的
    64 字元 ZIP SHA-256。
-7. Promotion job 會從 draft Release 重新下載資產，驗證 digest、來源 commit、
+8. Promotion job 會從 draft Release 重新下載資產，驗證 digest、來源 commit、
    metadata、attestation、錯誤來源 digest 負向案例及 DLL closure；全部通過才將
    既有 draft 公開。驗證 job 只有 `contents: read` 與 `attestations: read`，
    並執行 default branch 的 verifier；另一個 publish job 才有 `contents: write`，
@@ -86,9 +96,16 @@ metadata、禁止的 codec、必要檔案與完整 DLL closure。`-RunNegativeTe
 ## 供應鏈邊界
 
 - Workflow action 固定到從官方 repository tag 查得的完整 commit SHA。
+- 建置前的 Cargo feature-graph gate 允許主程式使用 `image` 的 GIF/JPEG/PNG/WebP
+  基礎功能，但禁止主程式啟用 `image/tiff`、拉入 `tiff` 或 libheif；helper 必須以
+  `heic,tiff` 同時拉入 TIFF 與 libheif。PASS anchor 是
+  `PASS codec-feature-boundary main-heif=absent main-tiff=absent helper-heif=present helper-tiff=present`。
+  PE import gate 與完整 DLL closure 仍各自執行。
 - SBOM 使用官方 cdxgen `v12.8.1` standalone generator/validator，workflow 內固定
   兩個 EXE 的 SHA-256，驗證後才執行；不以 lockfile 外的 `pnpm dlx` 載入工具。
-  產物再加入實際封裝的 libheif、libde265 和 MSVC runtime hash。
+  產物再加入實際封裝的 libheif、libde265 和 MSVC runtime hash；enrichment 會要求
+  cdxgen 已列出 Cargo `tiff` component，並在 helper component 記錄上述六個 isolation
+  properties。
 - GitHub attestation 依賴 repository 與方案支援；它不是 Authenticode。
 - 目前沒有設定簽章憑證、硬體金鑰或託管簽章服務，因此 ZIP、EXE 與 DLL 尚未具備
   Authenticode。加入 installer 或 updater 前必須另行完成簽章金鑰管理。

@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_DECODE_TIMEOUT: Duration = Duration::from_secs(30);
+use imgviewer_codec_protocol::CODEC_HELPER_DECODE_DEADLINE_MS;
+
+pub(crate) const DEFAULT_DECODE_TIMEOUT: Duration =
+    Duration::from_millis(CODEC_HELPER_DECODE_DEADLINE_MS);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DecodePolicy {

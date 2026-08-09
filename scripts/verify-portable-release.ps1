@@ -20,7 +20,9 @@ param(
         "NativeHashMismatch",
         "MissingDll",
         "MissingHelper",
-        "HelperHashMismatch"
+        "HelperHashMismatch",
+        "FaultHelperArtifact",
+        "TestHooksArtifact"
     )]
     [string]$NegativeMode = "None"
 )
@@ -30,6 +32,7 @@ $ErrorActionPreference = "Stop"
 
 $forbiddenCodecFilePattern =
     '^(?i:(?:lib)?(?:x265|aom|avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc))[^\\/]*\.(?:dll|exe)$'
+$forbiddenTestArtifactPattern = '(?i)(?:fault[-_]?helper|test[-_]?hooks?)'
 
 function Get-Sha256Hex {
     param([Parameter(Mandatory)] [string]$Path)
@@ -182,8 +185,32 @@ function Assert-Metadata {
         [switch]$CleanSource
     )
 
-    if ([int]$Metadata.schemaVersion -ne 2) {
+    if ([int]$Metadata.schemaVersion -ne 3) {
         throw "Unsupported BUILD_METADATA schemaVersion: $($Metadata.schemaVersion)"
+    }
+    if ([string]$Metadata.codecIsolation.helperRole -cne "codec-helper") {
+        throw "BUILD_METADATA codecIsolation helperRole must be 'codec-helper'."
+    }
+    if ([int]$Metadata.codecIsolation.protocolVersion -ne 3) {
+        throw "BUILD_METADATA codecIsolation protocolVersion must be 3."
+    }
+    $isolatedFormats = @(
+        $Metadata.codecIsolation.isolatedFormats | ForEach-Object { [string]$_ }
+    )
+    if (($isolatedFormats -join ",") -cne "heif,tiff") {
+        throw "BUILD_METADATA codecIsolation isolatedFormats must be exactly heif,tiff."
+    }
+    $cargoFeatures = @(
+        $Metadata.codecIsolation.cargoFeatures | ForEach-Object { [string]$_ }
+    )
+    if (($cargoFeatures -join ",") -cne "heic,tiff") {
+        throw "BUILD_METADATA codecIsolation cargoFeatures must be exactly heic,tiff."
+    }
+    if ([long]$Metadata.codecIsolation.memoryLimitBytes -ne 805306368) {
+        throw "BUILD_METADATA codecIsolation memoryLimitBytes must be 805306368."
+    }
+    if ([int]$Metadata.codecIsolation.decodeDeadlineMs -ne 30000) {
+        throw "BUILD_METADATA codecIsolation decodeDeadlineMs must be 30000."
     }
     if ([string]$Metadata.application.name -cne "ImgViewer") {
         throw "BUILD_METADATA application name is not ImgViewer."
@@ -244,7 +271,7 @@ function Assert-ExecutablePayloadHashes {
     $seenRoles = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::Ordinal
     )
-    $protocolVersion = $null
+    $protocolVersion = [int]$Metadata.codecIsolation.protocolVersion
     foreach ($item in $executables) {
         $role = [string]$item.role
         if (-not $expectedFiles.Contains($role) -or -not $seenRoles.Add($role)) {
@@ -255,13 +282,8 @@ function Assert-ExecutablePayloadHashes {
             throw "BUILD_METADATA executable '$role' must name '$($expectedFiles[$role])'."
         }
         $itemProtocolVersion = [int]$item.protocolVersion
-        if ($itemProtocolVersion -lt 1) {
-            throw "BUILD_METADATA executable '$role' has an invalid protocol version."
-        }
-        if ($null -eq $protocolVersion) {
-            $protocolVersion = $itemProtocolVersion
-        } elseif ($itemProtocolVersion -ne $protocolVersion) {
-            throw "BUILD_METADATA executables disagree on the codec helper protocol version."
+        if ($itemProtocolVersion -ne $protocolVersion) {
+            throw "BUILD_METADATA executable '$role' protocol version does not match codecIsolation."
         }
 
         $expectedHash = ([string]$item.sha256).ToUpperInvariant()
@@ -367,6 +389,17 @@ function Assert-NoForbiddenCodecEntries {
     }
 }
 
+function Assert-NoForbiddenTestArtifactEntries {
+    param([Parameter(Mandatory)] [string[]]$EntryNames)
+
+    $forbiddenEntries = @(
+        $EntryNames | Where-Object { $_ -match $forbiddenTestArtifactPattern }
+    )
+    if ($forbiddenEntries.Count -gt 0) {
+        throw "Portable artifact contains a fault-helper or test-hooks artifact: $($forbiddenEntries -join ', ')"
+    }
+}
+
 $ArtifactPath = [System.IO.Path]::GetFullPath($ArtifactPath)
 if (-not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) {
     throw "Portable artifact does not exist: $ArtifactPath"
@@ -414,6 +447,23 @@ try {
     try {
         Assert-ZipEntrySafety -Archive $archive -ExpectedRoot $artifactRoot
         $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+        if ($NegativeMode -eq "FaultHelperArtifact") {
+            Assert-ExpectedFailure -Name "fault-helper-artifact" -Operation {
+                Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                    "$artifactRoot/ImgViewer.CodecFaultHelper.exe"
+                )
+            }
+            return
+        }
+        if ($NegativeMode -eq "TestHooksArtifact") {
+            Assert-ExpectedFailure -Name "test-hooks-artifact" -Operation {
+                Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                    "$artifactRoot/ImgViewer.CodecHelper.test-hooks.exe"
+                )
+            }
+            return
+        }
+        Assert-NoForbiddenTestArtifactEntries -EntryNames $entryNames
         foreach ($requiredEntry in @(
             "$artifactRoot/ImgViewer.exe",
             "$artifactRoot/ImgViewer.CodecHelper.exe",
@@ -546,6 +596,16 @@ try {
             Assert-NoForbiddenCodecEntries -EntryNames @(
                 "$artifactRoot/ImgViewer.exe",
                 "$artifactRoot/libx265.dll"
+            )
+        }
+        Assert-ExpectedFailure -Name "fault-helper-artifact" -Operation {
+            Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                "$artifactRoot/ImgViewer.CodecFaultHelper.exe"
+            )
+        }
+        Assert-ExpectedFailure -Name "test-hooks-artifact" -Operation {
+            Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                "$artifactRoot/ImgViewer.CodecHelper.test-hooks.exe"
             )
         }
         Assert-ExpectedFailure -Name "checksum-mismatch" -Operation {

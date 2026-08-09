@@ -18,6 +18,7 @@ $forbiddenCodecFilePattern =
     '^(?i:(?:lib)?(?:x265|aom|avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc))[^\\/]*\.(?:dll|exe)$'
 $forbiddenVcpkgPackagePattern =
     '^(?i:(?:lib)?x265|(?:lib)?aom|(?:lib)?avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc)$'
+$forbiddenTestArtifactPattern = '(?i)(?:fault[-_]?helper|test[-_]?hooks?)'
 
 function Get-Sha256Hex {
     param([Parameter(Mandatory)] [string]$Path)
@@ -272,8 +273,26 @@ if ($codecProtocolSource -notmatch
     throw "Unable to read the codec helper protocol version."
 }
 $codecProtocolVersion = [int]$Matches.version
-if ($codecProtocolVersion -lt 1) {
-    throw "The codec helper protocol version must be positive."
+if ($codecProtocolVersion -ne 3) {
+    throw "The codec helper protocol version must be 3 for BUILD_METADATA schema 3."
+}
+if ($codecProtocolSource -notmatch
+    'pub\s+const\s+CODEC_HELPER_MEMORY_LIMIT_BYTES\s*:\s*usize\s*=\s*(?<value>[\d_]+)\s*;') {
+    throw "Unable to read the codec helper memory limit."
+}
+$codecHelperMemoryLimitBytes = [long]($Matches.value -replace '_', '')
+if ($codecProtocolSource -notmatch
+    'pub\s+const\s+CODEC_HELPER_DECODE_DEADLINE_MS\s*:\s*u64\s*=\s*(?<value>[\d_]+)\s*;') {
+    throw "Unable to read the codec helper decode deadline."
+}
+$codecHelperDecodeDeadlineMs = [long]($Matches.value -replace '_', '')
+if ($codecHelperMemoryLimitBytes -ne 805306368 -or
+    $codecHelperDecodeDeadlineMs -ne 30000) {
+    throw (
+        "BUILD_METADATA schema 3 requires the production codec helper limits " +
+        "805306368 bytes/30000 ms; found $codecHelperMemoryLimitBytes bytes/" +
+        "$codecHelperDecodeDeadlineMs ms."
+    )
 }
 
 $git = Get-Command git.exe -ErrorAction SilentlyContinue
@@ -449,14 +468,17 @@ try {
         Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" libheif-sys
     }
     Invoke-Checked $pnpm.Source install --frozen-lockfile
+    & (Join-Path $PSScriptRoot "Assert-CargoFeatureBoundary.ps1") `
+        -ManifestPath (Join-Path $repoRoot "src-tauri\Cargo.toml") `
+        -CargoExecutable $cargoCommand.Source | Write-Host
     if (-not $SkipChecks) {
         Invoke-Checked $pnpm.Source test
         Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --all-targets --no-default-features "--" "-Dwarnings"
         Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --no-default-features
         $codecPackages = @("imgviewer-codec-core", "imgviewer-codec-helper")
         foreach ($codecPackage in $codecPackages) {
-            Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --all-targets --no-default-features --features heic "--" "-Dwarnings"
-            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic --no-run
+            Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --all-targets --no-default-features --features heic,tiff "--" "-Dwarnings"
+            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic,tiff --no-run
         }
         $cargoMetadata = Invoke-Captured -FilePath $cargoCommand.Source -Arguments @(
             "metadata", "--locked", "--manifest-path",
@@ -474,7 +496,7 @@ try {
             }
         Write-Host "PASS native-test-stage target=debug/deps app-local-dlls=$(@(Get-ChildItem -LiteralPath $nativeTestDirectory -File -Filter '*.dll').Count)"
         foreach ($codecPackage in $codecPackages) {
-            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic
+            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic,tiff
         }
     }
     # Execute the exact CLI installed by the frozen project lock. `pnpm exec`
@@ -484,10 +506,10 @@ try {
     if (-not (Test-Path -LiteralPath $tauriCli -PathType Leaf)) {
         throw "The locked Tauri CLI shim is missing: node_modules\\.bin\\tauri.cmd"
     }
-    # The Tauri process intentionally has no native HEIF feature. Only the
-    # private helper below links libheif.
+    # The Tauri process intentionally has no isolated HEIF/TIFF features. Only
+    # the private helper below links libheif and the TIFF decoder.
     Invoke-Checked $tauriCli build --no-bundle "--" "--locked"
-    Invoke-Checked cargo build --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --release "--package" imgviewer-codec-helper --no-default-features --features heic
+    Invoke-Checked cargo build --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --release "--package" imgviewer-codec-helper --no-default-features --features heic,tiff
     if ($ReleaseMode) {
         $postBuildRevision = Invoke-Captured -FilePath $git.Source -Arguments @(
             "-C", $repoRoot, "rev-parse", "--verify", "HEAD"
@@ -576,6 +598,13 @@ $forbiddenCodecFiles = @(
 )
 if ($forbiddenCodecFiles.Count -gt 0) {
     throw "Portable package contains an unapproved HEIF/AVIF codec: $($forbiddenCodecFiles.Name -join ', ')"
+}
+$forbiddenTestArtifacts = @(
+    Get-ChildItem -LiteralPath $stageDirectory -Recurse -File |
+        Where-Object { $_.Name -match $forbiddenTestArtifactPattern }
+)
+if ($forbiddenTestArtifacts.Count -gt 0) {
+    throw "Portable package contains a fault-helper or test-hooks artifact: $($forbiddenTestArtifacts.Name -join ', ')"
 }
 
 # A second pass deliberately has no external search roots. This proves that the
@@ -745,13 +774,21 @@ $executableMetadata = @(
     }
 )
 $buildMetadata = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     application = [ordered]@{
         name = "ImgViewer"
         version = $version
         target = "windows-x64"
     }
     executables = $executableMetadata
+    codecIsolation = [ordered]@{
+        helperRole = "codec-helper"
+        protocolVersion = $codecProtocolVersion
+        isolatedFormats = @("heif", "tiff")
+        cargoFeatures = @("heic", "tiff")
+        memoryLimitBytes = $codecHelperMemoryLimitBytes
+        decodeDeadlineMs = $codecHelperDecodeDeadlineMs
+    }
     artifact = [ordered]@{
         fileName = "$artifactName.zip"
         archiveRoot = $artifactName
@@ -842,6 +879,12 @@ try {
     )
     if ($forbiddenEntries.Count -gt 0) {
         throw "ZIP verification found a forbidden codec: $($forbiddenEntries -join ', ')"
+    }
+    $forbiddenTestEntries = @(
+        $entryNames | Where-Object { $_ -match $forbiddenTestArtifactPattern }
+    )
+    if ($forbiddenTestEntries.Count -gt 0) {
+        throw "ZIP verification found a fault-helper or test-hooks artifact: $($forbiddenTestEntries -join ', ')"
     }
 } finally {
     $archive.Dispose()

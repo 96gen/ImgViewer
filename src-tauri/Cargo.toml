@@ -1,6 +1,6 @@
 [package]
 name = "imgviewer"
-version = "0.3.0"
+version = "0.4.0"
 description = "A small, secure Windows image viewer"
 authors = ["ImgViewer contributors"]
 license = "MIT"
@@ -23,17 +23,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = []
-# Transitional compatibility for existing development commands. Native HEIF
-# dependencies live only in imgviewer-codec-core and are not forwarded into
-# the Tauri application process.
-heic = []
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
-imgviewer-codec-core = { version = "=0.3.0", path = "crates/codec-core" }
-imgviewer-codec-protocol = { version = "=0.3.0", path = "crates/codec-protocol" }
+imgviewer-codec-core = { version = "=0.4.0", path = "crates/codec-core" }
+imgviewer-codec-protocol = { version = "=0.4.0", path = "crates/codec-protocol" }
 parking_lot = "=0.12.4"
 rand = "=0.9.3"
 serde = { version = "=1.0.228", features = ["derive"] }

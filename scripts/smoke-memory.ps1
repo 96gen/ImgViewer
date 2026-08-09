@@ -5,6 +5,8 @@ param(
 
     [string]$FixtureDirectory,
 
+    [switch]$IsolatedCodecAlternation,
+
     [ValidateRange(3, 10000)]
     [int]$Cycles = 100,
 
@@ -46,6 +48,8 @@ param(
 # occurs afterwards and is deliberately excluded from the p95 load metric.
 # The long default warm-up lets WebView2 reach its normal image-cache/GC
 # pressure plateau; leak thresholds are evaluated only on the remaining tail.
+# IsolatedCodecAlternation replaces the generated PNG set with committed TIFF
+# and HEIF fixtures so every measured cycle exercises the shared codec helper.
 # When OutputCsv is omitted, the CSV remains in the system TEMP directory;
 # only generated image fixtures are removed in finally.
 
@@ -767,12 +771,31 @@ $rows = [Collections.Generic.List[object]]::new()
 
 try {
     [IO.Directory]::CreateDirectory($runDirectory) | Out-Null
-    $images = @(New-DeterministicImages -Directory $runDirectory -ImageWidth $Width -ImageHeight $Height)
-    if ($images.Count -lt 3) {
-        throw "Expected at least three generated images; got $($images.Count)."
+    if ($IsolatedCodecAlternation) {
+        $tiffFixtureSource = Resolve-ExistingFile -Path (
+            Join-Path $fixtureDirectoryPath 'two-page.tiff'
+        )
+        $tiffFixturePath = Join-Path $runDirectory 'memory-codec-a.tiff'
+        $heifFixturePath = Join-Path $runDirectory 'memory-codec-b.heic'
+        [IO.File]::Copy($tiffFixtureSource, $tiffFixturePath, $false)
+        [IO.File]::Copy($helperFixtureSource, $heifFixturePath, $false)
+        $images = @($tiffFixturePath, $heifFixturePath)
+        $helperFixturePath = $tiffFixturePath
+        $helperSourceLabel = 'tiff-heif'
+        $summaryWidth = '5x3+3'
+        $summaryHeight = '5'
     }
-    $helperFixturePath = Join-Path $runDirectory 'memory-helper-primary.heic'
-    [IO.File]::Copy($helperFixtureSource, $helperFixturePath, $false)
+    else {
+        $images = @(New-DeterministicImages -Directory $runDirectory -ImageWidth $Width -ImageHeight $Height)
+        if ($images.Count -lt 3) {
+            throw "Expected at least three generated images; got $($images.Count)."
+        }
+        $helperFixturePath = Join-Path $runDirectory 'memory-helper-primary.heic'
+        [IO.File]::Copy($helperFixtureSource, $helperFixturePath, $false)
+        $helperSourceLabel = 'heic'
+        $summaryWidth = $Width
+        $summaryHeight = $Height
+    }
 
     $mainProcess = Start-Process -FilePath $executablePath `
         -ArgumentList ('"' + $helperFixturePath + '"') `
@@ -797,7 +820,7 @@ try {
     }
     if ($initialSample.HelperProcessCount -ne 1) {
         throw (
-            "HEIC startup must create exactly one direct codec helper child; " +
+            "Isolated-codec startup must create exactly one direct codec helper child; " +
             "found $($initialSample.HelperProcessCount)."
         )
     }
@@ -810,7 +833,7 @@ try {
             [StringComparison]::OrdinalIgnoreCase
         )) {
         throw (
-            "HEIC helper was not launched from the packaged sibling: " +
+            "Codec helper was not launched from the packaged sibling: " +
             "expected '$helperExecutablePath'; found '$actualHelperPath'."
         )
     }
@@ -939,15 +962,15 @@ try {
         'peak-root-private-mib={11:F2} peak-root-working-set-mib={12:F2} ' +
         'peak-helper-private-mib={13:F2} peak-helper-working-set-mib={14:F2} ' +
         'p95-load-ms={15:F0} processes={16} webview-processes={17} ' +
-        'helper-processes={18} helper-pid={19} helper-source=heic ' +
-        'measurement=peak-poll-plus-uia-image-then-fixed-idle webdriver=absent csv="{20}"'
+        'helper-processes={18} helper-pid={19} helper-source={20} ' +
+        'measurement=peak-poll-plus-uia-image-then-fixed-idle webdriver=absent csv="{21}"'
     )
     Write-Output ($summaryFormat -f
         $Cycles,
         $Warmup,
         $images.Count,
-        $Width,
-        $Height,
+        $summaryWidth,
+        $summaryHeight,
         $retainedPrivateMiB,
         $privateSlope,
         $retainedWorkingSetMiB,
@@ -963,6 +986,7 @@ try {
         $finalSample.WebViewProcessCount,
         $finalSample.HelperProcessCount,
         $finalSample.HelperProcessId,
+        $helperSourceLabel,
         $csvPath
     )
     $memorySmokeCompleted = $true

@@ -4,7 +4,9 @@
 param(
     [Parameter(Mandatory)] [string]$BaseSbomPath,
     [Parameter(Mandatory)] [string]$ArtifactPath,
-    [Parameter(Mandatory)] [string]$OutputPath
+    [Parameter(Mandatory)] [string]$OutputPath,
+    [string]$ManifestPath,
+    [string]$CargoExecutable
 )
 
 Set-StrictMode -Version Latest
@@ -30,6 +32,106 @@ function Get-Sha256Hex {
         }
     } finally {
         $hasher.Dispose()
+    }
+}
+
+function Get-ProductionTiffCargoComponent {
+    param(
+        [Parameter(Mandatory)] [string]$Manifest,
+        [Parameter(Mandatory)] [string]$Cargo
+    )
+
+    $featureSelection =
+        "imgviewer-codec-helper/heic,imgviewer-codec-helper/tiff"
+    $metadataOutput = @(
+        & $Cargo metadata --locked --manifest-path $Manifest `
+            --format-version 1 `
+            --filter-platform x86_64-pc-windows-msvc `
+            --no-default-features `
+            --features $featureSelection 2>$null
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo metadata failed while resolving the production helper graph with exit code $LASTEXITCODE."
+    }
+    try {
+        $cargoMetadata = $metadataOutput -join [Environment]::NewLine |
+            ConvertFrom-Json
+    } catch {
+        throw "cargo metadata returned invalid JSON for the production helper graph: $($_.Exception.Message)"
+    }
+
+    $helperPackages = @(
+        $cargoMetadata.packages |
+            Where-Object { [string]$_.name -ceq "imgviewer-codec-helper" }
+    )
+    if ($helperPackages.Count -ne 1) {
+        throw "The Cargo graph must contain exactly one imgviewer-codec-helper package."
+    }
+    $helperNodes = @(
+        $cargoMetadata.resolve.nodes |
+            Where-Object { [string]$_.id -ceq [string]$helperPackages[0].id }
+    )
+    if ($helperNodes.Count -ne 1) {
+        throw "The Cargo graph is missing the imgviewer-codec-helper resolve node."
+    }
+    $helperFeatures = @(
+        $helperNodes[0].features |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+    if (($helperFeatures -join ",") -cne "heic,tiff") {
+        throw "The production helper Cargo features must be exactly heic,tiff; found $($helperFeatures -join ',')."
+    }
+
+    $packagesById = @{}
+    foreach ($package in @($cargoMetadata.packages)) {
+        $packagesById[[string]$package.id] = $package
+    }
+    $nodesById = @{}
+    foreach ($node in @($cargoMetadata.resolve.nodes)) {
+        $nodesById[[string]$node.id] = $node
+    }
+
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $visited = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $pending.Enqueue([string]$helperPackages[0].id)
+    while ($pending.Count -gt 0) {
+        $packageId = $pending.Dequeue()
+        if (-not $visited.Add($packageId)) {
+            continue
+        }
+        if (-not $nodesById.ContainsKey($packageId)) {
+            throw "The Cargo graph is missing a resolve node for package '$packageId'."
+        }
+        foreach ($dependency in @($nodesById[$packageId].deps)) {
+            $normalDependencyKinds = @(
+                $dependency.dep_kinds |
+                    Where-Object { $null -eq $_.kind }
+            )
+            if ($normalDependencyKinds.Count -gt 0) {
+                $pending.Enqueue([string]$dependency.pkg)
+            }
+        }
+    }
+
+    $productionTiffPackages = @(
+        $visited |
+            ForEach-Object { $packagesById[$_] } |
+            Where-Object { [string]$_.name -ceq "tiff" }
+    )
+    if ($productionTiffPackages.Count -ne 1) {
+        throw "The production helper graph must reach exactly one tiff package; found $($productionTiffPackages.Count)."
+    }
+    $tiffVersion = [string]$productionTiffPackages[0].version
+    if ($tiffVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+        throw "The production helper graph reported an invalid tiff version: $tiffVersion"
+    }
+    return [pscustomobject]@{
+        name = "tiff"
+        version = $tiffVersion
+        purl = "pkg:cargo/tiff@$tiffVersion"
     }
 }
 
@@ -142,6 +244,31 @@ function Get-VerifiedPayloadHash {
     return $actualHash
 }
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
+    $ManifestPath = Join-Path $repoRoot "src-tauri\Cargo.toml"
+}
+$ManifestPath = [System.IO.Path]::GetFullPath($ManifestPath)
+if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+    throw "Cargo manifest does not exist: $ManifestPath"
+}
+if ([string]::IsNullOrWhiteSpace($CargoExecutable)) {
+    $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    if (-not $cargoCommand) {
+        $cargoCommand = Get-Command cargo -ErrorAction Stop
+    }
+    $CargoExecutable = $cargoCommand.Source
+} elseif (-not (Test-Path -LiteralPath $CargoExecutable -PathType Leaf)) {
+    $cargoCommand = Get-Command $CargoExecutable -ErrorAction SilentlyContinue
+    if (-not $cargoCommand) {
+        throw "Cargo executable was not found: $CargoExecutable"
+    }
+    $CargoExecutable = $cargoCommand.Source
+}
+$productionTiff = Get-ProductionTiffCargoComponent `
+    -Manifest $ManifestPath `
+    -Cargo $CargoExecutable
+
 $BaseSbomPath = [System.IO.Path]::GetFullPath($BaseSbomPath)
 $ArtifactPath = [System.IO.Path]::GetFullPath($ArtifactPath)
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
@@ -168,8 +295,16 @@ try {
     }
     $metadata = Get-Content -LiteralPath $metadataFile[0].FullName -Raw | ConvertFrom-Json
     $payloadRoot = Split-Path -Parent $metadataFile[0].FullName
-    if ([int]$metadata.schemaVersion -ne 2) {
+    if ([int]$metadata.schemaVersion -ne 3) {
         throw "Unsupported BUILD_METADATA schemaVersion: $($metadata.schemaVersion)"
+    }
+    if ([string]$metadata.codecIsolation.helperRole -cne "codec-helper" -or
+        [int]$metadata.codecIsolation.protocolVersion -ne 3 -or
+        (@($metadata.codecIsolation.isolatedFormats) -join ",") -cne "heif,tiff" -or
+        (@($metadata.codecIsolation.cargoFeatures) -join ",") -cne "heic,tiff" -or
+        [long]$metadata.codecIsolation.memoryLimitBytes -ne 805306368 -or
+        [int]$metadata.codecIsolation.decodeDeadlineMs -ne 30000) {
+        throw "BUILD_METADATA codecIsolation does not match the schema 3 release contract."
     }
     if ([string]$metadata.native.platformToolset -cne "v143") {
         throw "BUILD_METADATA native platform toolset is not the pinned v143."
@@ -181,6 +316,16 @@ try {
             [void]$components.Add($component)
         }
     }
+    $tiffCargoComponents = @(
+        $components | Where-Object {
+            [string]$_.name -ceq "tiff" -and
+            [string]$_.version -ceq [string]$productionTiff.version -and
+            [string]$_.purl -ceq [string]$productionTiff.purl
+        }
+    )
+    if ($tiffCargoComponents.Count -ne 1) {
+        throw "Base CycloneDX SBOM is missing or duplicates the required tiff Cargo component '$($productionTiff.purl)' from the production helper graph."
+    }
 
     $applicationVersion = [string]$metadata.application.version
     if (-not $applicationVersion) {
@@ -191,6 +336,9 @@ try {
         $role = [string]$executable.role
         if ($role -notin @("main", "codec-helper") -or $executablesByRole.ContainsKey($role)) {
             throw "BUILD_METADATA contains an invalid or duplicate executable role: $role"
+        }
+        if ([int]$executable.protocolVersion -ne [int]$metadata.codecIsolation.protocolVersion) {
+            throw "BUILD_METADATA executable '$role' protocol version does not match codecIsolation."
         }
         $executablesByRole[$role] = $executable
     }
@@ -256,6 +404,36 @@ try {
                     value = [string]$executable.protocolVersion
                 }
             )
+            if ($role -ceq [string]$metadata.codecIsolation.helperRole) {
+                foreach ($property in @(
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-helper-role"
+                        value = [string]$metadata.codecIsolation.helperRole
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-protocol-version"
+                        value = [string]$metadata.codecIsolation.protocolVersion
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-isolated-formats"
+                        value = (@($metadata.codecIsolation.isolatedFormats) -join ",")
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-cargo-features"
+                        value = (@($metadata.codecIsolation.cargoFeatures) -join ",")
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-memory-limit-bytes"
+                        value = [string]$metadata.codecIsolation.memoryLimitBytes
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-decode-deadline-ms"
+                        value = [string]$metadata.codecIsolation.decodeDeadlineMs
+                    }
+                )) {
+                    [void]$properties.Add($property)
+                }
+            }
         }
         $componentData = [ordered]@{
             type = [string]$workspaceComponent.type
@@ -378,6 +556,7 @@ try {
         "imgviewer-codec-core",
         "imgviewer-codec-helper",
         "imgviewer-codec-protocol",
+        "tiff",
         "libheif",
         "libde265"
     )) {

@@ -11,8 +11,8 @@ ImgViewer 是 Windows x64 專用的免安裝圖片瀏覽器。介面以 Vue 3 �
 
 解壓縮 `ImgViewer-{version}-windows-x64.zip` 後，直接執行資料夾內的
 `ImgViewer.exe`。請保留 `ImgViewer.CodecHelper.exe`、DLL 與授權文件在
-同一資料夾；helper 缺少或被移動時，其他格式仍可使用，但 HEIC／HEIF 會
-顯示可恢復錯誤。
+同一資料夾；helper 缺少或被移動時，其他格式仍可使用，但 TIFF、
+HEIC／HEIF 會顯示可恢復錯誤。
 
 ## 操作
 
@@ -56,16 +56,21 @@ WebView2 播放；結構型 frame／累計像素限制可先拒絕 frame bomb，
 helper process 能硬中止 WebView2 的動畫解碼，因此仍不宣稱已完全隔離
 animation CPU／codec hang DoS。
 
-HEIC／HEIF 解碼已移入固定同目錄的私有 helper process。主程式只把已開啟
+TIFF、HEIC／HEIF 解碼已移入固定同目錄的私有 helper process。主程式只把已開啟
 的 read-only handle 複製給 helper，不傳來源路徑、任意 command line 或
 輸出路徑；helper 啟動後先受 Windows Job Object 約束，限制單一 process、
 768 MiB 記憶體與每張 30 秒硬期限。timeout、取消、pipe 中斷、codec crash
 或不合法回應都會終止該 Job；同一張不自動重試，下一次選取才建立乾淨
 helper。
 
-TIFF 與其他同 process 解碼仍只有 30 秒 soft deadline：超時返回的結果不會
-覆蓋畫面，但卡死的 codec thread 無法安全強制中止。TIFF 隔離、parent
-junction race 與 WebView2 動畫解碼隔離仍列在 [Roadmap](ROADMAP.md)，
+helper 的 RGBA8 回應仍由主程序的 safe Rust encoder 產生 PNG。encoder 逐列
+串流處理並在每列之間檢查 cancellation 與同一個 30 秒期限；在 32,768 px
+單邊限制下，每個不可中斷的 RGBA8 row 最多 131,072 bytes。取消或逾時會
+淘汰該 helper session，partial／過期 PNG 不會發布。
+
+其他同 process 解碼仍只有 30 秒 soft deadline：超時返回的結果不會覆蓋
+畫面，但卡死的 codec thread 無法安全強制中止。parent junction race、
+codec fuzz 與 WebView2 動畫解碼隔離仍列在 [Roadmap](ROADMAP.md)，
 並記錄於 [威脅模型](THREAT_MODEL.md)。漏洞請依
 [安全政策](SECURITY.md) 私下回報；維護頻率與支援邊界分別見
 [維護節奏](MAINTENANCE.md)、[支援政策](SUPPORT.md)。
@@ -120,8 +125,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-memory.p
 
 0.1.1 的固定環境 before／after 數據，以及 0.1.2 無閃切圖的 100／160 輪 RAM 回收結果與解讀限制，見 [PERFORMANCE.md](PERFORMANCE.md)。
 
-要測試 HEIC helper，先佈署固定版 vcpkg 依賴，再建置 helper。Tauri 主
-process 不得啟用 HEIC feature：
+要測試 codec helper，先佈署固定版 vcpkg 依賴，再建置 helper。Tauri 主
+process 不得啟用 HEIC 或 TIFF feature：
 
 ```powershell
 $nativeBin = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-native-deps.ps1 | Select-Object -Last 1
@@ -132,7 +137,7 @@ $env:VCPKG_DEFAULT_HOST_TRIPLET = "x64-windows"
 $env:VCPKGRS_DYNAMIC = "1"
 $env:VCPKGRS_TRIPLET = "x64-windows"
 $env:PATH = "$nativeBin;$env:PATH"
-cargo build --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --features heic
+cargo build --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --no-default-features --features heic,tiff
 Copy-Item .\src-tauri\target\debug\imgviewer-codec-helper.exe .\src-tauri\target\debug\ImgViewer.CodecHelper.exe -Force
 pnpm run tauri dev
 ```
@@ -157,22 +162,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 
 1. 驗證並 bootstrap 固定版 vcpkg。
 2. 以 dynamic `x64-windows` 安裝 `libheif[core]`，overlay triplet 固定 MSVC `v143`，避免 hosted runner 新增 Visual Studio toolset 後悄悄改變 native ABI；`default-features: false` 排除 x265 與非必要 codec，overlay port 關閉 runtime plugin loading。
-3. 對全 Rust workspace 跑無 HEIC 測試，再對 codec core／helper 跑
-   HEIC 測試；Tauri 主程式以 `--no-bundle` 且不含 HEIC 建置，helper
-   另以 `--features heic` 建置。
+3. 對全 Rust workspace 跑無隔離 codec feature 測試，再對 codec core／helper
+   跑 HEIC＋TIFF 測試；Tauri 主程式以 `--no-bundle` 且不含 HEIC／TIFF
+   建置，helper 另以 `--features heic,tiff` 建置。
 4. 將 `ImgViewer.exe` 與 `ImgViewer.CodecHelper.exe` 一起放入 stage，
    用 `dumpbin /DEPENDENTS` 遞迴收集 vcpkg DLL 與必要 MSVC runtime。
-5. 驗證主 EXE 不匯入 `heif.dll`／`libde265.dll`、helper 必須匯入
-   `heif.dll`；移除外部搜尋路徑後再檢查 dependency closure。
+5. 驗證 Cargo feature graph 中主 EXE 不含 HEIF／TIFF decoder、helper 同時
+   包含兩者；binary import graph另要求主 EXE 不匯入 `heif.dll`／
+   `libde265.dll`、helper 必須匯入 `heif.dll`，再檢查 dependency closure。
 6. 對 stage binary 執行無 WebDriver 的 native smoke。
-7. 加入 README、MIT/LGPL 授權、來源版本通知與 schema v2
-   `BUILD_METADATA.json`（含兩個 EXE 的 role、protocol version 與 SHA-256），
+7. 加入 README、MIT/LGPL 授權、來源版本通知與 schema v3
+   `BUILD_METADATA.json`（含兩個 EXE 的 role、protocol version、SHA-256，
+   以及 helper 隔離格式、Cargo features、Job memory與deadline），
    輸出 ZIP、SHA-256 manifest 與 build metadata sidecar。
 
 GitHub 的 tag workflow 只建置一次並建立 draft release；CI 另產生並補強
 CycloneDX SBOM，且對 ZIP、checksum、metadata 與 SBOM 建立 artifact
-attestation。互動式 Windows 11 測試機必須下載同一份 ZIP、核對 digest
-並完成 packaged smoke，之後才可用該 digest 將 draft 升為正式 release；
+attestation。目前維護的互動式 Windows 11 實機必須下載同一份 ZIP、核對
+digest 並完成 packaged smoke，之後才可用該 digest 將 draft 升為正式
+release；VM 或乾淨作業系統映像永久不列入 gate，
 promotion 不會重新建置或替換資產。完整程序見
 [發布驗證指南](docs/release/README.md)。
 

@@ -52,6 +52,7 @@ $savedEnvironment = @{
     VCPKGRS_DYNAMIC = $env:VCPKGRS_DYNAMIC
     Path = $env:Path
 }
+$expectedHelperPaths = @()
 
 try {
     $env:VCPKG_ROOT = $VcpkgRoot
@@ -62,9 +63,17 @@ try {
     $env:Path = "$nativeBin;$($savedEnvironment.Path)"
 
     & cargo build --locked --manifest-path $manifestPath `
-        --package imgviewer-codec-helper --features heic
+        --package imgviewer-codec-helper --bin imgviewer-codec-helper `
+        --no-default-features --features heic,tiff
     if ($LASTEXITCODE -ne 0) {
-        throw "HEIC-enabled helper build failed with exit code $LASTEXITCODE."
+        throw "HEIF+TIFF helper build failed with exit code $LASTEXITCODE."
+    }
+
+    & cargo build --locked --manifest-path $manifestPath `
+        --package imgviewer-codec-helper --bin imgviewer-codec-fault-helper `
+        --no-default-features --features test-hooks
+    if ($LASTEXITCODE -ne 0) {
+        throw "Test-only codec fault helper build failed with exit code $LASTEXITCODE."
     }
 
     $metadata = & cargo metadata --locked --manifest-path $manifestPath `
@@ -74,11 +83,16 @@ try {
     }
     $targetDirectory = [string]($metadata | ConvertFrom-Json).target_directory
     $helperSource = Join-Path $targetDirectory "debug\imgviewer-codec-helper.exe"
+    $faultHelperSource = Join-Path $targetDirectory "debug\imgviewer-codec-fault-helper.exe"
     $testDirectory = Join-Path $targetDirectory "debug\deps"
     $nativeStage = Join-Path $targetDirectory "debug\native-test-v143"
     $helperTarget = Join-Path $testDirectory "ImgViewer.CodecHelper.exe"
+    $faultHelperTarget = Join-Path $testDirectory "ImgViewer.CodecFaultHelper.exe"
     if (-not (Test-Path -LiteralPath $helperSource)) {
         throw "Built helper was not found at $helperSource."
+    }
+    if (-not (Test-Path -LiteralPath $faultHelperSource)) {
+        throw "Built fault helper was not found at $faultHelperSource."
     }
     $targetRoot = [IO.Path]::GetFullPath($targetDirectory).TrimEnd('\', '/') +
         [IO.Path]::DirectorySeparatorChar
@@ -115,22 +129,66 @@ try {
         ForEach-Object {
             Copy-Item -LiteralPath $_.FullName `
                 -Destination (Join-Path $testDirectory $_.Name) -Force
-        }
+    }
     Copy-Item -LiteralPath $helperSource -Destination $helperTarget -Force
+    Copy-Item -LiteralPath $faultHelperSource -Destination $faultHelperTarget -Force
 
-    & cargo test --locked --manifest-path $manifestPath --package imgviewer `
-        --lib --no-default-features `
-        "codec_helper::tests::real_helper_process_decodes_persistently_and_recovers_after_crash" `
-        -- --exact --ignored --nocapture
-    if ($LASTEXITCODE -ne 0) {
-        throw "Real codec helper process test failed with exit code $LASTEXITCODE."
+    $processTests = @(
+        "codec_helper::tests::real_helper_process_decodes_persistently_and_recovers_after_crash",
+        "codec_helper::tests::real_fault_helper_hang_times_out_once_then_recovers_lazily",
+        "codec_helper::tests::real_fault_helper_job_oom_crashes_once_then_recovers_lazily"
+    )
+    foreach ($processTest in $processTests) {
+        & cargo test --locked --manifest-path $manifestPath --package imgviewer `
+            --lib --no-default-features $processTest `
+            -- --exact --ignored --nocapture
+        if ($LASTEXITCODE -ne 0) {
+            throw "Real codec helper process test '$processTest' failed with exit code $LASTEXITCODE."
+        }
+    }
+
+    $expectedHelperPaths = @(
+        [IO.Path]::GetFullPath($helperTarget),
+        [IO.Path]::GetFullPath($faultHelperTarget)
+    )
+    $orphanProcesses = @(
+        Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+                $expectedHelperPaths -icontains [IO.Path]::GetFullPath(
+                    [string]$_.ExecutablePath
+                )
+            }
+    )
+    if ($orphanProcesses.Count -gt 0) {
+        $orphanIds = @($orphanProcesses | ForEach-Object { [int]$_.ProcessId })
+        foreach ($orphanId in $orphanIds) {
+            Stop-Process -Id $orphanId -Force -ErrorAction SilentlyContinue
+        }
+        throw "Codec helper process tests left orphan PIDs: $($orphanIds -join ', ')."
     }
 
     Write-Output (
-        "PASS codec-helper-process primary=3x5 persistent=2 crash-recovery=1 " +
-        "handle-release=4 app-local-v143=1 helper=$helperTarget"
+        "PASS codec-helper-process formats=heif,tiff persistent=1 crash-restarts=20 " +
+        "hang-recovery=1 oom-recovery=1 handle-release=verified orphan=absent"
     )
 } finally {
+    # A failed ignored process test can leave its deliberately hung/crashed
+    # helper alive. Always clean only the exact staged helper paths before
+    # restoring the caller's environment; never match by process name alone.
+    if (@($expectedHelperPaths).Count -gt 0) {
+        @(
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+                    $expectedHelperPaths -icontains [IO.Path]::GetFullPath(
+                        [string]$_.ExecutablePath
+                    )
+                }
+        ) | ForEach-Object {
+            Stop-Process -Id ([int]$_.ProcessId) -Force -ErrorAction SilentlyContinue
+        }
+    }
     foreach ($entry in $savedEnvironment.GetEnumerator()) {
         [Environment]::SetEnvironmentVariable(
             [string]$entry.Key,

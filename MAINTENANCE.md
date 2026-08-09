@@ -39,8 +39,9 @@ ImgViewer 的成功標準不是每月增加功能，而是即使一年沒有新�
 
 ## 每年
 
-- 在乾淨 Windows VM 從零還原、建置、驗證 Git tag、checksum、SBOM 與
-  provenance。
+- 在目前維護的 Windows 11 實機建立全新 clone，重新 bootstrap 專案內工具，
+  從零建置並驗證 Git tag、checksum、SBOM 與 provenance；不要求 VM 或
+  乾淨作業系統映像。
 - 建立離線 Git bundle，測試備份確實可還原。
 - 盤點 repository 權限、branch/tag protection、簽章金鑰、支援中的
   Windows/WebView2，以及第三方授權。

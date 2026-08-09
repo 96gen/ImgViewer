@@ -2,16 +2,17 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use crate::catalog::validate_source_path;
-use crate::codec_helper::HeifHelperClient;
+use crate::codec_helper::CodecHelperClient;
 use crate::error::{ViewerError, code as error_code};
 
 pub(crate) use imgviewer_codec_core::MAX_DECODE_BYTES;
 use imgviewer_codec_core::SupportedFormat;
+use imgviewer_codec_protocol::CodecFormat;
 
 #[derive(Default)]
 pub(crate) struct ProductionDecoder {
     local: imgviewer_codec_core::ProductionDecoder,
-    heif: HeifHelperClient,
+    helper: CodecHelperClient,
 }
 
 impl ProductionDecoder {
@@ -20,19 +21,26 @@ impl ProductionDecoder {
         path: &Path,
         file: File,
     ) -> Result<imgviewer_codec_core::DecodedRender, ViewerError> {
-        if SupportedFormat::from_path(path) == Some(SupportedFormat::Heif) {
-            self.heif.decode(file)
-        } else {
-            self.local.decode(path, file)
+        match helper_format(path) {
+            Some(format) => self.helper.decode(format, file),
+            None => self.local.decode(path, file),
         }
     }
 
     pub(crate) fn cancel_current(&self) {
-        self.heif.cancel_current();
+        self.helper.cancel_current();
     }
 
     pub(crate) fn shutdown(&self) {
-        self.heif.shutdown();
+        self.helper.shutdown();
+    }
+}
+
+fn helper_format(path: &Path) -> Option<CodecFormat> {
+    match SupportedFormat::from_path(path) {
+        Some(SupportedFormat::Heif) => Some(CodecFormat::Heif),
+        Some(SupportedFormat::Tiff) => Some(CodecFormat::Tiff),
+        _ => None,
     }
 }
 
@@ -85,4 +93,30 @@ fn validate_source_path_for_open(path: &Path) -> Result<(), ViewerError> {
             error
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heif_and_tiff_are_routed_to_the_codec_helper() {
+        assert_eq!(
+            helper_format(Path::new("image.heic")),
+            Some(CodecFormat::Heif)
+        );
+        assert_eq!(
+            helper_format(Path::new("image.HEIF")),
+            Some(CodecFormat::Heif)
+        );
+        assert_eq!(
+            helper_format(Path::new("image.tif")),
+            Some(CodecFormat::Tiff)
+        );
+        assert_eq!(
+            helper_format(Path::new("image.TIFF")),
+            Some(CodecFormat::Tiff)
+        );
+        assert_eq!(helper_format(Path::new("image.png")), None);
+    }
 }

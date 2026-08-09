@@ -1,6 +1,6 @@
 [package]
 name = "imgviewer-codec-helper"
-version = "0.3.0"
+version = "0.4.0"
 description = "Private out-of-process codec helper for ImgViewer"
 license = "MIT"
 edition = "2024"
@@ -10,10 +10,12 @@ publish = false
 [features]
 default = []
 heic = ["imgviewer-codec-core/heic"]
+tiff = ["imgviewer-codec-core/tiff"]
+test-hooks = []
 
 [dependencies]
-imgviewer-codec-core = { version = "=0.3.0", path = "../codec-core" }
-imgviewer-codec-protocol = { version = "=0.3.0", path = "../codec-protocol" }
+imgviewer-codec-core = { version = "=0.4.0", path = "../codec-core" }
+imgviewer-codec-protocol = { version = "=0.4.0", path = "../codec-protocol" }
 
 [dev-dependencies]
 tempfile = "=3.20.0"
@@ -25,3 +27,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "imgviewer-codec-helper"
 path = "src/main.rs"
+
+[[bin]]
+name = "imgviewer-codec-fault-helper"
+path = "src/fault_main.rs"
+required-features = ["test-hooks"]

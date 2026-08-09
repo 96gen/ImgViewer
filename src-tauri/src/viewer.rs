@@ -267,37 +267,39 @@ impl ViewerController {
                     if state.shutdown_requested {
                         return state.snapshot.clone();
                     }
+                    // Keep the worker behind the state lock while cancelling.
+                    // Otherwise a just-finished decode can take the newly
+                    // published pending job before `cancel_current`, causing
+                    // the cancellation intended for the old generation to
+                    // terminate the new request instead.
+                    self.inner.decoder.cancel_current();
                     state.files = files;
                     state.index = Some(index);
                     state.schedule_current()
                 };
-                self.inner.decoder.cancel_current();
                 self.inner.wake_worker.notify_one();
                 snapshot
             }
             Err(error) => {
-                let snapshot = {
-                    let mut state = self.inner.state.lock();
-                    if state.shutdown_requested {
-                        return state.snapshot.clone();
-                    }
-                    let generation = state.next_generation();
-                    let revision = state.next_revision();
-                    state.files.clear();
-                    state.index = None;
-                    state.pending = None;
-                    state.renders.clear();
-                    state.snapshot = ViewerSnapshot::open_error(
-                        generation,
-                        revision,
-                        path.file_name()
-                            .map(|name| name.to_string_lossy().into_owned()),
-                        error,
-                    );
-                    state.snapshot.clone()
-                };
+                let mut state = self.inner.state.lock();
+                if state.shutdown_requested {
+                    return state.snapshot.clone();
+                }
                 self.inner.decoder.cancel_current();
-                snapshot
+                let generation = state.next_generation();
+                let revision = state.next_revision();
+                state.files.clear();
+                state.index = None;
+                state.pending = None;
+                state.renders.clear();
+                state.snapshot = ViewerSnapshot::open_error(
+                    generation,
+                    revision,
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned()),
+                    error,
+                );
+                state.snapshot.clone()
             }
         }
     }
@@ -318,6 +320,10 @@ impl ViewerController {
                 _ => None,
             };
             if let Some(target) = target {
+                // Cancellation is ordered before the replacement job becomes
+                // observable to the worker. See the corresponding open-path
+                // ordering above.
+                self.inner.decoder.cancel_current();
                 state.index = Some(target);
                 scheduled = true;
                 state.schedule_current()
@@ -326,7 +332,6 @@ impl ViewerController {
             }
         };
         if scheduled {
-            self.inner.decoder.cancel_current();
             self.inner.wake_worker.notify_one();
         }
         snapshot
@@ -1173,6 +1178,91 @@ mod tests {
         controller.shutdown();
         controller.shutdown();
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    struct BlockingCancelDecoder {
+        started: Sender<String>,
+        release_first: Mutex<Receiver<()>>,
+        cancel_calls: AtomicUsize,
+        second_cancel_entered: Sender<()>,
+        release_second_cancel: Mutex<Receiver<()>>,
+    }
+
+    impl Decoder for BlockingCancelDecoder {
+        fn decode(&self, path: &Path, _file: File) -> Result<DecodedRender, ViewerError> {
+            let name = display_name(path);
+            self.started.send(name.clone()).unwrap();
+            if name == "1.jpg" {
+                self.release_first
+                    .lock()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            Ok(DecodedRender {
+                bytes: name.into_bytes(),
+                mime_type: "image/jpeg",
+                width: 1,
+                height: 1,
+                animated: false,
+            })
+        }
+
+        fn cancel_current(&self) {
+            let call = self.cancel_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 2 {
+                self.second_cancel_entered.send(()).unwrap();
+                self.release_second_cancel
+                    .lock()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_job_is_not_observable_until_old_request_cancel_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["1.jpg", "2.jpg"] {
+            File::create(directory.path().join(name)).unwrap();
+        }
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (cancel_entered_tx, cancel_entered_rx) = mpsc::channel();
+        let (release_cancel_tx, release_cancel_rx) = mpsc::channel();
+        let controller = ViewerController::with_decoder(Arc::new(BlockingCancelDecoder {
+            started: started_tx,
+            release_first: Mutex::new(release_first_rx),
+            cancel_calls: AtomicUsize::new(0),
+            second_cancel_entered: cancel_entered_tx,
+            release_second_cancel: Mutex::new(release_cancel_rx),
+        }));
+
+        controller.open_path(directory.path().join("1.jpg"));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "1.jpg"
+        );
+
+        let navigation_controller = controller.clone();
+        let navigation =
+            thread::spawn(move || navigation_controller.navigate(NavigationDirection::Next));
+        cancel_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        release_first_tx.send(()).unwrap();
+
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the worker observed the replacement job before old-request cancellation completed"
+        );
+        release_cancel_tx.send(()).unwrap();
+        let loading = navigation.join().unwrap();
+        assert_eq!(loading.file_name.as_deref(), Some("2.jpg"));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "2.jpg"
+        );
+        assert_eq!(wait_until_ready(&controller).status, ViewerStatus::Ready);
     }
 
     #[test]

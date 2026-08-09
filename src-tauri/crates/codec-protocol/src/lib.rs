@@ -4,13 +4,15 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const PROTOCOL_MAGIC: [u8; 8] = *b"IMGVC001";
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
+pub const CODEC_HELPER_MEMORY_LIMIT_BYTES: usize = 805_306_368;
+pub const CODEC_HELPER_DECODE_DEADLINE_MS: u64 = 30_000;
 pub const HEADER_LEN: usize = 16;
 pub const MAX_CONTROL_PAYLOAD_BYTES: u32 = 64 * 1024;
 pub const MAX_RENDER_BYTES: u32 = 512 * 1024 * 1024;
 pub const MAX_RENDER_SIDE: u32 = 32_768;
 pub const MAX_RENDER_PIXELS: u64 = 100_000_000;
-pub const DECODE_REQUEST_LEN: u32 = 24;
+pub const DECODE_REQUEST_LEN: u32 = 32;
 pub const DECODE_SUCCESS_PREFIX_LEN: u32 = 24;
 pub const DECODE_ERROR_LEN: u32 = 32;
 pub const MAX_RENDER_PAYLOAD_BYTES: u32 = MAX_RENDER_BYTES + DECODE_SUCCESS_PREFIX_LEN;
@@ -20,7 +22,7 @@ pub const MAX_RENDER_PAYLOAD_BYTES: u32 = MAX_RENDER_BYTES + DECODE_SUCCESS_PREF
 pub enum MessageKind {
     Hello = 1,
     Ready = 2,
-    DecodeHeif = 3,
+    DecodeImage = 3,
     DecodeSuccess = 4,
     DecodeError = 5,
     Shutdown = 6,
@@ -39,7 +41,7 @@ impl TryFrom<u16> for MessageKind {
         match value {
             1 => Ok(Self::Hello),
             2 => Ok(Self::Ready),
-            3 => Ok(Self::DecodeHeif),
+            3 => Ok(Self::DecodeImage),
             4 => Ok(Self::DecodeSuccess),
             5 => Ok(Self::DecodeError),
             6 => Ok(Self::Shutdown),
@@ -115,23 +117,53 @@ impl Header {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecodeHeifRequest {
+#[repr(u16)]
+pub enum CodecFormat {
+    Heif = 1,
+    Tiff = 2,
+}
+
+impl CodecFormat {
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+impl TryFrom<u16> for CodecFormat {
+    type Error = ProtocolError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Heif),
+            2 => Ok(Self::Tiff),
+            _ => Err(ProtocolError::UnknownCodecFormat(value)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeRequest {
     pub request_id: u64,
     pub duplicated_handle: u64,
     pub expected_length: u64,
+    pub format: CodecFormat,
 }
 
-impl DecodeHeifRequest {
+impl DecodeRequest {
     pub fn encode(self) -> [u8; DECODE_REQUEST_LEN as usize] {
         let mut bytes = [0_u8; DECODE_REQUEST_LEN as usize];
         bytes[..8].copy_from_slice(&self.request_id.to_le_bytes());
         bytes[8..16].copy_from_slice(&self.duplicated_handle.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.expected_length.to_le_bytes());
+        bytes[24..26].copy_from_slice(&self.format.code().to_le_bytes());
         bytes
     }
 
-    pub fn decode(bytes: [u8; DECODE_REQUEST_LEN as usize]) -> Self {
-        Self {
+    pub fn decode(bytes: [u8; DECODE_REQUEST_LEN as usize]) -> Result<Self, ProtocolError> {
+        if bytes[26..32] != [0_u8; 6] {
+            return Err(ProtocolError::NonCanonicalReservedBytes);
+        }
+        Ok(Self {
             request_id: u64::from_le_bytes(bytes[..8].try_into().expect("fixed request id")),
             duplicated_handle: u64::from_le_bytes(
                 bytes[8..16].try_into().expect("fixed duplicated handle"),
@@ -139,7 +171,8 @@ impl DecodeHeifRequest {
             expected_length: u64::from_le_bytes(
                 bytes[16..24].try_into().expect("fixed expected length"),
             ),
-        }
+            format: CodecFormat::try_from(u16::from_le_bytes([bytes[24], bytes[25]]))?,
+        })
     }
 }
 
@@ -233,7 +266,7 @@ pub enum DecodeResponse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HelperCommand {
-    DecodeHeif(DecodeHeifRequest),
+    DecodeImage(DecodeRequest),
     Shutdown,
 }
 
@@ -250,6 +283,7 @@ pub enum ProtocolError {
     InvalidMagic,
     UnsupportedVersion(u16),
     UnknownMessageKind(u16),
+    UnknownCodecFormat(u16),
     UnknownWireErrorCode(u16),
     UnexpectedMessage {
         observed: MessageKind,
@@ -303,6 +337,9 @@ impl fmt::Display for ProtocolError {
             }
             Self::UnknownMessageKind(kind) => {
                 write!(formatter, "unknown codec protocol message kind {kind}")
+            }
+            Self::UnknownCodecFormat(format) => {
+                write!(formatter, "unknown codec format {format}")
             }
             Self::UnknownWireErrorCode(code) => {
                 write!(formatter, "unknown codec wire error code {code}")
@@ -390,11 +427,11 @@ pub fn write_shutdown(writer: &mut (impl Write + ?Sized)) -> Result<(), Protocol
 
 pub fn write_decode_request(
     writer: &mut (impl Write + ?Sized),
-    request: DecodeHeifRequest,
+    request: DecodeRequest,
 ) -> Result<(), ProtocolError> {
     write_header(
         writer,
-        Header::new(MessageKind::DecodeHeif, DECODE_REQUEST_LEN)?,
+        Header::new(MessageKind::DecodeImage, DECODE_REQUEST_LEN)?,
     )?;
     writer
         .write_all(&request.encode())
@@ -406,10 +443,10 @@ pub fn read_helper_command(
 ) -> Result<HelperCommand, ProtocolError> {
     let header = read_header(reader)?;
     match header.kind() {
-        MessageKind::DecodeHeif => {
+        MessageKind::DecodeImage => {
             let mut bytes = [0_u8; DECODE_REQUEST_LEN as usize];
             read_exact_counted(reader, &mut bytes, false)?;
-            Ok(HelperCommand::DecodeHeif(DecodeHeifRequest::decode(bytes)))
+            Ok(HelperCommand::DecodeImage(DecodeRequest::decode(bytes)?))
         }
         MessageKind::Shutdown => Ok(HelperCommand::Shutdown),
         observed => Err(ProtocolError::UnexpectedMessage { observed }),
@@ -564,7 +601,7 @@ fn validate_header_payload(kind: MessageKind, payload_len: u32) -> Result<(), Pr
 
     let (minimum, maximum) = match kind {
         MessageKind::Hello | MessageKind::Ready | MessageKind::Shutdown => (0, 0),
-        MessageKind::DecodeHeif => (DECODE_REQUEST_LEN, DECODE_REQUEST_LEN),
+        MessageKind::DecodeImage => (DECODE_REQUEST_LEN, DECODE_REQUEST_LEN),
         MessageKind::DecodeError => (DECODE_ERROR_LEN, DECODE_ERROR_LEN),
         MessageKind::DecodeSuccess => (DECODE_SUCCESS_PREFIX_LEN, MAX_RENDER_PAYLOAD_BYTES),
     };
@@ -648,17 +685,87 @@ mod tests {
 
     #[test]
     fn fixed_header_and_decode_request_round_trip_uses_explicit_fields() {
-        let request = DecodeHeifRequest {
+        let request = DecodeRequest {
             request_id: 42,
             duplicated_handle: 0x1234,
             expected_length: 9_876,
+            format: CodecFormat::Tiff,
         };
         let mut bytes = Vec::new();
         write_decode_request(&mut bytes, request).unwrap();
         assert_eq!(bytes.len(), HEADER_LEN + DECODE_REQUEST_LEN as usize);
+        assert_eq!(&bytes[8..10], &PROTOCOL_VERSION.to_le_bytes());
+        assert_eq!(
+            &bytes[10..12],
+            &MessageKind::DecodeImage.code().to_le_bytes()
+        );
+        assert_eq!(
+            &bytes[HEADER_LEN + 24..HEADER_LEN + 26],
+            &2_u16.to_le_bytes()
+        );
+        assert_eq!(&bytes[HEADER_LEN + 26..HEADER_LEN + 32], &[0_u8; 6]);
         assert_eq!(
             read_helper_command(&mut Cursor::new(bytes)).unwrap(),
-            HelperCommand::DecodeHeif(request)
+            HelperCommand::DecodeImage(request)
+        );
+    }
+
+    #[test]
+    fn codec_format_codes_are_stable_and_unknown_values_fail_closed() {
+        assert_eq!(CODEC_HELPER_MEMORY_LIMIT_BYTES, 805_306_368);
+        assert_eq!(CODEC_HELPER_DECODE_DEADLINE_MS, 30_000);
+        assert_eq!(CodecFormat::Heif.code(), 1);
+        assert_eq!(CodecFormat::Tiff.code(), 2);
+        assert_eq!(CodecFormat::try_from(1), Ok(CodecFormat::Heif));
+        assert_eq!(CodecFormat::try_from(2), Ok(CodecFormat::Tiff));
+        assert_eq!(
+            CodecFormat::try_from(0).unwrap_err(),
+            ProtocolError::UnknownCodecFormat(0)
+        );
+
+        let request = DecodeRequest {
+            request_id: 7,
+            duplicated_handle: 8,
+            expected_length: 9,
+            format: CodecFormat::Heif,
+        };
+        let mut bytes = Vec::new();
+        write_decode_request(&mut bytes, request).unwrap();
+        bytes[HEADER_LEN + 24..HEADER_LEN + 26].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            read_helper_command(&mut Cursor::new(bytes)).unwrap_err(),
+            ProtocolError::UnknownCodecFormat(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn decode_request_reserved_bytes_and_non_v3_length_fail_closed() {
+        let request = DecodeRequest {
+            request_id: 7,
+            duplicated_handle: 8,
+            expected_length: 9,
+            format: CodecFormat::Tiff,
+        };
+        let mut noncanonical = Vec::new();
+        write_decode_request(&mut noncanonical, request).unwrap();
+        noncanonical[HEADER_LEN + 31] = 1;
+        assert_eq!(
+            read_helper_command(&mut Cursor::new(noncanonical)).unwrap_err(),
+            ProtocolError::NonCanonicalReservedBytes
+        );
+
+        let mut v2_length = Header::new(MessageKind::DecodeImage, DECODE_REQUEST_LEN)
+            .unwrap()
+            .encode();
+        v2_length[12..16].copy_from_slice(&24_u32.to_le_bytes());
+        assert_eq!(
+            read_helper_command(&mut Cursor::new(v2_length)).unwrap_err(),
+            ProtocolError::InvalidPayloadLength {
+                kind: MessageKind::DecodeImage,
+                observed: 24,
+                minimum: DECODE_REQUEST_LEN,
+                maximum: DECODE_REQUEST_LEN,
+            }
         );
     }
 
@@ -726,7 +833,7 @@ mod tests {
         let mut request = Vec::new();
         write_header(
             &mut request,
-            Header::new(MessageKind::DecodeHeif, DECODE_REQUEST_LEN).unwrap(),
+            Header::new(MessageKind::DecodeImage, DECODE_REQUEST_LEN).unwrap(),
         )
         .unwrap();
         request.extend_from_slice(&[0_u8; 5]);

@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "imgviewer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "image",
  "imgviewer-codec-core",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "imgviewer-codec-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "image",
  "libheif-rs",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "imgviewer-codec-helper"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "imgviewer-codec-core",
  "imgviewer-codec-protocol",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "imgviewer-codec-protocol"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "indexmap"

@@ -1,12 +1,12 @@
+use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read};
+use std::io::{BufReader, Cursor, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use image::{
-    ColorType, DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader, Limits,
-    metadata::Orientation,
-};
+#[cfg(any(test, feature = "tiff"))]
+use image::ColorType;
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, metadata::Orientation};
 use moxcms::{
     Chromaticity, CicpColorPrimaries, CicpProfile, ColorPrimaries, ColorProfile, DataColorSpace,
     Layout, MatrixCoefficients, ParsingOptions, ToneReprCurve, TransferCharacteristics,
@@ -101,6 +101,23 @@ pub fn decode_heif_file_rgba8(file: File) -> Result<DecodedRgba8, ViewerError> {
         ));
     }
     decode_heif_rgba8(bytes)
+}
+
+/// Decodes the first page of a TIFF image from an already-open, owned file
+/// handle to canonical RGBA8.
+///
+/// The handle is consumed exactly once. Size validation, bounded reading,
+/// magic validation, orientation, ICC conversion, and integer/float sample
+/// normalization all operate on that same owned byte snapshot.
+pub fn decode_tiff_file_rgba8(file: File) -> Result<DecodedRgba8, ViewerError> {
+    let bytes = read_limited(file)?;
+    if sniff_format(&bytes) != Some(SupportedFormat::Tiff) {
+        return Err(ViewerError::new(
+            "format_mismatch",
+            "檔案內容不是有效的 TIFF 格式。",
+        ));
+    }
+    decode_tiff_rgba8(bytes)
 }
 
 fn read_limited(file: File) -> Result<Vec<u8>, ViewerError> {
@@ -500,14 +517,24 @@ fn raster_dimensions(bytes: &[u8], format: ImageFormat) -> Result<(u32, u32), Vi
     reader.into_dimensions().map_err(image_error)
 }
 
+#[cfg(feature = "tiff")]
 fn decode_tiff(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
+    encode_rgba8_png(decode_tiff_rgba8(bytes)?)
+}
+
+#[cfg(feature = "tiff")]
+fn decode_tiff_rgba8(bytes: Vec<u8>) -> Result<DecodedRgba8, ViewerError> {
+    let source_profile = tiff_first_ifd_icc_profile(&bytes)?
+        .map(|profile| parse_rgb_icc_profile(profile, true))
+        .transpose()?
+        .flatten();
     let (width, height) = raster_dimensions(&bytes, ImageFormat::Tiff)?;
     validate_dimensions(width, height)?;
     let source_bytes = bytes.len() as u64;
 
     // TiffDecoder starts at the first IFD (the first page). Read its orientation
-    // before consuming the decoder, then normalize pixels so the PNG does not
-    // depend on browser-specific TIFF metadata handling.
+    // before consuming the decoder, then normalize canonical pixels without
+    // depending on browser-specific TIFF metadata handling.
     let mut decoder =
         image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)).map_err(image_error)?;
     decoder.set_limits(decode_limits()).map_err(image_error)?;
@@ -527,13 +554,6 @@ fn decode_tiff(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
         height,
         u64::from(source_color_type.bytes_per_pixel()),
     )?;
-    let source_profile = decoder
-        .icc_profile()
-        .map_err(image_error)?
-        .as_deref()
-        .map(|profile| parse_rgb_icc_profile(profile, true))
-        .transpose()?
-        .flatten();
     let orientation = decoder.orientation().map_err(image_error)?;
     let mut image = DynamicImage::from_decoder(decoder).map_err(image_error)?;
     image.apply_orientation(orientation);
@@ -554,14 +574,132 @@ fn decode_tiff(bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
         }
         rgba8.into_raw()
     };
-    let png = encode_rgba_png(width, height, &rgba)?;
-    Ok(DecodedRender {
-        bytes: png,
-        mime_type: "image/png",
+    Ok(DecodedRgba8 {
+        rgba,
         width,
         height,
-        animated: false,
     })
+}
+
+#[cfg(feature = "tiff")]
+#[derive(Clone, Copy)]
+enum TiffByteOrder {
+    Little,
+    Big,
+}
+
+#[cfg(feature = "tiff")]
+fn tiff_first_ifd_icc_profile(bytes: &[u8]) -> Result<Option<&[u8]>, ViewerError> {
+    const ICC_PROFILE_TAG: u16 = 34_675;
+    const BYTE_TYPE: u16 = 1;
+    const UNDEFINED_TYPE: u16 = 7;
+
+    let order = match bytes.get(..2) {
+        Some(b"II") => TiffByteOrder::Little,
+        Some(b"MM") => TiffByteOrder::Big,
+        _ => return Err(ViewerError::corrupt("TIFF 位元組順序標頭無效。")),
+    };
+    if tiff_u16(bytes, 2, order) != Some(42) {
+        return Err(ViewerError::corrupt("TIFF magic number 無效。"));
+    }
+    let ifd_offset = tiff_u32(bytes, 4, order)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| ViewerError::corrupt("TIFF 第一個 IFD offset 無效。"))?;
+    let entry_count = tiff_u16(bytes, ifd_offset, order)
+        .map(usize::from)
+        .ok_or_else(|| ViewerError::corrupt("TIFF 第一個 IFD 被截斷。"))?;
+    let entries_start = ifd_offset
+        .checked_add(2)
+        .ok_or_else(|| ViewerError::corrupt("TIFF IFD offset 溢位。"))?;
+    let entries_bytes = entry_count
+        .checked_mul(12)
+        .ok_or_else(|| ViewerError::corrupt("TIFF IFD entry 數量溢位。"))?;
+    let entries_end = entries_start
+        .checked_add(entries_bytes)
+        .and_then(|end| end.checked_add(4))
+        .ok_or_else(|| ViewerError::corrupt("TIFF IFD 大小溢位。"))?;
+    if entries_end > bytes.len() {
+        return Err(ViewerError::corrupt("TIFF 第一個 IFD 被截斷。"));
+    }
+
+    let mut profile = None;
+    for index in 0..entry_count {
+        let offset = entries_start + index * 12;
+        if tiff_u16(bytes, offset, order) != Some(ICC_PROFILE_TAG) {
+            continue;
+        }
+        if profile.is_some() {
+            return Err(ViewerError::corrupt(
+                "TIFF 第一個 IFD 包含重複的 ICC 色彩描述。",
+            ));
+        }
+        let field_type = tiff_u16(bytes, offset + 2, order)
+            .ok_or_else(|| ViewerError::corrupt("TIFF ICC tag type 被截斷。"))?;
+        if field_type != BYTE_TYPE && field_type != UNDEFINED_TYPE {
+            return Err(ViewerError::corrupt("TIFF ICC tag type 無效。"));
+        }
+        let observed = tiff_u32(bytes, offset + 4, order)
+            .map(u64::from)
+            .ok_or_else(|| ViewerError::corrupt("TIFF ICC tag 長度被截斷。"))?;
+        if observed > MAX_ICC_PROFILE_BYTES as u64 {
+            return Err(ViewerError::limit(
+                "color_profile_too_large",
+                "圖片的 ICC 色彩描述超過 16 MiB 上限。",
+            )
+            .with_parameter("observedBytes", observed)
+            .with_parameter("maxBytes", MAX_ICC_PROFILE_BYTES as u64));
+        }
+        let profile_len = observed as usize;
+        let profile_offset = if profile_len <= 4 {
+            offset + 8
+        } else {
+            tiff_u32(bytes, offset + 8, order)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| ViewerError::corrupt("TIFF ICC tag offset 無效。"))?
+        };
+        let profile_end = profile_offset
+            .checked_add(profile_len)
+            .ok_or_else(|| ViewerError::corrupt("TIFF ICC 色彩描述範圍溢位。"))?;
+        profile = Some(
+            bytes
+                .get(profile_offset..profile_end)
+                .ok_or_else(|| ViewerError::corrupt("TIFF ICC 色彩描述超出檔案範圍。"))?,
+        );
+    }
+    Ok(profile)
+}
+
+#[cfg(feature = "tiff")]
+fn tiff_u16(bytes: &[u8], offset: usize, order: TiffByteOrder) -> Option<u16> {
+    let value: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+    Some(match order {
+        TiffByteOrder::Little => u16::from_le_bytes(value),
+        TiffByteOrder::Big => u16::from_be_bytes(value),
+    })
+}
+
+#[cfg(feature = "tiff")]
+fn tiff_u32(bytes: &[u8], offset: usize, order: TiffByteOrder) -> Option<u32> {
+    let value: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(match order {
+        TiffByteOrder::Little => u32::from_le_bytes(value),
+        TiffByteOrder::Big => u32::from_be_bytes(value),
+    })
+}
+
+#[cfg(not(feature = "tiff"))]
+fn decode_tiff(_bytes: Vec<u8>) -> Result<DecodedRender, ViewerError> {
+    Err(tiff_unavailable())
+}
+
+#[cfg(not(feature = "tiff"))]
+fn decode_tiff_rgba8(_bytes: Vec<u8>) -> Result<DecodedRgba8, ViewerError> {
+    Err(tiff_unavailable())
+}
+
+#[cfg(not(feature = "tiff"))]
+fn tiff_unavailable() -> ViewerError {
+    ViewerError::new("tiff_unavailable", "這個程序未啟用 TIFF 解碼。")
 }
 
 fn rgb_icc_to_srgb_transform(
@@ -809,6 +947,15 @@ fn unpremultiply_rgba16(rgba: &mut [u16], bit_depth: u8) -> Result<(), ViewerErr
 }
 
 fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, ViewerError> {
+    encode_rgba_png_checked(width, height, rgba, &mut || Ok(()))
+}
+
+fn encode_rgba_png_checked(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    check: &mut impl FnMut() -> Result<(), ViewerError>,
+) -> Result<Vec<u8>, ViewerError> {
     let expected = u64::from(width)
         .checked_mul(u64::from(height))
         .and_then(|pixels| pixels.checked_mul(4))
@@ -820,17 +967,40 @@ fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, View
         ));
     }
 
-    let mut output = Vec::new();
-    let mut encoder = image::codecs::png::PngEncoder::new(&mut output);
+    let row_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .filter(|row_bytes| *row_bytes != 0)
+        .ok_or_else(|| ViewerError::limit("dimensions_exceeded", "PNG row 大小計算溢位。"))?;
+
+    check()?;
     let srgb_profile = moxcms::ColorProfile::new_srgb()
         .encode()
         .map_err(|error| ViewerError::corrupt(format!("無法建立 sRGB 色彩描述：{error}")))?;
-    encoder
-        .set_icc_profile(srgb_profile)
-        .map_err(|error| ViewerError::corrupt(format!("無法寫入 sRGB 色彩描述：{error}")))?;
-    encoder
-        .write_image(rgba, width, height, ColorType::Rgba8.into())
-        .map_err(image_error)?;
+    let mut info = png::Info::with_size(width, height);
+    info.color_type = png::ColorType::Rgba;
+    info.bit_depth = png::BitDepth::Eight;
+    info.icc_profile = Some(Cow::Owned(srgb_profile));
+
+    let mut output = Vec::new();
+    let mut encoder = png::Encoder::with_info(&mut output, info).map_err(png_encoding_error)?;
+    // Match image::PngEncoder's established defaults so the checked path
+    // changes interruptibility rather than the display PNG's quality policy.
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_filter(png::Filter::Adaptive);
+    let mut writer = encoder.write_header().map_err(png_encoding_error)?;
+    {
+        let mut stream = writer
+            .stream_writer_with_size(4 * 1024)
+            .map_err(png_encoding_error)?;
+        for row in rgba.chunks_exact(row_bytes) {
+            check()?;
+            stream.write_all(row).map_err(png_stream_error)?;
+        }
+        stream.finish().map_err(png_encoding_error)?;
+    }
+    writer.finish().map_err(png_encoding_error)?;
+    check()?;
     if output.len() as u64 > MAX_DECODE_BYTES {
         return Err(ViewerError::limit(
             "decode_limit_exceeded",
@@ -840,15 +1010,42 @@ fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, View
     Ok(output)
 }
 
+fn png_encoding_error(error: png::EncodingError) -> ViewerError {
+    match error {
+        png::EncodingError::LimitsExceeded => {
+            ViewerError::limit("decode_limit_exceeded", "PNG 編碼超過 512 MiB 安全上限。")
+        }
+        other => ViewerError::corrupt(format!("無法編碼顯示用 PNG：{other}")),
+    }
+}
+
+fn png_stream_error(error: std::io::Error) -> ViewerError {
+    ViewerError::corrupt(format!("無法編碼顯示用 PNG：{error}"))
+}
+
 /// Encodes canonical RGBA8 into the application's display PNG.
 ///
 /// The raw plane and conservative PNG encoder reserve are budgeted together
 /// before allocation so moving encoding out of the native helper does not
 /// weaken the 512 MiB aggregate working-set contract.
 pub fn encode_rgba8_png(decoded: DecodedRgba8) -> Result<DecodedRender, ViewerError> {
+    encode_rgba8_png_checked(decoded, || Ok(()))
+}
+
+/// Encodes canonical RGBA8 into the application's display PNG while calling
+/// `check` before encoder setup, before every bounded scanline, and after
+/// finalization before the completed PNG can be published.
+///
+/// Returning an error from `check` stops encoding without publishing a partial
+/// PNG. The existing 512 MiB aggregate budget and sRGB ICC output contract are
+/// identical to [`encode_rgba8_png`].
+pub fn encode_rgba8_png_checked(
+    decoded: DecodedRgba8,
+    mut check: impl FnMut() -> Result<(), ViewerError>,
+) -> Result<DecodedRender, ViewerError> {
     validate_dimensions(decoded.width, decoded.height)?;
     validate_rgba_png_working_set(decoded.width, decoded.height)?;
-    let png = encode_rgba_png(decoded.width, decoded.height, &decoded.rgba)?;
+    let png = encode_rgba_png_checked(decoded.width, decoded.height, &decoded.rgba, &mut check)?;
     Ok(DecodedRender {
         bytes: png,
         mime_type: "image/png",
@@ -1602,7 +1799,7 @@ fn decode_heif_rgba8(_bytes: Vec<u8>) -> Result<DecodedRgba8, ViewerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{Delay, Frame, Rgba, RgbaImage};
+    use image::{Delay, Frame, ImageEncoder, Rgba, RgbaImage};
     use std::borrow::Cow;
     use std::fs;
     use std::io::Cursor;
@@ -1650,6 +1847,68 @@ mod tests {
             writer.write_image_data(&color).unwrap();
         }
         output
+    }
+
+    #[cfg(feature = "tiff")]
+    fn push_tiff_u16(bytes: &mut Vec<u8>, value: u16, big_endian: bool) {
+        let encoded = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+
+    #[cfg(feature = "tiff")]
+    fn push_tiff_u32(bytes: &mut Vec<u8>, value: u32, big_endian: bool) {
+        let encoded = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+
+    #[cfg(feature = "tiff")]
+    fn baseline_gray_tiff(
+        big_endian: bool,
+        width: u32,
+        height: u32,
+        strip_offset_override: Option<u32>,
+    ) -> Vec<u8> {
+        const ENTRY_COUNT: u16 = 8;
+        const IFD_OFFSET: u32 = 8;
+        const PIXEL_OFFSET: u32 = IFD_OFFSET + 2 + ENTRY_COUNT as u32 * 12 + 4;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(if big_endian { b"MM" } else { b"II" });
+        push_tiff_u16(&mut bytes, 42, big_endian);
+        push_tiff_u32(&mut bytes, IFD_OFFSET, big_endian);
+        push_tiff_u16(&mut bytes, ENTRY_COUNT, big_endian);
+
+        let mut entry = |tag: u16, field_type: u16, value: u32| {
+            push_tiff_u16(&mut bytes, tag, big_endian);
+            push_tiff_u16(&mut bytes, field_type, big_endian);
+            push_tiff_u32(&mut bytes, 1, big_endian);
+            if field_type == 3 {
+                push_tiff_u16(&mut bytes, value as u16, big_endian);
+                push_tiff_u16(&mut bytes, 0, big_endian);
+            } else {
+                push_tiff_u32(&mut bytes, value, big_endian);
+            }
+        };
+        entry(256, 4, width); // ImageWidth LONG
+        entry(257, 4, height); // ImageLength LONG
+        entry(258, 3, 8); // BitsPerSample SHORT
+        entry(259, 3, 1); // Compression = none
+        entry(262, 3, 1); // PhotometricInterpretation = BlackIsZero
+        entry(273, 4, strip_offset_override.unwrap_or(PIXEL_OFFSET)); // StripOffsets
+        entry(278, 4, height); // RowsPerStrip
+        entry(279, 4, width.saturating_mul(height)); // StripByteCounts
+        push_tiff_u32(&mut bytes, 0, big_endian); // no next IFD
+        debug_assert_eq!(bytes.len(), PIXEL_OFFSET as usize);
+        bytes.push(0x7f);
+        bytes
     }
 
     fn gif_animation_structure(frame_count: usize, width: u16, height: u16) -> Vec<u8> {
@@ -1733,12 +1992,52 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn path_independent_tiff_entry_rejects_magic_before_codec_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("disguised.tiff");
+        fs::write(&path, png_bytes([1, 2, 3, 255])).unwrap();
+
+        let error = decode_tiff_file_rgba8(File::open(path).unwrap()).unwrap_err();
+        assert_eq!(error.code, "format_mismatch");
+        assert!(error.parameters.is_empty());
+    }
+
+    #[test]
+    fn path_independent_tiff_entry_enforces_input_limit_and_releases_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.tiff");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_INPUT_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = decode_tiff_file_rgba8(File::open(&path).unwrap()).unwrap_err();
+        assert_eq!(error.code, "file_too_large");
+        assert_eq!(
+            error.parameters["observedBytes"],
+            serde_json::json!(MAX_INPUT_BYTES + 1)
+        );
+        assert_eq!(
+            error.parameters["maxBytes"],
+            serde_json::json!(MAX_INPUT_BYTES)
+        );
+        fs::remove_file(path).unwrap();
+    }
+
     #[cfg(not(feature = "heic"))]
     #[test]
     fn path_independent_heif_entry_reports_disabled_codec_after_validation() {
         let decoded =
             decode_heif_file(File::open(fixture("primary-second.heic")).unwrap()).unwrap_err();
         assert_eq!(decoded.code, "heic_unavailable");
+    }
+
+    #[cfg(not(feature = "tiff"))]
+    #[test]
+    fn path_independent_tiff_entry_reports_disabled_codec_after_validation() {
+        let decoded =
+            decode_tiff_file_rgba8(File::open(fixture("two-page.tiff")).unwrap()).unwrap_err();
+        assert_eq!(decoded.code, "tiff_unavailable");
     }
 
     #[test]
@@ -1845,6 +2144,54 @@ mod tests {
         assert_eq!(over_budget.parameters["phase"], "png_encode");
         assert_eq!(over_budget.parameters["maxBytes"], MAX_DECODE_BYTES);
         assert!(over_budget.parameters["estimatedBytes"].as_u64().unwrap() > MAX_DECODE_BYTES);
+    }
+
+    #[test]
+    fn checked_png_encoder_checkpoints_each_row_and_preserves_rgba_and_icc() {
+        let rgba = vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+        let mut checks = 0;
+        let render = encode_rgba8_png_checked(
+            DecodedRgba8 {
+                rgba: rgba.clone(),
+                width: 1,
+                height: 4,
+            },
+            || {
+                checks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(checks, 6, "setup + four rows + completed output");
+        assert_eq!(
+            image::load_from_memory(&render.bytes)
+                .unwrap()
+                .to_rgba8()
+                .as_raw(),
+            &rgba
+        );
+        let mut decoder = image::codecs::png::PngDecoder::new(Cursor::new(&render.bytes)).unwrap();
+        assert!(decoder.icc_profile().unwrap().is_some());
+
+        let mut interrupted_checks = 0;
+        let error = encode_rgba8_png_checked(
+            DecodedRgba8 {
+                rgba,
+                width: 1,
+                height: 4,
+            },
+            || {
+                interrupted_checks += 1;
+                if interrupted_checks == 3 {
+                    Err(ViewerError::new("test_cancelled", "cancelled by test"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "test_cancelled");
+        assert_eq!(interrupted_checks, 3, "no later scanline was encoded");
     }
 
     #[test]
@@ -2000,8 +2347,9 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tiff")]
     #[test]
-    fn tiff_conversion_uses_first_page_and_outputs_eight_bit_png() {
+    fn path_independent_tiff_entry_uses_first_page_and_outputs_rgba8() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pages.tiff");
         let mut bytes = Vec::new();
@@ -2020,14 +2368,15 @@ mod tests {
         }
         fs::write(&path, bytes).unwrap();
 
-        let decoded = decode_file(&path).unwrap();
-        assert_eq!(decoded.mime_type, "image/png");
-        let image = image::load_from_memory(&decoded.bytes).unwrap().to_rgba8();
-        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        let decoded = decode_tiff_file_rgba8(File::open(&path).unwrap()).unwrap();
+        assert_eq!((decoded.width, decoded.height), (1, 1));
+        assert_eq!(decoded.rgba, [255, 0, 0, 255]);
+        fs::remove_file(path).expect("TIFF entry must release the consumed file handle");
     }
 
+    #[cfg(feature = "tiff")]
     #[test]
-    fn small_rgba32f_tiff_is_budgeted_and_normalized_to_eight_bit_png() {
+    fn small_rgba32f_tiff_is_budgeted_and_normalized_to_rgba8() {
         let mut bytes = Vec::new();
         {
             let mut encoder = tiff::encoder::TiffEncoder::new(Cursor::new(&mut bytes)).unwrap();
@@ -2038,16 +2387,131 @@ mod tests {
                 .unwrap();
         }
 
-        let decoded = decode_tiff(bytes).unwrap();
-        assert_eq!(decoded.mime_type, "image/png");
-        let image = image::load_from_memory(&decoded.bytes).unwrap().to_rgba8();
-        let pixel = image.get_pixel(0, 0).0;
+        let decoded = decode_tiff_rgba8(bytes).unwrap();
+        let pixel = &decoded.rgba[..4];
         assert_eq!([pixel[0], pixel[2], pixel[3]], [255, 0, 255]);
         assert!((127..=128).contains(&pixel[1]));
     }
 
+    #[cfg(feature = "tiff")]
     #[test]
-    fn tiff_orientation_is_applied_before_png_conversion() {
+    fn rgba16_tiff_is_normalized_to_rgba8_after_high_bit_processing() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(Cursor::new(&mut bytes)).unwrap();
+            encoder
+                .new_image::<tiff::encoder::colortype::RGBA16>(1, 1)
+                .unwrap()
+                .write_data(&[u16::MAX, 32_768, 0, u16::MAX])
+                .unwrap();
+        }
+
+        let decoded = decode_tiff_rgba8(bytes).unwrap();
+        assert_eq!(
+            [decoded.rgba[0], decoded.rgba[2], decoded.rgba[3]],
+            [255, 0, 255]
+        );
+        assert!((127..=128).contains(&decoded.rgba[1]));
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn big_endian_baseline_tiff_decodes_to_rgba8() {
+        let decoded = decode_tiff_rgba8(baseline_gray_tiff(true, 1, 1, None)).unwrap();
+        assert_eq!((decoded.width, decoded.height), (1, 1));
+        assert_eq!(decoded.rgba, [0x7f, 0x7f, 0x7f, 0xff]);
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn malformed_tiff_ifd_and_strip_offsets_fail_closed() {
+        let mut truncated_ifd = baseline_gray_tiff(false, 1, 1, None);
+        truncated_ifd.truncate(19);
+        assert_eq!(
+            decode_tiff_rgba8(truncated_ifd).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+
+        let out_of_range_strip = baseline_gray_tiff(false, 1, 1, Some(u32::MAX));
+        assert_eq!(
+            decode_tiff_rgba8(out_of_range_strip).unwrap_err().code,
+            error_code::CORRUPT_IMAGE
+        );
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn declared_oversized_tiff_dimensions_fail_before_strip_read() {
+        let error =
+            decode_tiff_rgba8(baseline_gray_tiff(false, MAX_SIDE + 1, 1, None)).unwrap_err();
+        assert_eq!(error.code, "dimensions_exceeded");
+        assert_eq!(error.parameters["width"], serde_json::json!(MAX_SIDE + 1));
+        assert_eq!(error.parameters["height"], serde_json::json!(1));
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn tiff_icc_profile_over_limit_is_rejected_before_parsing() {
+        let oversized_profile = vec![0_u8; MAX_ICC_PROFILE_BYTES + 1];
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(Cursor::new(&mut bytes)).unwrap();
+            let mut image = encoder
+                .new_image::<tiff::encoder::colortype::RGBA8>(1, 1)
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(tiff::tags::Tag::IccProfile, oversized_profile.as_slice())
+                .unwrap();
+            image.write_data(&[1, 2, 3, 255]).unwrap();
+        }
+
+        assert_eq!(
+            decode_tiff_rgba8(bytes).unwrap_err().code,
+            "color_profile_too_large"
+        );
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn tiff_icc_profile_is_applied_before_rgba8_return() {
+        let source_profile = ColorProfile::new_display_p3().encode().unwrap();
+        let source_pixel = [32, 160, 224, 255];
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(Cursor::new(&mut bytes)).unwrap();
+            let mut image = encoder
+                .new_image::<tiff::encoder::colortype::RGBA8>(1, 1)
+                .unwrap();
+            image
+                .encoder()
+                .write_tag(tiff::tags::Tag::IccProfile, source_profile.as_slice())
+                .unwrap();
+            image.write_data(&source_pixel).unwrap();
+        }
+
+        let mut direct = tiff::decoder::Decoder::new(Cursor::new(bytes.as_slice())).unwrap();
+        assert_eq!(
+            direct.get_tag_u8_vec(tiff::tags::Tag::IccProfile).unwrap(),
+            source_profile
+        );
+        let decoded = decode_tiff_rgba8(bytes).unwrap();
+        let expected = [0_u8, 163, 230, 255];
+        assert_ne!(decoded.rgba, source_pixel);
+        assert!(
+            decoded
+                .rgba
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1),
+            "expected independent P3 reference {expected:?}, got {:?}",
+            decoded.rgba
+        );
+    }
+
+    #[cfg(feature = "tiff")]
+    #[test]
+    fn tiff_orientation_is_applied_before_rgba8_return() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("oriented.tiff");
         let mut bytes = Vec::new();
@@ -2064,11 +2528,10 @@ mod tests {
         }
         fs::write(&path, bytes).unwrap();
 
-        let decoded = decode_file(&path).unwrap();
+        let decoded = decode_tiff_file_rgba8(File::open(&path).unwrap()).unwrap();
         assert_eq!((decoded.width, decoded.height), (1, 2));
-        let image = image::load_from_memory(&decoded.bytes).unwrap().to_rgba8();
-        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
-        assert_eq!(image.get_pixel(0, 1).0, [0, 0, 255, 255]);
+        assert_eq!(&decoded.rgba[..4], &[255, 0, 0, 255]);
+        assert_eq!(&decoded.rgba[4..], &[0, 0, 255, 255]);
     }
 
     #[test]
@@ -2365,6 +2828,7 @@ mod tests {
         assert_eq!(rgba10, [512, 256, 64, 512, 0, 0, 0, 0]);
     }
 
+    #[cfg(feature = "tiff")]
     #[test]
     fn committed_two_page_tiff_uses_expected_first_page_dimensions() {
         let decoded = decode_file(&fixture("two-page.tiff")).unwrap();

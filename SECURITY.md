@@ -48,8 +48,9 @@ Private vulnerability reporting。
 [THREAT_MODEL.md](THREAT_MODEL.md)。任何 Capability、CSP、Tauri plugin、
 原生 codec 或輸入限制變更，都必須在 PR 中附上威脅分析與負向測試。
 
-HEIC／HEIF 原生解碼在私有 helper process 中執行。helper 只接受 broker
+TIFF 與 HEIC／HEIF 解碼在私有 helper process 中執行。helper 只接受 broker
 duplicated 的 read-only handle，受 768 MiB、單一 process、kill-on-close
 的 Windows Job Object 與每張 30 秒硬期限約束；timeout、crash 或 protocol
-錯誤後不會自動重試同一輸入。TIFF 與 WebView2 動畫解碼尚未具備同等硬
-隔離，仍是明確記錄的 DoS 殘餘風險。
+錯誤後不會自動重試同一輸入。回傳 RGBA8 的 safe Rust PNG 編碼會逐列檢查
+取消與剩餘期限，過期或 partial 結果不發布。WebView2 動畫解碼尚未具備同等硬隔離，
+仍是明確記錄的 DoS 殘餘風險。
