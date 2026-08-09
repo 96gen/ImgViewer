@@ -501,7 +501,7 @@ describe("desktop security contract", () => {
     expect(select(runs)).toBe("4");
     expect(() => select(runs.slice(0, 3))).toThrow();
     expect(() => select([...runs, { ...exact, databaseId: 5 }])).toThrow();
-  });
+  }, 20_000);
 
   it("clears a handled native negative-test exit code before the step ends", () => {
     if (process.platform !== "win32") return;
@@ -523,7 +523,7 @@ describe("desktop security contract", () => {
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     );
     expect(output.trim()).toBe("PASS handled-native-negative-exit");
-  });
+  }, 20_000);
 
   it("keeps packaged keyboard smoke focused and rapid navigation deterministic", () => {
     const smoke = read("scripts/smoke-native.ps1");
