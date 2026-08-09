@@ -5,6 +5,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Promotion 的唯讀驗證 job 改從成功的 tag workflow immutable artifact 取件，避免
+  GitHub `contents: read` token 無法查閱 draft Release；有 write 權限但不 checkout
+  原始碼的 publish job 仍會逐檔比對 draft digest 後才公開。
+
 ## [0.4.0] - 2026-08-09
 
 ### Added

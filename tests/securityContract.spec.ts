@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -430,6 +431,72 @@ describe("desktop security contract", () => {
         "pnpm/action-setup",
       ].sort(),
     );
+  });
+
+  it("verifies tag artifacts read-only before a no-checkout draft publish", () => {
+    const workflow = read(".github/workflows/portable-release.yml");
+    const verifyStart = workflow.indexOf("  verify-draft:");
+    const publishStart = workflow.indexOf("  publish-draft:");
+    expect(verifyStart).toBeGreaterThanOrEqual(0);
+    expect(publishStart).toBeGreaterThan(verifyStart);
+    const verifyJob = workflow.slice(verifyStart, publishStart);
+    const publishJob = workflow.slice(publishStart);
+
+    expect(verifyJob).toContain("actions: read");
+    expect(verifyJob).toContain("contents: read");
+    expect(verifyJob).toContain("attestations: read");
+    expect(verifyJob).not.toContain("contents: write");
+    expect(verifyJob).toContain("gh run download");
+    expect(verifyJob).not.toContain("gh release download");
+    expect(verifyJob).toContain("$workflowRunsJson = gh run list");
+    expect(verifyJob).toContain("./scripts/select-portable-tag-workflow-run.ps1");
+    expect(publishJob).toContain("contents: write");
+    expect(publishJob).not.toContain("actions/checkout@");
+    expect(publishJob).toContain("gh release download");
+    expect(publishJob).toContain("Get-FileHash");
+  });
+
+  it("flattens multi-run GitHub JSON before selecting the immutable tag run", () => {
+    if (process.platform !== "win32") return;
+
+    const exact = {
+      databaseId: 4,
+      headBranch: "v0.4.0",
+      headSha: "expected",
+      status: "completed",
+      conclusion: "success",
+    };
+    const runs = [
+      { ...exact, databaseId: 1, headBranch: "main" },
+      { ...exact, databaseId: 2, headSha: "other" },
+      { ...exact, databaseId: 3, conclusion: "failure" },
+      exact,
+    ];
+    const select = (input: object[]) =>
+      execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          join(root, "scripts/select-portable-tag-workflow-run.ps1"),
+          "-ReleaseTag",
+          "v0.4.0",
+          "-ExpectedCommit",
+          "expected",
+        ],
+        {
+          encoding: "utf8",
+          input: JSON.stringify(input),
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      ).trim();
+
+    expect(select(runs)).toBe("4");
+    expect(() => select(runs.slice(0, 3))).toThrow();
+    expect(() => select([...runs, { ...exact, databaseId: 5 }])).toThrow();
   });
 
   it("keeps packaged keyboard smoke focused and rapid navigation deterministic", () => {
