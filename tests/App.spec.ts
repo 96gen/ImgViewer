@@ -109,6 +109,50 @@ describe("App keyboard and navigation", () => {
     wrapper.unmount();
   });
 
+  it("delivers a rapid pair of ArrowRight events before either invoke resolves", async () => {
+    let resolveFirst!: (snapshot: Record<string, unknown>) => void;
+    let resolveSecond!: (snapshot: Record<string, unknown>) => void;
+    const first = new Promise<Record<string, unknown>>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const second = new Promise<Record<string, unknown>>((resolve) => {
+      resolveSecond = resolve;
+    });
+    bridgeMocks.navigate
+      .mockImplementationOnce(() => first)
+      .mockImplementationOnce(() => second);
+
+    const wrapper = mount(App, { attachTo: document.body });
+    await vi.waitFor(() => expect(wrapper.text()).toContain("broken.jpg"));
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }));
+    expect(bridgeMocks.navigate).toHaveBeenCalledTimes(2);
+    expect(bridgeMocks.navigate.mock.calls).toEqual([["next"], ["next"]]);
+
+    const { error: _discardedError, ...base } = bridgeMocks.initial;
+    resolveSecond({
+      ...base,
+      revision: 102,
+      generation: 7,
+      status: "loading",
+      fileName: "rapid-final.jpg",
+    });
+    await vi.waitFor(() => expect(wrapper.text()).toContain("rapid-final.jpg"));
+
+    resolveFirst({
+      ...base,
+      revision: 101,
+      generation: 6,
+      status: "loading",
+      fileName: "rapid-stale.jpg",
+    });
+    await Promise.resolve();
+    expect(wrapper.text()).toContain("rapid-final.jpg");
+    expect(wrapper.text()).not.toContain("rapid-stale.jpg");
+    wrapper.unmount();
+  });
+
   it("opens the dialog with Ctrl+O", async () => {
     const wrapper = mount(App, { attachTo: document.body });
     await vi.waitFor(() => expect(wrapper.text()).toContain("broken.jpg"));
@@ -338,7 +382,7 @@ describe("App keyboard and navigation", () => {
 
     await wrapper.get('button[aria-label="關於 ImgViewer"]').trigger("click");
     const dialog = wrapper.get('[role="dialog"]');
-    expect(dialog.text()).toContain("ImgViewer 0.2.2");
+    expect(dialog.text()).toContain("ImgViewer 0.4.0");
     expect(dialog.text()).toContain("不含遙測");
     expect(dialog.get("input").attributes("value")).toBe(
       "https://github.com/96gen/ImgViewer/releases",

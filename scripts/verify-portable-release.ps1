@@ -12,12 +12,50 @@ param(
     [switch]$RequireCleanSource,
     [switch]$SkipDllClosure,
     [switch]$RunNegativeTests,
-    [ValidateSet("None", "ChecksumMismatch", "MetadataVersionMismatch", "NativeHashMismatch", "MissingDll")]
+    [ValidateSet(
+        "None",
+        "ChecksumMismatch",
+        "MetadataVersionMismatch",
+        "NativeToolsetMismatch",
+        "NativeHashMismatch",
+        "MissingDll",
+        "MissingHelper",
+        "HelperHashMismatch",
+        "FaultHelperArtifact",
+        "TestHooksArtifact"
+    )]
     [string]$NegativeMode = "None"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+$forbiddenCodecFilePattern =
+    '^(?i:(?:lib)?(?:x265|aom|avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc))[^\\/]*\.(?:dll|exe)$'
+$forbiddenTestArtifactPattern = '(?i)(?:fault[-_]?helper|test[-_]?hooks?)'
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            [System.IO.Path]::GetFullPath($Path),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            return [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
 
 function Assert-SafeChildPath {
     param(
@@ -66,7 +104,7 @@ function Assert-ArtifactChecksum {
 
     $fileName = [System.IO.Path]::GetFileName($Artifact)
     $manifestHash = Read-ChecksumManifest -Path $Manifest -ExpectedFileName $fileName
-    $actualHash = (Get-FileHash -LiteralPath $Artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = (Get-Sha256Hex -Path $Artifact).ToLowerInvariant()
     if ($manifestHash -cne $actualHash) {
         throw "SHA-256 mismatch for $fileName. Manifest=$manifestHash Actual=$actualHash"
     }
@@ -147,8 +185,32 @@ function Assert-Metadata {
         [switch]$CleanSource
     )
 
-    if ([int]$Metadata.schemaVersion -ne 1) {
+    if ([int]$Metadata.schemaVersion -ne 3) {
         throw "Unsupported BUILD_METADATA schemaVersion: $($Metadata.schemaVersion)"
+    }
+    if ([string]$Metadata.codecIsolation.helperRole -cne "codec-helper") {
+        throw "BUILD_METADATA codecIsolation helperRole must be 'codec-helper'."
+    }
+    if ([int]$Metadata.codecIsolation.protocolVersion -ne 3) {
+        throw "BUILD_METADATA codecIsolation protocolVersion must be 3."
+    }
+    $isolatedFormats = @(
+        $Metadata.codecIsolation.isolatedFormats | ForEach-Object { [string]$_ }
+    )
+    if (($isolatedFormats -join ",") -cne "heif,tiff") {
+        throw "BUILD_METADATA codecIsolation isolatedFormats must be exactly heif,tiff."
+    }
+    $cargoFeatures = @(
+        $Metadata.codecIsolation.cargoFeatures | ForEach-Object { [string]$_ }
+    )
+    if (($cargoFeatures -join ",") -cne "heic,tiff") {
+        throw "BUILD_METADATA codecIsolation cargoFeatures must be exactly heic,tiff."
+    }
+    if ([long]$Metadata.codecIsolation.memoryLimitBytes -ne 805306368) {
+        throw "BUILD_METADATA codecIsolation memoryLimitBytes must be 805306368."
+    }
+    if ([int]$Metadata.codecIsolation.decodeDeadlineMs -ne 30000) {
+        throw "BUILD_METADATA codecIsolation decodeDeadlineMs must be 30000."
     }
     if ([string]$Metadata.application.name -cne "ImgViewer") {
         throw "BUILD_METADATA application name is not ImgViewer."
@@ -168,6 +230,9 @@ function Assert-Metadata {
     if ($CleanSource -and [bool]$Metadata.source.dirty) {
         throw "Release metadata reports a dirty source tree."
     }
+    if ([string]$Metadata.native.platformToolset -cne "v143") {
+        throw "BUILD_METADATA native platform toolset is not the pinned v143."
+    }
     if ($CleanSource) {
         $expectedNativeProvenance = [ordered]@{
             vcpkgReleaseTag = "2026.05.25"
@@ -184,6 +249,60 @@ function Assert-Metadata {
         }
         if ([string]::IsNullOrWhiteSpace([string]$Metadata.native.vcpkgToolVersion)) {
             throw "BUILD_METADATA does not report the pinned vcpkg-tool version."
+        }
+    }
+}
+
+function Assert-ExecutablePayloadHashes {
+    param(
+        [Parameter(Mandatory)] [psobject]$Metadata,
+        [Parameter(Mandatory)] [string]$StageDirectory
+    )
+
+    $executables = @($Metadata.executables)
+    if ($executables.Count -ne 2) {
+        throw "BUILD_METADATA must describe exactly the main and codec-helper executables."
+    }
+
+    $expectedFiles = [ordered]@{
+        "main" = "ImgViewer.exe"
+        "codec-helper" = "ImgViewer.CodecHelper.exe"
+    }
+    $seenRoles = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $protocolVersion = [int]$Metadata.codecIsolation.protocolVersion
+    foreach ($item in $executables) {
+        $role = [string]$item.role
+        if (-not $expectedFiles.Contains($role) -or -not $seenRoles.Add($role)) {
+            throw "BUILD_METADATA contains an invalid or duplicate executable role: $role"
+        }
+        $fileName = [string]$item.fileName
+        if ($fileName -cne [string]$expectedFiles[$role]) {
+            throw "BUILD_METADATA executable '$role' must name '$($expectedFiles[$role])'."
+        }
+        $itemProtocolVersion = [int]$item.protocolVersion
+        if ($itemProtocolVersion -ne $protocolVersion) {
+            throw "BUILD_METADATA executable '$role' protocol version does not match codecIsolation."
+        }
+
+        $expectedHash = ([string]$item.sha256).ToUpperInvariant()
+        if ($expectedHash -notmatch '^[0-9A-F]{64}$') {
+            throw "BUILD_METADATA contains an invalid executable SHA-256 for $fileName."
+        }
+        $payloadPath = Join-Path $StageDirectory $fileName
+        if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
+            throw "Executable payload named by BUILD_METADATA is missing: $fileName"
+        }
+        $actualHash = (Get-Sha256Hex -Path $payloadPath).ToUpperInvariant()
+        if ($actualHash -cne $expectedHash) {
+            throw "Executable payload hash mismatch for $fileName. Metadata=$expectedHash Actual=$actualHash"
+        }
+    }
+
+    foreach ($role in $expectedFiles.Keys) {
+        if (-not $seenRoles.Contains($role)) {
+            throw "BUILD_METADATA is missing executable role: $role"
         }
     }
 }
@@ -218,7 +337,7 @@ function Assert-NativePayloadHashes {
         if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
             throw "Native payload named by BUILD_METADATA is missing: $fileName"
         }
-        $actualHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
+        $actualHash = (Get-Sha256Hex -Path $payloadPath).ToUpperInvariant()
         if ($actualHash -cne $expectedHash) {
             throw "Native payload hash mismatch for $fileName. Metadata=$expectedHash Actual=$actualHash"
         }
@@ -235,6 +354,8 @@ function Invoke-DllClosure {
 
     $resolver = Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1"
     & $resolver -StageDirectory $StageDirectory -RequireBundledMsvcRuntime | Out-Null
+    $boundary = Join-Path $PSScriptRoot "Assert-CodecBinaryBoundary.ps1"
+    & $boundary -StageDirectory $StageDirectory | Out-Null
 }
 
 function Assert-ExpectedFailure {
@@ -260,12 +381,22 @@ function Assert-NoForbiddenCodecEntries {
 
     $forbiddenEntries = @(
         $EntryNames | Where-Object {
-            [System.IO.Path]::GetFileName($_) -match
-                '^(?:lib)?(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
+            [System.IO.Path]::GetFileName($_) -match $forbiddenCodecFilePattern
         }
     )
     if ($forbiddenEntries.Count -gt 0) {
         throw "ZIP verification found a forbidden codec: $($forbiddenEntries -join ', ')"
+    }
+}
+
+function Assert-NoForbiddenTestArtifactEntries {
+    param([Parameter(Mandatory)] [string[]]$EntryNames)
+
+    $forbiddenEntries = @(
+        $EntryNames | Where-Object { $_ -match $forbiddenTestArtifactPattern }
+    )
+    if ($forbiddenEntries.Count -gt 0) {
+        throw "Portable artifact contains a fault-helper or test-hooks artifact: $($forbiddenEntries -join ', ')"
     }
 }
 
@@ -316,8 +447,26 @@ try {
     try {
         Assert-ZipEntrySafety -Archive $archive -ExpectedRoot $artifactRoot
         $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+        if ($NegativeMode -eq "FaultHelperArtifact") {
+            Assert-ExpectedFailure -Name "fault-helper-artifact" -Operation {
+                Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                    "$artifactRoot/ImgViewer.CodecFaultHelper.exe"
+                )
+            }
+            return
+        }
+        if ($NegativeMode -eq "TestHooksArtifact") {
+            Assert-ExpectedFailure -Name "test-hooks-artifact" -Operation {
+                Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                    "$artifactRoot/ImgViewer.CodecHelper.test-hooks.exe"
+                )
+            }
+            return
+        }
+        Assert-NoForbiddenTestArtifactEntries -EntryNames $entryNames
         foreach ($requiredEntry in @(
             "$artifactRoot/ImgViewer.exe",
+            "$artifactRoot/ImgViewer.CodecHelper.exe",
             "$artifactRoot/heif.dll",
             "$artifactRoot/libde265.dll",
             "$artifactRoot/LICENSE",
@@ -352,10 +501,20 @@ try {
         }
         return
     }
+    if ($NegativeMode -eq "NativeToolsetMismatch") {
+        $metadata.native.platformToolset = "v145"
+        Assert-ExpectedFailure -Name "native-toolset-mismatch" -Operation {
+            Assert-Metadata -Metadata $metadata -ArtifactFileName $artifactFileName `
+                -Version $metadataVersion -Commit $ExpectedCommit -Tag $ExpectedTag `
+                -CleanSource:$RequireCleanSource
+        }
+        return
+    }
 
     Assert-Metadata -Metadata $metadata -ArtifactFileName $artifactFileName `
         -Version $metadataVersion -Commit $ExpectedCommit -Tag $ExpectedTag `
         -CleanSource:$RequireCleanSource
+    Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $stageDirectory
     Assert-NativePayloadHashes -Metadata $metadata -StageDirectory $stageDirectory
 
     if ($MetadataPath) {
@@ -363,8 +522,8 @@ try {
         if (-not (Test-Path -LiteralPath $MetadataPath -PathType Leaf)) {
             throw "BUILD_METADATA sidecar does not exist: $MetadataPath"
         }
-        $insideHash = (Get-FileHash -LiteralPath $insideMetadataPath -Algorithm SHA256).Hash
-        $outsideHash = (Get-FileHash -LiteralPath $MetadataPath -Algorithm SHA256).Hash
+        $insideHash = Get-Sha256Hex -Path $insideMetadataPath
+        $outsideHash = Get-Sha256Hex -Path $MetadataPath
         if ($insideHash -cne $outsideHash) {
             throw "BUILD_METADATA sidecar differs from the copy inside the ZIP."
         }
@@ -397,6 +556,36 @@ try {
         }
         return
     }
+    if ($NegativeMode -eq "MissingHelper") {
+        $negativeStage = Join-Path $temporaryRoot "missing-helper"
+        Copy-Item -LiteralPath $stageDirectory -Destination $negativeStage -Recurse
+        Remove-Item -LiteralPath (
+            Join-Path $negativeStage "ImgViewer.CodecHelper.exe"
+        ) -Force
+        Assert-ExpectedFailure -Name "missing-helper" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $negativeStage
+        }
+        return
+    }
+    if ($NegativeMode -eq "HelperHashMismatch") {
+        $negativeStage = Join-Path $temporaryRoot "helper-hash-mismatch"
+        Copy-Item -LiteralPath $stageDirectory -Destination $negativeStage -Recurse
+        $tamperedPath = Join-Path $negativeStage "ImgViewer.CodecHelper.exe"
+        $stream = [System.IO.File]::Open(
+            $tamperedPath,
+            [System.IO.FileMode]::Append,
+            [System.IO.FileAccess]::Write
+        )
+        try {
+            $stream.WriteByte(0)
+        } finally {
+            $stream.Dispose()
+        }
+        Assert-ExpectedFailure -Name "helper-hash-mismatch" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $negativeStage
+        }
+        return
+    }
 
     if (-not $SkipDllClosure) {
         Invoke-DllClosure -StageDirectory $stageDirectory
@@ -409,6 +598,16 @@ try {
                 "$artifactRoot/libx265.dll"
             )
         }
+        Assert-ExpectedFailure -Name "fault-helper-artifact" -Operation {
+            Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                "$artifactRoot/ImgViewer.CodecFaultHelper.exe"
+            )
+        }
+        Assert-ExpectedFailure -Name "test-hooks-artifact" -Operation {
+            Assert-NoForbiddenTestArtifactEntries -EntryNames @(
+                "$artifactRoot/ImgViewer.CodecHelper.test-hooks.exe"
+            )
+        }
         Assert-ExpectedFailure -Name "checksum-mismatch" -Operation {
             Assert-ArtifactChecksum -Artifact $ArtifactPath -Manifest $ChecksumPath `
                 -IndependentExpectedHash ("0" * 64) | Out-Null
@@ -418,6 +617,14 @@ try {
                 -Version "999.999.999" -Commit $ExpectedCommit -Tag $ExpectedTag `
                 -CleanSource:$RequireCleanSource
         }
+        $originalPlatformToolset = [string]$metadata.native.platformToolset
+        $metadata.native.platformToolset = "v145"
+        Assert-ExpectedFailure -Name "native-toolset-mismatch" -Operation {
+            Assert-Metadata -Metadata $metadata -ArtifactFileName $artifactFileName `
+                -Version $ExpectedVersion -Commit $ExpectedCommit -Tag $ExpectedTag `
+                -CleanSource:$RequireCleanSource
+        }
+        $metadata.native.platformToolset = $originalPlatformToolset
         $negativeHashStage = Join-Path $temporaryRoot "native-hash-mismatch"
         Copy-Item -LiteralPath $stageDirectory -Destination $negativeHashStage -Recurse
         $tamperedPath = Join-Path $negativeHashStage "heif.dll"
@@ -430,6 +637,30 @@ try {
         Assert-ExpectedFailure -Name "native-hash-mismatch" -Operation {
             Assert-NativePayloadHashes -Metadata $metadata -StageDirectory $negativeHashStage
         }
+        $missingHelperStage = Join-Path $temporaryRoot "missing-helper"
+        Copy-Item -LiteralPath $stageDirectory -Destination $missingHelperStage -Recurse
+        Remove-Item -LiteralPath (
+            Join-Path $missingHelperStage "ImgViewer.CodecHelper.exe"
+        ) -Force
+        Assert-ExpectedFailure -Name "missing-helper" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $missingHelperStage
+        }
+        $helperHashStage = Join-Path $temporaryRoot "helper-hash-mismatch"
+        Copy-Item -LiteralPath $stageDirectory -Destination $helperHashStage -Recurse
+        $tamperedHelper = Join-Path $helperHashStage "ImgViewer.CodecHelper.exe"
+        $stream = [System.IO.File]::Open(
+            $tamperedHelper,
+            [System.IO.FileMode]::Append,
+            [System.IO.FileAccess]::Write
+        )
+        try {
+            $stream.WriteByte(0)
+        } finally {
+            $stream.Dispose()
+        }
+        Assert-ExpectedFailure -Name "helper-hash-mismatch" -Operation {
+            Assert-ExecutablePayloadHashes -Metadata $metadata -StageDirectory $helperHashStage
+        }
         if (-not $SkipDllClosure) {
             $negativeStage = Join-Path $temporaryRoot "missing-dll"
             Copy-Item -LiteralPath $stageDirectory -Destination $negativeStage -Recurse
@@ -440,7 +671,7 @@ try {
         }
     }
 
-    Write-Host "PASS portable-integrity version=$ExpectedVersion sha256=$artifactHash dll-closure=$(-not $SkipDllClosure)"
+    Write-Host "PASS portable-integrity version=$ExpectedVersion sha256=$artifactHash helper=verified dll-closure=$(-not $SkipDllClosure)"
     Write-Output $artifactHash
 } finally {
     if (Test-Path -LiteralPath $temporaryRoot) {

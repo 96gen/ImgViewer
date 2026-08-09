@@ -18,6 +18,10 @@ function filesBelow(path: string): string[] {
   });
 }
 
+function beforeTestModule(source: string) {
+  return source.split(/\r?\n#\[cfg\(test\)\]\r?\n/)[0];
+}
+
 describe("desktop security contract", () => {
   it("keeps the main window capability on an exact least-privilege allowlist", () => {
     const capability = JSON.parse(read("src-tauri/capabilities/main.json"));
@@ -119,6 +123,198 @@ describe("desktop security contract", () => {
     }
   });
 
+  it("keeps the private codec helper workspace isolated from desktop capabilities", () => {
+    const cargoManifest = read("src-tauri/Cargo.toml");
+    const workspaceSection = cargoManifest
+      .split("[workspace]")[1]
+      .split(/\r?\n\[/)[0];
+    const workspaceMembers = [
+      ...workspaceSection.matchAll(
+        /"(crates\/codec-(?:core|helper|protocol))"/g,
+      ),
+    ].map((match) => match[1]);
+    expect(workspaceMembers.sort()).toEqual([
+      "crates/codec-core",
+      "crates/codec-helper",
+      "crates/codec-protocol",
+    ]);
+    expect(cargoManifest).toContain('default-members = ["."]');
+
+    const coreManifest = read("src-tauri/crates/codec-core/Cargo.toml");
+    const protocolManifest = read(
+      "src-tauri/crates/codec-protocol/Cargo.toml",
+    );
+    const helperManifest = read("src-tauri/crates/codec-helper/Cargo.toml");
+    const rootDependencySection = cargoManifest
+      .split("[dependencies]")[1]
+      .split(/\r?\n\[/)[0];
+    const coreDependencySection = coreManifest
+      .split("[dependencies]")[1]
+      .split(/\r?\n\[/)[0];
+    const coreDependencies = [
+      ...coreDependencySection.matchAll(/^([a-z0-9_-]+)\s*=/gm),
+    ].map((match) => match[1]);
+    expect(coreDependencies).toEqual([
+      "image",
+      "libheif-rs",
+      "libheif-sys",
+      "moxcms",
+      "png",
+      "serde",
+      "serde_json",
+    ]);
+    expect(rootDependencySection).not.toMatch(/^libheif-(?:rs|sys)\s*=/m);
+    expect(coreManifest).toMatch(
+      /^libheif-rs\s*=\s*\{[^}]*optional\s*=\s*true[^}]*\}$/m,
+    );
+    expect(coreManifest).toMatch(
+      /^libheif-sys\s*=\s*\{[^}]*optional\s*=\s*true[^}]*\}$/m,
+    );
+    const helperDependencySection = helperManifest
+      .split("[dependencies]")[1]
+      .split(/\r?\n\[/)[0];
+    const helperDependencies = [
+      ...helperDependencySection.matchAll(/^([a-z0-9_-]+)\s*=/gm),
+    ].map((match) => match[1]);
+    expect(helperDependencies).toEqual([
+      "imgviewer-codec-core",
+      "imgviewer-codec-protocol",
+    ]);
+
+    const protocolSource = read(
+      "src-tauri/crates/codec-protocol/src/lib.rs",
+    );
+    const helperLibrary = read("src-tauri/crates/codec-helper/src/lib.rs");
+    const helperMain = read("src-tauri/crates/codec-helper/src/main.rs");
+    const helperHandleAdapter = read(
+      "src-tauri/crates/codec-helper/src/windows_handle.rs",
+    );
+    const helperSource = [
+      protocolSource,
+      helperLibrary,
+      helperMain,
+      helperHandleAdapter,
+    ].join("\n");
+    expect(protocolSource).toContain("#![forbid(unsafe_code)]");
+    expect(helperMain).toContain("#![forbid(unsafe_code)]");
+    expect(helperLibrary).toContain("#![deny(unsafe_code)]");
+    expect(helperLibrary).toMatch(
+      /#\[allow\(\s*unsafe_code,\s*reason = "the explicit Windows handle adapter owns all transferred raw handles"\s*\)\]\s*mod windows_handle;/,
+    );
+    expect(
+      `${coreManifest}\n${protocolManifest}\n${helperManifest}\n${helperSource}`,
+    ).not.toMatch(
+      /\b(?:tauri|reqwest|hyper|ureq|curl|tokio|async_std|smol)\b|https?:\/\/|std::process::Command|cmd\.exe|powershell/i,
+    );
+    const helperProductionSource = [
+      beforeTestModule(helperLibrary),
+      helperMain,
+      beforeTestModule(helperHandleAdapter),
+    ].join("\n");
+    expect(helperProductionSource).not.toMatch(
+      /\b(?:Path|PathBuf|OpenOptions)\b|File::open/,
+    );
+    expect(helperProductionSource).toContain(
+      "File::from_raw_handle(handle)",
+    );
+    expect(helperProductionSource).toContain(
+      "take_disk_file(request.duplicated_handle, request.expected_length)",
+    );
+    expect(helperSource).toContain("validate_cli_arguments(std::env::args_os())");
+    expect(helperSource).toContain("CliError::UnexpectedArgument");
+
+    const ci = read(".github/workflows/ci.yml");
+    for (const command of [
+      ...ci.matchAll(/run:\s*(cargo (?:clippy|test)[^\r\n]*)/g),
+    ].map((match) => match[1])) {
+      expect(command, `Workspace crate 未納入 CI：${command}`).toContain(
+        "--workspace",
+      );
+    }
+  });
+
+  it("pins native codec builds and packaged runtimes to MSVC v143", () => {
+    const triplet = read("vcpkg-triplets/x64-windows.cmake");
+    const configuration = JSON.parse(read("vcpkg-configuration.json"));
+    const installer = read("scripts/install-native-deps.ps1");
+    const build = read("scripts/build-portable.ps1");
+    const dependencyResolver = read(
+      "scripts/Resolve-NativeDependencies.ps1",
+    );
+    const releaseWorkflow = read(".github/workflows/portable-release.yml");
+
+    expect(configuration["overlay-triplets"]).toEqual([
+      "vcpkg-triplets",
+    ]);
+    expect(triplet).toMatch(
+      /^set\(VCPKG_PLATFORM_TOOLSET v143\)$/m,
+    );
+    expect(triplet).toMatch(/^set\(VCPKG_CRT_LINKAGE dynamic\)$/m);
+    expect(triplet).toMatch(/^set\(VCPKG_LIBRARY_LINKAGE dynamic\)$/m);
+    expect(installer).toContain('"--overlay-triplets=$overlayTriplets"');
+    expect(installer).toContain(
+      "VCPKG_PLATFORM_TOOLSET\\s+v143",
+    );
+    expect(build).toContain('"Microsoft.VC143.CRT"');
+    expect(build).toContain("& $vswhere -all -products *");
+    expect(build).toContain('platformToolset = "v143"');
+    expect(build).toContain("app-local=1");
+    expect(dependencyResolver).toContain('"Microsoft.VC143.CRT"');
+    expect(dependencyResolver).toContain("& $vswhere -all -products *");
+    expect(releaseWorkflow).toContain(
+      "'vcpkg-configuration.json', 'vcpkg-triplets/**'",
+    );
+  });
+
+  it("keeps unsafe Rust inside reviewed Win32 and codec FFI adapters", () => {
+    const rustPaths = [
+      ...filesBelow("src-tauri/src"),
+      ...filesBelow("src-tauri/crates"),
+    ].filter((path) => path.endsWith(".rs"));
+    const unsafeFiles = rustPaths
+      .filter((path) => /\bunsafe\s*(?:\{|extern\b)/.test(read(path)))
+      .map((path) => path.replaceAll("\\", "/"))
+      .sort();
+    expect(unsafeFiles).toEqual(
+      [
+        "src-tauri/crates/codec-core/src/heif_ffi_adapter.rs",
+        "src-tauri/crates/codec-helper/src/windows_handle.rs",
+        "src-tauri/src/catalog.rs",
+        "src-tauri/src/codec_helper/windows.rs",
+        "src-tauri/src/window.rs",
+      ].sort(),
+    );
+
+    for (const path of unsafeFiles) {
+      const lines = read(path).split(/\r?\n/);
+      for (const [index, line] of lines.entries()) {
+        if (!/\bunsafe\s*(?:\{|extern\b)/.test(line)) {
+          continue;
+        }
+        const safetyContext = lines
+          .slice(Math.max(0, index - 4), index)
+          .join("\n");
+        expect(
+          safetyContext,
+          `${path}:${index + 1} 缺少就近 SAFETY 理由`,
+        ).toContain("SAFETY:");
+      }
+    }
+
+    expect(read("src-tauri/src/lib.rs")).toContain(
+      "#![deny(unsafe_code)]",
+    );
+    expect(read("src-tauri/crates/codec-core/src/lib.rs")).toContain(
+      "#![deny(unsafe_code)]",
+    );
+    expect(read("src-tauri/crates/codec-helper/src/lib.rs")).toContain(
+      "#![deny(unsafe_code)]",
+    );
+    expect(read("src-tauri/crates/codec-protocol/src/lib.rs")).toContain(
+      "#![forbid(unsafe_code)]",
+    );
+  });
+
   it("pins the local and CI toolchains and uses locked Cargo graphs", () => {
     expect(read(".node-version").trim()).toBe("24.18.0");
     const rustToolchain = read("rust-toolchain.toml");
@@ -166,7 +362,7 @@ describe("desktop security contract", () => {
     expect(portableBuild).toContain("Get-MsvcRedistDirectories");
     expect(portableBuild).toContain("Assert-NativeLibraryLoadable");
     expect(portableBuild).toContain(
-      "PASS native-test-loader dlls=2 msvc-runtime=explicit",
+      "PASS native-test-loader dlls=2 msvc-runtime=v143 app-local=1",
     );
     const portableVerify = read("scripts/verify-portable-release.ps1");
     expect(portableVerify).toContain('"$artifactRoot/libx265.dll"');
@@ -176,7 +372,10 @@ describe("desktop security contract", () => {
   });
 
   it("preserves hard image and allocation limits in the Rust core", () => {
-    const rust = filesBelow("src-tauri/src")
+    const rust = [
+      ...filesBelow("src-tauri/src"),
+      ...filesBelow("src-tauri/crates/codec-core/src"),
+    ]
       .filter((path) => path.endsWith(".rs"))
       .map(read)
       .join("\n");
@@ -233,11 +432,17 @@ describe("desktop security contract", () => {
     );
   });
 
-  it("keeps packaged keyboard smoke away from the native title bar", () => {
+  it("keeps packaged keyboard smoke focused and rapid navigation deterministic", () => {
     const smoke = read("scripts/smoke-native.ps1");
     expect(smoke).not.toContain("[int]($rect.Top + 14)");
     expect(smoke).toContain(
       "[int][Math]::Floor(($rect.Top + $rect.Bottom) / 2)",
     );
+    expect(smoke).toContain("function Invoke-ViewerNavigationBurst");
+    expect(smoke).toContain(
+      "PASS rapid-navigation final=10.jpg trigger=uia-burst count=2 rect=unchanged",
+    );
+    expect(smoke).toContain("uia-images=[$imageSummary]");
+    expect(smoke).toContain("uia-text=[$textSummary]");
   });
 });

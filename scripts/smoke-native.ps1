@@ -27,11 +27,19 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
 public static class ImgViewerNativeSmoke
 {
+    public sealed class ProcessIdentity
+    {
+        public uint ProcessId { get; set; }
+        public uint ParentProcessId { get; set; }
+        public string Name { get; set; }
+    }
+
     public delegate bool EnumWindowsCallback(IntPtr hwnd, IntPtr state);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -42,6 +50,26 @@ public static class ImgViewerNativeSmoke
         public int Right;
         public int Bottom;
     }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry32
+    {
+        public uint Size;
+        public uint Usage;
+        public uint ProcessId;
+        public IntPtr DefaultHeapId;
+        public uint ModuleId;
+        public uint Threads;
+        public uint ParentProcessId;
+        public int BasePriority;
+        public uint Flags;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string ExeFile;
+    }
+
+    private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
+    private const uint SnapshotProcesses = 0x00000002;
 
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr state);
@@ -80,6 +108,18 @@ public static class ImgViewerNativeSmoke
 
     [DllImport("user32.dll")]
     private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool Process32FirstW(IntPtr snapshot, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool Process32NextW(IntPtr snapshot, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
 
     public static void LeftClick(int x, int y)
     {
@@ -126,6 +166,48 @@ public static class ImgViewerNativeSmoke
             throw new InvalidOperationException("GetWindowRect failed.");
         return rect;
     }
+
+    public static ProcessIdentity[] ReadDirectChildren(uint expectedParentProcessId)
+    {
+        IntPtr snapshot = CreateToolhelp32Snapshot(SnapshotProcesses, 0);
+        if (snapshot == InvalidHandleValue)
+            throw new InvalidOperationException(
+                "CreateToolhelp32Snapshot failed with Win32 error " +
+                Marshal.GetLastWin32Error() + "."
+            );
+
+        var result = new List<ProcessIdentity>();
+        try
+        {
+            var entry = new ProcessEntry32();
+            entry.Size = (uint)Marshal.SizeOf(typeof(ProcessEntry32));
+            if (!Process32FirstW(snapshot, ref entry))
+                throw new InvalidOperationException(
+                    "Process32FirstW failed with Win32 error " +
+                    Marshal.GetLastWin32Error() + "."
+                );
+
+            do
+            {
+                if (entry.ParentProcessId == expectedParentProcessId)
+                {
+                    result.Add(new ProcessIdentity
+                    {
+                        ProcessId = entry.ProcessId,
+                        ParentProcessId = entry.ParentProcessId,
+                        Name = entry.ExeFile
+                    });
+                }
+                entry.Size = (uint)Marshal.SizeOf(typeof(ProcessEntry32));
+            }
+            while (Process32NextW(snapshot, ref entry));
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+        return result.ToArray();
+    }
 }
 '@
 
@@ -143,22 +225,174 @@ function Wait-Until {
     throw $FailureMessage
 }
 
+function Get-DirectCodecHelpers {
+    param([Parameter(Mandatory = $true)][int]$RootProcessId)
+
+    return @(
+        [ImgViewerNativeSmoke]::ReadDirectChildren([uint32]$RootProcessId) |
+            Where-Object {
+                [string]::Equals(
+                    [string]$_.Name,
+                    'ImgViewer.CodecHelper.exe',
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )
+}
+
+function Wait-SingleCodecHelper {
+    param([Parameter(Mandatory = $true)][int]$RootProcessId)
+
+    return Wait-Until `
+        -FailureMessage "Timed out waiting for the unique direct codec helper child of ImgViewer PID $RootProcessId." `
+        -Condition {
+            $helpers = @(Get-DirectCodecHelpers -RootProcessId $RootProcessId)
+            if ($helpers.Count -gt 1) {
+                $ids = @($helpers | ForEach-Object { $_.ProcessId })
+                throw "ImgViewer PID $RootProcessId has multiple direct codec helpers: $($ids -join ', ')."
+            }
+            if ($helpers.Count -eq 1) {
+                return $helpers[0]
+            }
+            return $null
+        }
+}
+
+function Assert-PersistentCodecHelper {
+    param(
+        [Parameter(Mandatory = $true)][int]$RootProcessId,
+        [Parameter(Mandatory = $true)][int]$ExpectedProcessId
+    )
+
+    $helper = Wait-SingleCodecHelper -RootProcessId $RootProcessId
+    if ([int]$helper.ProcessId -ne $ExpectedProcessId) {
+        throw (
+            "Codec helper was replaced between isolated-format decodes: " +
+            "expected PID $ExpectedProcessId; found PID $($helper.ProcessId)."
+        )
+    }
+    return $helper
+}
+
+function Test-CodecHelperProcessRunning {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $candidate = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    return (
+        $null -ne $candidate -and
+        [string]::Equals(
+            [string]$candidate.ProcessName,
+            'ImgViewer.CodecHelper',
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    )
+}
+
+function Assert-CodecHelperExecutablePath {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][string]$ExpectedPath
+    )
+
+    $candidate = Get-Process -Id $ProcessId -ErrorAction Stop
+    $actualPath = [IO.Path]::GetFullPath([string]$candidate.Path)
+    $expectedFullPath = [IO.Path]::GetFullPath($ExpectedPath)
+    if (-not [string]::Equals(
+            $actualPath,
+            $expectedFullPath,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw (
+            "Codec helper PID $ProcessId was not launched from the packaged sibling: " +
+            "expected '$expectedFullPath'; found '$actualPath'."
+        )
+    }
+}
+
 function Wait-Image {
     param([IntPtr]$Window, [string]$Name)
-    return Wait-Until -FailureMessage "Timed out waiting for rendered image '$Name'." -Condition {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastError = $null
+    do {
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
+            if ($null -ne $root) {
+                $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::NameProperty,
+                    $Name
+                )
+                $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Image
+                )
+                $condition = [System.Windows.Automation.AndCondition]::new(
+                    $nameCondition,
+                    $typeCondition
+                )
+                $image = $root.FindFirst(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    $condition
+                )
+                if ($null -ne $image) {
+                    return $image
+                }
+            }
+        }
+        catch {
+            # WebView2 can replace its child HWND while the native window is
+            # already visible. Treat that short UIA gap as not-ready.
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    $imageNames = @()
+    $textNames = @()
+    try {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($Window)
-        if ($null -eq $root) { return $null }
-        $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::NameProperty,
-            $Name
-        )
-        $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Image
-        )
-        $condition = [System.Windows.Automation.AndCondition]::new($nameCondition, $typeCondition)
-        $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if ($null -ne $root) {
+            $imageType = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Image
+            )
+            $images = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $imageType
+            )
+            for ($index = 0; $index -lt $images.Count; $index++) {
+                $candidateName = [string]$images.Item($index).Current.Name
+                if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
+                    $imageNames += $candidateName
+                }
+            }
+
+            $textType = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Text
+            )
+            $texts = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $textType
+            )
+            for ($index = 0; $index -lt $texts.Count; $index++) {
+                $candidateName = [string]$texts.Item($index).Current.Name
+                if (-not [string]::IsNullOrWhiteSpace($candidateName)) {
+                    $textNames += $candidateName
+                }
+            }
+        }
     }
+    catch {
+        $lastError = $_.Exception.Message
+    }
+
+    $imageSummary = @($imageNames | Select-Object -Unique) -join ', '
+    $textSummary = @($textNames | Select-Object -Unique -First 20) -join ', '
+    throw (
+        "Timed out waiting for rendered image '$Name'; " +
+        "uia-images=[$imageSummary]; uia-text=[$textSummary]; " +
+        "last-uia-error='$lastError'."
+    )
 }
 
 function Get-ViewerImages {
@@ -453,6 +687,29 @@ function Navigate-Viewer {
     }
 }
 
+function Invoke-ViewerNavigationBurst {
+    param(
+        [IntPtr]$Window,
+        [ValidateSet('previous', 'next')] [string]$Direction,
+        [ValidateRange(1, 100)] [int]$Count
+    )
+
+    $buttonName = if ($Direction -eq 'previous') {
+        ([char[]](0x4E0A, 0x4E00, 0x5F35) -join '')
+    }
+    else {
+        ([char[]](0x4E0B, 0x4E00, 0x5F35) -join '')
+    }
+    $button = Wait-Control $Window $buttonName ([System.Windows.Automation.ControlType]::Button)
+    if (-not $button.Current.IsEnabled) {
+        throw "Viewer button '$buttonName' was disabled before the rapid navigation burst."
+    }
+    $invokePattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    for ($step = 0; $step -lt $Count; $step++) {
+        $invokePattern.Invoke()
+    }
+}
+
 function Begin-ViewerNavigation {
     param(
         [IntPtr]$Window,
@@ -627,11 +884,22 @@ function Assert-SameRect {
 }
 
 $executablePath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Executable).Path)
+$helperExecutablePath = Join-Path (
+    [IO.Path]::GetDirectoryName($executablePath)
+) 'ImgViewer.CodecHelper.exe'
+if (-not [IO.File]::Exists($helperExecutablePath)) {
+    throw "Packaged codec helper is missing beside ImgViewer.exe: $helperExecutablePath"
+}
 $fixturePath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $FixtureDirectory).Path)
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $smokeDirectory = Join-Path $tempRoot ("ImgViewer-native-smoke-" + [Guid]::NewGuid().ToString('N'))
 $process = $null
 $window = [IntPtr]::Zero
+$helperProcessId = $null
+$helperProcessIds = @()
+$helperPersistenceVerified = $false
+$helperCleanupFailure = $null
+$nativeSmokeCompleted = $false
 
 try {
     [IO.Directory]::CreateDirectory($smokeDirectory) | Out-Null
@@ -764,9 +1032,32 @@ try {
             @{ Name = 'single.heif'; Format = 'HEIF' }
         )) {
             Open-ThroughExistingInstance (Join-Path $formatDirectory $case.Name) $window | Out-Null
+            if ($case.Format -eq 'TIFF') {
+                $helper = Wait-SingleCodecHelper -RootProcessId $process.Id
+                $helperProcessId = [int]$helper.ProcessId
+                $helperProcessIds = @($helperProcessId)
+                Assert-CodecHelperExecutablePath `
+                    -ProcessId $helperProcessId `
+                    -ExpectedPath $helperExecutablePath
+            }
+            elseif ($case.Format -in @('HEIC', 'HEIF')) {
+                if ($null -eq $helperProcessId) {
+                    throw "$($case.Format) decoded before the TIFF helper PID was captured."
+                }
+                Assert-PersistentCodecHelper `
+                    -RootProcessId $process.Id `
+                    -ExpectedProcessId $helperProcessId | Out-Null
+                if ($case.Format -eq 'HEIF') {
+                    $helperPersistenceVerified = $true
+                }
+            }
             Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) "$($case.Format) handoff"
             Write-Output "PASS format=$($case.Format) file=$($case.Name) rect=unchanged"
         }
+        if (-not $helperPersistenceVerified) {
+            throw 'The TIFF-to-HEIC-to-HEIF codec helper persistence check did not run.'
+        }
+        $nativeSmokeCompleted = $true
         Write-Output 'PASS handoff-format-smoke formats=7 animations-opened=2 rect=unchanged webdriver=absent'
         return
     }
@@ -788,15 +1079,15 @@ try {
     Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) 'end-stop navigation'
     Write-Output 'PASS end-stop file=10.jpg rect=unchanged'
 
-    Navigate-Viewer $window 'previous' 2
+    Invoke-ViewerNavigationBurst $window 'previous' 2
     Wait-Image $window '1.jpg' | Out-Null
-    Navigate-Viewer $window 'next' 2
+    Invoke-ViewerNavigationBurst $window 'next' 2
     $rapidImage = Wait-Image $window '10.jpg'
     if (-not $SkipPixelChecks) {
         Wait-DominantColor $window $rapidImage 'blue' 'rapid latest-wins navigation' | Out-Null
     }
     Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) 'rapid latest-wins navigation'
-    Write-Output 'PASS rapid-navigation final=10.jpg rect=unchanged'
+    Write-Output 'PASS rapid-navigation final=10.jpg trigger=uia-burst count=2 rect=unchanged'
 
     $continuityOldImage = Open-ThroughExistingInstance $continuityRedPath $window
     if (-not $SkipPixelChecks) {
@@ -822,8 +1113,30 @@ try {
         @{ Name = 'single.heif'; Format = 'HEIF' }
     )) {
         $image = Open-ThroughExistingInstance (Join-Path $formatDirectory $case.Name) $window
+        if ($case.Format -eq 'TIFF') {
+            $helper = Wait-SingleCodecHelper -RootProcessId $process.Id
+            $helperProcessId = [int]$helper.ProcessId
+            $helperProcessIds = @($helperProcessId)
+            Assert-CodecHelperExecutablePath `
+                -ProcessId $helperProcessId `
+                -ExpectedPath $helperExecutablePath
+        }
+        elseif ($case.Format -in @('HEIC', 'HEIF')) {
+            if ($null -eq $helperProcessId) {
+                throw "$($case.Format) decoded before the TIFF helper PID was captured."
+            }
+            Assert-PersistentCodecHelper `
+                -RootProcessId $process.Id `
+                -ExpectedProcessId $helperProcessId | Out-Null
+            if ($case.Format -eq 'HEIF') {
+                $helperPersistenceVerified = $true
+            }
+        }
         Assert-SameRect $baseline ([ImgViewerNativeSmoke]::ReadRect($window)) "$($case.Format) handoff"
         Write-Output "PASS format=$($case.Format) file=$($case.Name) rect=unchanged"
+    }
+    if (-not $helperPersistenceVerified) {
+        throw 'The TIFF-to-HEIC-to-HEIF codec helper persistence check did not run.'
     }
 
     Open-ThroughExistingInstance (Join-Path $formatDirectory 'animated.gif') $window | Out-Null
@@ -887,16 +1200,65 @@ try {
     else {
         Write-Output 'PASS native-smoke formats=7 animations=2 navigation=4 continuity=1 error-recovery=1 webdriver=absent'
     }
+    $nativeSmokeCompleted = $true
 }
 finally {
+    if ($null -ne $process) {
+        try {
+            $process.Refresh()
+            if (-not $process.HasExited) {
+                $closingHelpers = @(Get-DirectCodecHelpers -RootProcessId $process.Id)
+                if ($closingHelpers.Count -gt 1) {
+                    $ids = @($closingHelpers | ForEach-Object { $_.ProcessId })
+                    $helperCleanupFailure = (
+                        "ImgViewer had multiple codec helpers at shutdown: $($ids -join ', ')."
+                    )
+                }
+                $helperProcessIds = @(
+                    @($helperProcessIds) +
+                        @($closingHelpers | ForEach-Object { [int]$_.ProcessId }) |
+                        Sort-Object -Unique
+                )
+            }
+        }
+        catch {}
+    }
     if ($window -ne [IntPtr]::Zero) {
         [ImgViewerNativeSmoke]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
     }
     if ($null -ne $process) {
         if (-not $process.WaitForExit(3000)) {
-            try { $process.Kill() } catch {}
+            try {
+                $process.Kill()
+                [void]$process.WaitForExit(2000)
+            }
+            catch {}
         }
         $process.Dispose()
+    }
+    foreach ($observedHelperProcessId in @($helperProcessIds | Sort-Object -Unique)) {
+        $helperExitDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while ((Test-CodecHelperProcessRunning -ProcessId $observedHelperProcessId) -and
+            [DateTime]::UtcNow -lt $helperExitDeadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        if (Test-CodecHelperProcessRunning -ProcessId $observedHelperProcessId) {
+            $helperCleanupFailure = (
+                "Codec helper PID $observedHelperProcessId remained alive after ImgViewer exited."
+            )
+            try {
+                Stop-Process -Id $observedHelperProcessId -Force -ErrorAction SilentlyContinue
+            }
+            catch {}
+        }
+    }
+    if (-not $helperCleanupFailure -and
+        $helperPersistenceVerified -and
+        $nativeSmokeCompleted) {
+        Write-Output (
+            "PASS codec-helper-runtime sibling=verified direct-child=1 " +
+            "persistent-pid=$helperProcessId orphan=absent webdriver=absent"
+        )
     }
     $resolvedSmoke = [IO.Path]::GetFullPath($smokeDirectory)
     if ($resolvedSmoke.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and
@@ -904,5 +1266,8 @@ finally {
         if ([IO.Directory]::Exists($resolvedSmoke)) {
             [IO.Directory]::Delete($resolvedSmoke, $true)
         }
+    }
+    if ($helperCleanupFailure) {
+        throw $helperCleanupFailure
     }
 }

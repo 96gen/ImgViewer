@@ -5,6 +5,46 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-09
+
+### Added
+
+- HEIC／HEIF 與 TIFF 第一頁解碼移入固定同目錄的私有 codec helper；主程式
+  只傳 duplicated read-only handle，不傳本機路徑、任意 command line 或
+  輸出路徑。
+- helper 與主程式共用 persistent process、768 MiB Job Object 與每張 30 秒
+  硬期限；主程式不再編入 TIFF 或 libheif decoder。
+- private codec protocol 升至 v3；固定 32-byte request 明列
+  `heif`／`tiff` 格式，拒絕未知格式、非零 reserved bytes、錯誤長度與
+  protocol version mismatch。
+- 加入真實 helper 的 TIFF→HEIF→TIFF persistence、20 次 crash/lazy
+  restart、hang、OOM、handle release 與 orphan process 測試。
+- BUILD_METADATA schema v3 與 CycloneDX SBOM 記錄隔離格式、helper Cargo
+  features、protocol、記憶體上限及 deadline；發布 gate 驗證主程式的
+  dependency graph 不含 TIFF／HEIF decoder。
+
+### Security
+
+- vcpkg `x64-windows` 以 overlay triplet 固定 MSVC `v143`，native probe、
+  Cargo tests 與 portable DLL 收集只使用同代 VC143 runtime。
+- Portable、SBOM 與 vcpkg 完整性雜湊直接使用 .NET SHA-256，不依賴
+  Windows PowerShell 模組自動載入。
+- TIFF 不可信資料改在可終止的 helper process 中處理；timeout、OOM、
+  protocol failure 或 codec crash 只淘汰該 helper，主窗口可於下一張圖片
+  lazy restart，且不自動重試同一輸入。
+- test-only fault helper 僅接受 duplicated read-only handle 中的固定 marker；
+  release build 與 portable stage 均拒絕測試 hook 產物。
+- cancellation 會在新 pending generation 可被 worker 取走前先終止舊 request；
+  已被取消或 kill 的 helper session 不會被下一張圖片復用。
+- helper 回傳的 RGBA8 由主程序以 safe Rust 逐列編成 PNG；每列之間檢查
+  cancellation 與 30 秒期限，單次不可中斷工作固定不超過 131,072 bytes，
+  過期結果與 partial PNG 均不發布。
+- helper timeout、取消、pipe 中斷、codec crash 或不合法回應都會終止整個
+  Job；Rust `unsafe` 收斂到明列的 Win32 與 codec FFI adapter，每段都有
+  就近 `SAFETY` 理由。
+- 更新 Rust security lockfile，並將前端 transitive `nanoid`、`postcss`、`undici`
+  與 `brace-expansion` 固定至含安全修補的 patch 版本。
+
 ## [0.2.2] - 2026-07-29
 
 ### Fixed

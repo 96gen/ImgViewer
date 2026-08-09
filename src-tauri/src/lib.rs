@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod catalog;
+mod codec_helper;
 mod decode;
 mod error;
 mod model;

@@ -132,6 +132,49 @@ describe("useViewer", () => {
     wrapper.unmount();
   });
 
+  it("keeps the latest generation when concurrent navigation responses arrive in reverse order", async () => {
+    const first = deferred<ViewerSnapshot>();
+    const second = deferred<ViewerSnapshot>();
+    const navigate = vi
+      .fn<ViewerBridge["navigate"]>()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    let serial = 0;
+    vi.spyOn(URL, "createObjectURL").mockImplementation(
+      () => `blob:navigation-${++serial}`,
+    );
+    const revoke = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => undefined);
+    const { wrapper, session } = mountSession(fakeBridge({ navigate }));
+
+    await session.applySnapshot(readySnapshot(1, 11));
+    const firstNavigation = session.navigate("next");
+    const secondNavigation = session.navigate("next");
+    expect(navigate.mock.calls).toEqual([["next"], ["next"]]);
+
+    second.resolve(readySnapshot(3, 33));
+    await secondNavigation;
+    first.resolve({
+      protocolVersion: 1,
+      revision: 4,
+      generation: 2,
+      status: "loading",
+      index: 2,
+      total: 10,
+      fileName: "2.png",
+      canPrevious: true,
+      canNext: true,
+    });
+    await firstNavigation;
+
+    expect(session.snapshot.value?.generation).toBe(3);
+    expect(session.displayedImage.value?.generation).toBe(3);
+    expect(session.imageUrl.value).toBe("blob:navigation-2");
+    expect(revoke).toHaveBeenCalledWith("blob:navigation-1");
+    wrapper.unmount();
+  });
+
   it("swaps only after the candidate image preload completes", async () => {
     const nextReady = deferred<void>();
     let serial = 0;

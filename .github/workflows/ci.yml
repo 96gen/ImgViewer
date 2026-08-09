@@ -74,8 +74,8 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --manifest-path ./src-tauri/Cargo.toml --all -- --check
 
-      - name: Rust lint without native HEIC
-        run: cargo clippy --locked --manifest-path ./src-tauri/Cargo.toml --all-targets --no-default-features -- -D warnings
+      - name: Rust lint without isolated codec features
+        run: cargo clippy --locked --manifest-path ./src-tauri/Cargo.toml --workspace --all-targets --no-default-features -- -D warnings
 
-      - name: Rust tests without native HEIC
-        run: cargo test --locked --manifest-path ./src-tauri/Cargo.toml --no-default-features
+      - name: Rust tests without isolated codec features
+        run: cargo test --locked --manifest-path ./src-tauri/Cargo.toml --workspace --no-default-features

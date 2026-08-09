@@ -9,7 +9,10 @@ ImgViewer 是 Windows x64 專用的免安裝圖片瀏覽器。介面以 Vue 3 �
 - Microsoft Edge WebView2 Evergreen Runtime。支援版本的 Windows 通常已安裝；若系統提示缺少 runtime，請使用 Microsoft 的 [WebView2 Runtime 下載頁](https://developer.microsoft.com/microsoft-edge/webview2/consumer/) 安裝 Evergreen Runtime。
 - 不需要 Windows HEIF Image Extensions；ZIP 已包含 `libheif` 與 `libde265`。
 
-解壓縮 `ImgViewer-{version}-windows-x64.zip` 後，直接執行資料夾內的 `ImgViewer.exe`。請保留 EXE、DLL、授權文件在同一資料夾。
+解壓縮 `ImgViewer-{version}-windows-x64.zip` 後，直接執行資料夾內的
+`ImgViewer.exe`。請保留 `ImgViewer.CodecHelper.exe`、DLL 與授權文件在
+同一資料夾；helper 缺少或被移動時，其他格式仍可使用，但 TIFF、
+HEIC／HEIF 會顯示可恢復錯誤。
 
 ## 操作
 
@@ -53,12 +56,24 @@ WebView2 播放；結構型 frame／累計像素限制可先拒絕 frame bomb，
 helper process 能硬中止 WebView2 的動畫解碼，因此仍不宣稱已完全隔離
 animation CPU／codec hang DoS。
 
-解碼工作目前有 30 秒 soft deadline：超時返回的結果不會覆蓋畫面，但
-同 process 內卡死的 native codec 仍無法安全強制中止。TIFF／HEIF helper
-process 與 Windows Job Object 硬隔離列在 [Roadmap](ROADMAP.md)，此限制
-也記錄於 [威脅模型](THREAT_MODEL.md)。漏洞請依 [安全政策](SECURITY.md)
-私下回報；維護頻率與支援邊界分別見 [維護節奏](MAINTENANCE.md)、
-[支援政策](SUPPORT.md)。
+TIFF、HEIC／HEIF 解碼已移入固定同目錄的私有 helper process。主程式只把已開啟
+的 read-only handle 複製給 helper，不傳來源路徑、任意 command line 或
+輸出路徑；helper 啟動後先受 Windows Job Object 約束，限制單一 process、
+768 MiB 記憶體與每張 30 秒硬期限。timeout、取消、pipe 中斷、codec crash
+或不合法回應都會終止該 Job；同一張不自動重試，下一次選取才建立乾淨
+helper。
+
+helper 的 RGBA8 回應仍由主程序的 safe Rust encoder 產生 PNG。encoder 逐列
+串流處理並在每列之間檢查 cancellation 與同一個 30 秒期限；在 32,768 px
+單邊限制下，每個不可中斷的 RGBA8 row 最多 131,072 bytes。取消或逾時會
+淘汰該 helper session，partial／過期 PNG 不會發布。
+
+其他同 process 解碼仍只有 30 秒 soft deadline：超時返回的結果不會覆蓋
+畫面，但卡死的 codec thread 無法安全強制中止。parent junction race、
+codec fuzz 與 WebView2 動畫解碼隔離仍列在 [Roadmap](ROADMAP.md)，
+並記錄於 [威脅模型](THREAT_MODEL.md)。漏洞請依
+[安全政策](SECURITY.md) 私下回報；維護頻率與支援邊界分別見
+[維護節奏](MAINTENANCE.md)、[支援政策](SUPPORT.md)。
 
 HDR 的 PQ/HLG transfer 與廣色域原色會轉進有限的 8-bit sRGB 顯示範圍；超出 SDR／sRGB 範圍的值會截斷，第一版不輸出 HDR，也不提供可調整的感知式 tone mapping。
 
@@ -81,8 +96,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 cargo fmt --manifest-path .\src-tauri\Cargo.toml --all -- --check
-cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --all-targets --no-default-features -- -D warnings
-cargo test --locked --manifest-path .\src-tauri\Cargo.toml --no-default-features
+cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --workspace --all-targets --no-default-features -- -D warnings
+cargo test --locked --manifest-path .\src-tauri\Cargo.toml --workspace --no-default-features
 ```
 
 原生窗口 smoke 不使用 WDIO、WebDriver 或測試外掛；它直接啟動正式 binary，以 Windows UI Automation 找到已顯示的圖片，再用 Win32 讀取原生窗口 rect：
@@ -93,7 +108,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-native.ps1 -Executable ".\release\ImgViewer-$version-windows-x64\ImgViewer.exe"
 ```
 
-此 smoke 覆蓋 CLI 開圖、自然排序、首尾停止、快速方向鍵、single-instance handoff、切圖過程 UIA 圖片不中斷，以及每次操作前後窗口 rect 完全相同。專案不含 WDIO／WebDriver dependency 或自動化 command；完整 PASS anchors 見 [scripts/VERIFYING.md](scripts/VERIFYING.md)。
+此 smoke 覆蓋 CLI 開圖、單次方向鍵自然排序、首尾停止、無等待 UIA
+連按的快速 latest-wins、single-instance handoff、切圖過程 UIA 圖片不中斷，
+以及每次操作前後窗口 rect 完全相同。快速 Arrow key 的同步事件與反序
+response 另由 Vitest 固定重現。專案不含 WDIO／WebDriver dependency 或
+自動化 command；完整 PASS anchors 見 [scripts/VERIFYING.md](scripts/VERIFYING.md)。
 
 正式 EXE 的 RAM smoke 同樣不使用 WDIO／WebDriver。它動態產生測試圖，循環走 single-instance 開圖，以 UI Automation 等待圖片，再統計 ImgViewer 與所有 WebView2 子程序的 peak／retained private bytes、working set、斜率與 p95 載入時間：
 
@@ -106,16 +125,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-memory.p
 
 0.1.1 的固定環境 before／after 數據，以及 0.1.2 無閃切圖的 100／160 輪 RAM 回收結果與解讀限制，見 [PERFORMANCE.md](PERFORMANCE.md)。
 
-要在開發模式測試 HEIC，先佈署固定版 vcpkg 依賴，再啟用 `heic` feature：
+要測試 codec helper，先佈署固定版 vcpkg 依賴，再建置 helper。Tauri 主
+process 不得啟用 HEIC 或 TIFF feature：
 
 ```powershell
 $nativeBin = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-native-deps.ps1 | Select-Object -Last 1
-cargo clean --manifest-path .\src-tauri\Cargo.toml -p libheif-sys
+cargo clean --manifest-path .\src-tauri\Cargo.toml --package libheif-sys
 $env:VCPKG_ROOT = "$PWD\.tools\vcpkg"
+$env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
+$env:VCPKG_DEFAULT_HOST_TRIPLET = "x64-windows"
 $env:VCPKGRS_DYNAMIC = "1"
 $env:VCPKGRS_TRIPLET = "x64-windows"
 $env:PATH = "$nativeBin;$env:PATH"
-pnpm run tauri dev --features heic
+cargo build --locked --manifest-path .\src-tauri\Cargo.toml --package imgviewer-codec-helper --no-default-features --features heic,tiff
+Copy-Item .\src-tauri\target\debug\imgviewer-codec-helper.exe .\src-tauri\target\debug\ImgViewer.CodecHelper.exe -Force
+pnpm run tauri dev
+```
+
+真正的 broker／Job Object／duplicated-handle process 測試可直接執行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-codec-helper-process.ps1
 ```
 
 `.tools/vcpkg` 固定為 tag `2026.05.25`。這是 annotated tag：tag object 是 `baddcee32f29086c2c1c1f002df5078e371f7934`，實際 checkout 與 `builtin-baseline` 必須使用 peeled commit `d015e31e90838a4c9dfa3eed45979bc70d9357fc`。專案內的 `vcpkg-overlays/ports/libheif` 保留該版本 port，僅在編譯時停用 libheif runtime plugin loading；HEIC 仍由內建註冊的 libde265 decoder 解碼，程式不會掃描外部 codec DLL。
@@ -131,18 +161,26 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable
 腳本會依序：
 
 1. 驗證並 bootstrap 固定版 vcpkg。
-2. 以 dynamic `x64-windows` 安裝 `libheif[core]`；`default-features: false` 排除 x265 與非必要 codec，overlay 關閉 runtime plugin loading。
-3. 執行前端、Rust 測試，然後執行 Tauri `--no-bundle --features heic` release build。
-4. 用 `dumpbin /DEPENDENTS` 遞迴收集 vcpkg DLL 與必要 MSVC runtime。
-5. 移除外部搜尋路徑後再檢查 dependency closure 與禁止 codec 清單；任何未封裝的非系統 DLL 都會使發佈失敗。
+2. 以 dynamic `x64-windows` 安裝 `libheif[core]`，overlay triplet 固定 MSVC `v143`，避免 hosted runner 新增 Visual Studio toolset 後悄悄改變 native ABI；`default-features: false` 排除 x265 與非必要 codec，overlay port 關閉 runtime plugin loading。
+3. 對全 Rust workspace 跑無隔離 codec feature 測試，再對 codec core／helper
+   跑 HEIC＋TIFF 測試；Tauri 主程式以 `--no-bundle` 且不含 HEIC／TIFF
+   建置，helper 另以 `--features heic,tiff` 建置。
+4. 將 `ImgViewer.exe` 與 `ImgViewer.CodecHelper.exe` 一起放入 stage，
+   用 `dumpbin /DEPENDENTS` 遞迴收集 vcpkg DLL 與必要 MSVC runtime。
+5. 驗證 Cargo feature graph 中主 EXE 不含 HEIF／TIFF decoder、helper 同時
+   包含兩者；binary import graph另要求主 EXE 不匯入 `heif.dll`／
+   `libde265.dll`、helper 必須匯入 `heif.dll`，再檢查 dependency closure。
 6. 對 stage binary 執行無 WebDriver 的 native smoke。
-7. 加入 README、MIT/LGPL 授權、來源版本通知與 `BUILD_METADATA.json`，
+7. 加入 README、MIT/LGPL 授權、來源版本通知與 schema v3
+   `BUILD_METADATA.json`（含兩個 EXE 的 role、protocol version、SHA-256，
+   以及 helper 隔離格式、Cargo features、Job memory與deadline），
    輸出 ZIP、SHA-256 manifest 與 build metadata sidecar。
 
 GitHub 的 tag workflow 只建置一次並建立 draft release；CI 另產生並補強
 CycloneDX SBOM，且對 ZIP、checksum、metadata 與 SBOM 建立 artifact
-attestation。互動式 Windows 11 測試機必須下載同一份 ZIP、核對 digest
-並完成 packaged smoke，之後才可用該 digest 將 draft 升為正式 release；
+attestation。目前維護的互動式 Windows 11 實機必須下載同一份 ZIP、核對
+digest 並完成 packaged smoke，之後才可用該 digest 將 draft 升為正式
+release；VM 或乾淨作業系統映像永久不列入 gate，
 promotion 不會重新建置或替換資產。完整程序見
 [發布驗證指南](docs/release/README.md)。
 

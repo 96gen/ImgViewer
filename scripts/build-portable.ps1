@@ -14,6 +14,35 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$forbiddenCodecFilePattern =
+    '^(?i:(?:lib)?(?:x265|aom|avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc))[^\\/]*\.(?:dll|exe)$'
+$forbiddenVcpkgPackagePattern =
+    '^(?i:(?:lib)?x265|(?:lib)?aom|(?:lib)?avif|dav1d|rav1e|svt[-_]?av1|kvazaar|vvenc)$'
+$forbiddenTestArtifactPattern = '(?i)(?:fault[-_]?helper|test[-_]?hooks?)'
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            [System.IO.Path]::GetFullPath($Path),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            return [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) "release"
 }
@@ -106,10 +135,11 @@ function ConvertTo-SafeRepositoryUrl {
 
 function Get-MsvcRedistDirectories {
     $results = [System.Collections.Generic.List[string]]::new()
+    $runtimeDirectoryName = "Microsoft.VC143.CRT"
 
     if ($env:VCToolsRedistDir) {
         Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir "x64") `
-            -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+            -Directory -Filter $runtimeDirectoryName -ErrorAction SilentlyContinue |
             ForEach-Object { $results.Add($_.FullName) }
     }
 
@@ -125,26 +155,43 @@ function Get-MsvcRedistDirectories {
     }
 
     if ($vswhere) {
-        $installationPath = (
-            & $vswhere -latest -products * `
+        $installationPaths = @(
+            & $vswhere -all -products * `
                 -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-                -property installationPath |
-                Select-Object -First 1
+                -property installationPath
         )
-        if ($installationPath) {
+        foreach ($installationPath in $installationPaths) {
             Get-ChildItem -LiteralPath (Join-Path $installationPath "VC\Redist\MSVC") `
                 -Directory -ErrorAction SilentlyContinue |
                 Sort-Object Name -Descending |
                 ForEach-Object {
                     Get-ChildItem -LiteralPath (Join-Path $_.FullName "x64") `
-                        -Directory -Filter "Microsoft.VC*.CRT" `
+                        -Directory -Filter $runtimeDirectoryName `
                         -ErrorAction SilentlyContinue |
                         ForEach-Object { $results.Add($_.FullName) }
                 }
         }
     }
 
-    return @($results | Select-Object -Unique)
+    return @(
+        $results |
+            Select-Object -Unique |
+            Sort-Object {
+                $runtimePath = Join-Path $_ "VCRUNTIME140.dll"
+                if (-not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+                    return [version]"0.0"
+                }
+                try {
+                    return [version](
+                        [Diagnostics.FileVersionInfo]::GetVersionInfo(
+                            $runtimePath
+                        ).FileVersion
+                    )
+                } catch {
+                    return [version]"0.0"
+                }
+            } -Descending
+    )
 }
 
 function Assert-NativeLibraryLoadable {
@@ -173,8 +220,8 @@ public static class ImgViewerBuildNativeLoader
 
     $fullPath = [System.IO.Path]::GetFullPath($LibraryPath)
     # LOAD_WITH_ALTERED_SEARCH_PATH starts dependency lookup beside the target
-    # DLL, then uses the inherited process search path containing the matching
-    # VC runtime directories selected above.
+    # DLL. The probe directory deliberately contains the codec closure and the
+    # pinned VC143 runtime, matching the final portable application directory.
     $module = [ImgViewerBuildNativeLoader]::LoadLibraryExW(
         $fullPath,
         [IntPtr]::Zero,
@@ -197,6 +244,15 @@ $vcpkgProjectVersion = [string]$vcpkgManifest.'version-string'
 $versionSources = [ordered]@{
     "src-tauri/tauri.conf.json" = $version
     "src-tauri/Cargo.toml" = $cargoVersion
+    "src-tauri/crates/codec-core/Cargo.toml" = Get-CargoPackageVersion -ManifestPath (
+        Join-Path $repoRoot "src-tauri\crates\codec-core\Cargo.toml"
+    )
+    "src-tauri/crates/codec-helper/Cargo.toml" = Get-CargoPackageVersion -ManifestPath (
+        Join-Path $repoRoot "src-tauri\crates\codec-helper\Cargo.toml"
+    )
+    "src-tauri/crates/codec-protocol/Cargo.toml" = Get-CargoPackageVersion -ManifestPath (
+        Join-Path $repoRoot "src-tauri\crates\codec-protocol\Cargo.toml"
+    )
     "package.json" = $packageVersion
     "vcpkg.json" = $vcpkgProjectVersion
 }
@@ -207,6 +263,36 @@ $mismatchedVersions = @(
 )
 if ($mismatchedVersions.Count -gt 0) {
     throw "ImgViewer version mismatch. Expected $version; found $($mismatchedVersions -join ', ')."
+}
+
+$codecProtocolSource = Get-Content -LiteralPath (
+    Join-Path $repoRoot "src-tauri\crates\codec-protocol\src\lib.rs"
+) -Raw
+if ($codecProtocolSource -notmatch
+    'pub\s+const\s+PROTOCOL_VERSION\s*:\s*u16\s*=\s*(?<version>\d+)\s*;') {
+    throw "Unable to read the codec helper protocol version."
+}
+$codecProtocolVersion = [int]$Matches.version
+if ($codecProtocolVersion -ne 3) {
+    throw "The codec helper protocol version must be 3 for BUILD_METADATA schema 3."
+}
+if ($codecProtocolSource -notmatch
+    'pub\s+const\s+CODEC_HELPER_MEMORY_LIMIT_BYTES\s*:\s*usize\s*=\s*(?<value>[\d_]+)\s*;') {
+    throw "Unable to read the codec helper memory limit."
+}
+$codecHelperMemoryLimitBytes = [long]($Matches.value -replace '_', '')
+if ($codecProtocolSource -notmatch
+    'pub\s+const\s+CODEC_HELPER_DECODE_DEADLINE_MS\s*:\s*u64\s*=\s*(?<value>[\d_]+)\s*;') {
+    throw "Unable to read the codec helper decode deadline."
+}
+$codecHelperDecodeDeadlineMs = [long]($Matches.value -replace '_', '')
+if ($codecHelperMemoryLimitBytes -ne 805306368 -or
+    $codecHelperDecodeDeadlineMs -ne 30000) {
+    throw (
+        "BUILD_METADATA schema 3 requires the production codec helper limits " +
+        "805306368 bytes/30000 ms; found $codecHelperMemoryLimitBytes bytes/" +
+        "$codecHelperDecodeDeadlineMs ms."
+    )
 }
 
 $git = Get-Command git.exe -ErrorAction SilentlyContinue
@@ -305,6 +391,7 @@ if (-not $pnpm) {
 if (-not $pnpm) {
     throw "pnpm is required. Install the version declared by packageManager in package.json."
 }
+$cargoCommand = Get-Command cargo.exe -ErrorAction Stop
 
 $nativeInstallArguments = @{}
 if ($ReleaseMode -or $FreshNative) {
@@ -325,51 +412,92 @@ $previousPath = $env:PATH
 $previousCi = $env:CI
 $msvcRuntimeDirectories = @(Get-MsvcRedistDirectories)
 if ($msvcRuntimeDirectories.Count -eq 0) {
-    throw "The matching MSVC x64 redistributable directory was not found before native tests."
+    throw "The pinned MSVC v143 x64 redistributable directory was not found before native tests."
+}
+$nativeTestDirectory = Join-Path $repoRoot ".tools\native-test-v143"
+Assert-SafeChildPath -Parent (Join-Path $repoRoot ".tools") -Child $nativeTestDirectory
+if (Test-Path -LiteralPath $nativeTestDirectory) {
+    $nativeTestItem = Get-Item -LiteralPath $nativeTestDirectory -Force
+    if (($nativeTestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to replace a native test runtime reparse point: $nativeTestDirectory"
+    }
+    Remove-Item -LiteralPath $nativeTestDirectory -Recurse -Force
+}
+New-Item -ItemType Directory -Path $nativeTestDirectory | Out-Null
+foreach ($nativeCodecDll in @("libde265.dll", "heif.dll")) {
+    Copy-Item -LiteralPath (Join-Path $runtimeBin $nativeCodecDll) `
+        -Destination (Join-Path $nativeTestDirectory $nativeCodecDll)
+}
+& (Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1") `
+    -StageDirectory $nativeTestDirectory `
+    -SearchDirectory (@($runtimeBin) + $msvcRuntimeDirectories) `
+    -CopyDependencies `
+    -RequireBundledMsvcRuntime | Write-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to stage the isolated MSVC v143 native test runtime."
 }
 $env:VCPKG_ROOT = $vcpkgRoot
 $env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
 $env:VCPKG_DEFAULT_HOST_TRIPLET = "x64-windows"
 $env:VCPKGRS_DYNAMIC = "1"
 $env:VCPKGRS_TRIPLET = "x64-windows"
-$env:PATH = (
-    @($runtimeBin) + $msvcRuntimeDirectories + @($previousPath) -join
-        [System.IO.Path]::PathSeparator
-)
+$env:PATH = @($nativeTestDirectory, $previousPath) -join [IO.Path]::PathSeparator
 $env:CI = "true"
-Write-Host "MSVC test runtime search: $($msvcRuntimeDirectories -join '; ')"
+Write-Host "MSVC v143 test runtime search: $($msvcRuntimeDirectories -join '; ')"
 foreach ($nativeTestDll in @("libde265.dll", "heif.dll")) {
-    $nativeTestDllPath = Join-Path $runtimeBin $nativeTestDll
+    $nativeTestDllPath = Join-Path $nativeTestDirectory $nativeTestDll
     if (-not (Test-Path -LiteralPath $nativeTestDllPath -PathType Leaf)) {
         throw "Native dependency install did not produce $nativeTestDll."
     }
-    $nativeTestDllHash = (
-        Get-FileHash -LiteralPath $nativeTestDllPath -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
+    $nativeTestDllHash = (Get-Sha256Hex -Path $nativeTestDllPath).ToLowerInvariant()
     Write-Host "Native test DLL: $nativeTestDll sha256=$nativeTestDllHash"
     Assert-NativeLibraryLoadable -LibraryPath $nativeTestDllPath
 }
-Write-Host "PASS native-test-loader dlls=2 msvc-runtime=explicit"
+Write-Host "PASS native-test-loader dlls=2 msvc-runtime=v143 app-local=1"
 
 Push-Location $repoRoot
 try {
     if ($ReleaseMode -or $FreshNative) {
-        # A tagged release fresh-installs vcpkg. Never combine those newly built
-        # DLLs with a restored Cargo target tree containing old native OUT_DIRs
-        # or downstream test artifacts. FreshNative gives release candidates the
-        # same native/test isolation without claiming tag provenance.
+        # Release candidates and tags rebuild vcpkg from source. Never combine
+        # those DLLs with a restored Cargo target tree containing old native
+        # OUT_DIRs or downstream test executables.
         Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml")
     } else {
-        # libheif-sys copies heif.dll into Cargo OUT_DIR. Rust caches do not
-        # notice when vcpkg rebuilds that DLL, so invalidate its native outputs
-        # while retaining the faster target cache for ordinary candidate builds.
+        # Ordinary local packages keep the target cache, but libheif-sys still
+        # needs invalidation because Cargo does not observe a rebuilt DLL.
         Invoke-Checked cargo clean --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" libheif-sys
     }
     Invoke-Checked $pnpm.Source install --frozen-lockfile
+    & (Join-Path $PSScriptRoot "Assert-CargoFeatureBoundary.ps1") `
+        -ManifestPath (Join-Path $repoRoot "src-tauri\Cargo.toml") `
+        -CargoExecutable $cargoCommand.Source | Write-Host
     if (-not $SkipChecks) {
         Invoke-Checked $pnpm.Source test
-        Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --all-targets --no-default-features --features heic "--" "-Dwarnings"
-        Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --no-default-features --features heic
+        Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --all-targets --no-default-features "--" "-Dwarnings"
+        Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --workspace --no-default-features
+        $codecPackages = @("imgviewer-codec-core", "imgviewer-codec-helper")
+        foreach ($codecPackage in $codecPackages) {
+            Invoke-Checked cargo clippy --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --all-targets --no-default-features --features heic,tiff "--" "-Dwarnings"
+            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic,tiff --no-run
+        }
+        $cargoMetadata = Invoke-Captured -FilePath $cargoCommand.Source -Arguments @(
+            "metadata", "--locked", "--manifest-path",
+            (Join-Path $repoRoot "src-tauri\Cargo.toml"),
+            "--format-version", "1", "--no-deps"
+        )
+        $cargoTestDirectory = Join-Path (
+            [string]($cargoMetadata | ConvertFrom-Json).target_directory
+        ) "debug\deps"
+        New-Item -ItemType Directory -Path $cargoTestDirectory -Force | Out-Null
+        Get-ChildItem -LiteralPath $nativeTestDirectory -File -Filter "*.dll" |
+            ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName `
+                    -Destination (Join-Path $cargoTestDirectory $_.Name) -Force
+            }
+        Write-Host "PASS native-test-stage target=debug/deps app-local-dlls=$(@(Get-ChildItem -LiteralPath $nativeTestDirectory -File -Filter '*.dll').Count)"
+        foreach ($codecPackage in $codecPackages) {
+            Invoke-Checked cargo test --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") "--package" $codecPackage --no-default-features --features heic,tiff
+        }
     }
     # Execute the exact CLI installed by the frozen project lock. `pnpm exec`
     # depends on pnpm's global store/index being writable and has failed on
@@ -378,7 +506,10 @@ try {
     if (-not (Test-Path -LiteralPath $tauriCli -PathType Leaf)) {
         throw "The locked Tauri CLI shim is missing: node_modules\\.bin\\tauri.cmd"
     }
-    Invoke-Checked $tauriCli build --no-bundle --features heic "--" "--locked"
+    # The Tauri process intentionally has no isolated HEIF/TIFF features. Only
+    # the private helper below links libheif and the TIFF decoder.
+    Invoke-Checked $tauriCli build --no-bundle "--" "--locked"
+    Invoke-Checked cargo build --locked --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --release "--package" imgviewer-codec-helper --no-default-features --features heic,tiff
     if ($ReleaseMode) {
         $postBuildRevision = Invoke-Captured -FilePath $git.Source -Arguments @(
             "-C", $repoRoot, "rev-parse", "--verify", "HEAD"
@@ -411,6 +542,10 @@ $builtExe = Get-ChildItem -LiteralPath $releaseDirectory -File -Filter "*.exe" |
 if (-not $builtExe) {
     throw "Tauri build completed but ImgViewer.exe was not found in $releaseDirectory"
 }
+$builtHelper = Join-Path $releaseDirectory "imgviewer-codec-helper.exe"
+if (-not (Test-Path -LiteralPath $builtHelper -PathType Leaf)) {
+    throw "Codec helper build completed but imgviewer-codec-helper.exe was not found in $releaseDirectory"
+}
 
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -438,10 +573,13 @@ foreach ($oldOutput in @($zipPath, $checksumPath, $metadataPath, $sbomPath, $bas
 }
 New-Item -ItemType Directory -Path $stageDirectory | Out-Null
 Copy-Item -LiteralPath $builtExe.FullName -Destination (Join-Path $stageDirectory "ImgViewer.exe")
+Copy-Item -LiteralPath $builtHelper -Destination (
+    Join-Path $stageDirectory "ImgViewer.CodecHelper.exe"
+)
 
 & (Join-Path $PSScriptRoot "Resolve-NativeDependencies.ps1") `
     -StageDirectory $stageDirectory `
-    -SearchDirectory $runtimeBin `
+    -SearchDirectory (@($runtimeBin) + $msvcRuntimeDirectories) `
     -CopyDependencies `
     -RequireBundledMsvcRuntime | Write-Host
 if ($LASTEXITCODE -ne 0) {
@@ -456,12 +594,17 @@ foreach ($requiredDll in @("heif.dll", "libde265.dll")) {
 
 $forbiddenCodecFiles = @(
     Get-ChildItem -LiteralPath $stageDirectory -Recurse -File |
-        Where-Object {
-            $_.Name -match '^(?:lib)?(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
-        }
+        Where-Object { $_.Name -match $forbiddenCodecFilePattern }
 )
 if ($forbiddenCodecFiles.Count -gt 0) {
-    throw "Portable package contains a forbidden HEIF/AVIF codec: $($forbiddenCodecFiles.Name -join ', ')"
+    throw "Portable package contains an unapproved HEIF/AVIF codec: $($forbiddenCodecFiles.Name -join ', ')"
+}
+$forbiddenTestArtifacts = @(
+    Get-ChildItem -LiteralPath $stageDirectory -Recurse -File |
+        Where-Object { $_.Name -match $forbiddenTestArtifactPattern }
+)
+if ($forbiddenTestArtifacts.Count -gt 0) {
+    throw "Portable package contains a fault-helper or test-hooks artifact: $($forbiddenTestArtifacts.Name -join ', ')"
 }
 
 # A second pass deliberately has no external search roots. This proves that the
@@ -471,6 +614,11 @@ if ($forbiddenCodecFiles.Count -gt 0) {
     -RequireBundledMsvcRuntime | Write-Host
 if ($LASTEXITCODE -ne 0) {
     throw "Final DLL dependency closure validation failed."
+}
+& (Join-Path $PSScriptRoot "Assert-CodecBinaryBoundary.ps1") `
+    -StageDirectory $stageDirectory | Write-Host
+if ($LASTEXITCODE -ne 0) {
+    throw "Codec process import-boundary validation failed."
 }
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination $stageDirectory
@@ -490,6 +638,22 @@ $installedPackages = @(& $vcpkgExe list "--x-install-root=$vcpkgInstallRoot")
 if ($LASTEXITCODE -ne 0) {
     throw "vcpkg list failed while collecting SOURCE_VERSIONS.txt metadata."
 }
+$installedPackageNames = @(
+    $installedPackages |
+        ForEach-Object {
+            if ($_ -match '^(?<package>[^:\s]+):(?<triplet>[^\s]+)\s+') {
+                [string]$Matches.package
+            }
+        } |
+        Sort-Object -Unique
+)
+$forbiddenInstalledPackages = @(
+    $installedPackageNames |
+        Where-Object { $_ -match $forbiddenVcpkgPackagePattern }
+)
+if ($forbiddenInstalledPackages.Count -gt 0) {
+    throw "vcpkg installed unapproved HEIF/AVIF codec packages: $($forbiddenInstalledPackages -join ', ')"
+}
 $libheifRow = ($installedPackages | Where-Object { $_ -match '^libheif:x64-windows\s+' } | Select-Object -First 1)
 $libde265Row = ($installedPackages | Where-Object { $_ -match '^libde265:x64-windows\s+' } | Select-Object -First 1)
 if (-not $libheifRow -or -not $libde265Row) {
@@ -506,7 +670,7 @@ $libde265Version = $Matches.version
 $vcpkgToolVersion = Invoke-Captured -FilePath $vcpkgExe -Arguments @(
     "version", "--disable-metrics"
 )
-$vcpkgToolSha256 = (Get-FileHash -LiteralPath $vcpkgExe -Algorithm SHA256).Hash.ToLowerInvariant()
+$vcpkgToolSha256 = (Get-Sha256Hex -Path $vcpkgExe).ToLowerInvariant()
 if ($vcpkgToolSha256 -cne "f1edbf3a39de350e2bb065214fdc057111aa87a2e2ed9a7dcb8ddc86e17751b9") {
     throw "Pinned vcpkg.exe digest changed after native dependency installation."
 }
@@ -534,6 +698,7 @@ vcpkg checkout / builtin baseline: d015e31e90838a4c9dfa3eed45979bc70d9357fc
 vcpkg-tool release: 2026-04-08
 vcpkg-tool SHA-256: $vcpkgToolSha256
 $vcpkgToolVersion
+MSVC platform toolset: v143
 libheif overlay: upstream pinned port with ENABLE_PLUGIN_LOADING=OFF
 $libheifRow
 $libde265Row
@@ -552,7 +717,6 @@ $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 
 $nodeCommand = Get-Command node.exe -ErrorAction Stop
 $rustcCommand = Get-Command rustc.exe -ErrorAction Stop
-$cargoCommand = Get-Command cargo.exe -ErrorAction Stop
 $vcpkgRevision = if ($git) {
     Invoke-Captured -FilePath $git.Source -Arguments @(
         "-C", $vcpkgRoot, "rev-parse", "--verify", "HEAD"
@@ -567,7 +731,7 @@ $codecMetadata = @(
         triplet = "x64-windows"
         installedRow = [string]$libheifRow
         fileName = "heif.dll"
-        sha256 = (Get-FileHash -LiteralPath (Join-Path $stageDirectory "heif.dll") -Algorithm SHA256).Hash
+        sha256 = Get-Sha256Hex -Path (Join-Path $stageDirectory "heif.dll")
     },
     [ordered]@{
         name = "libde265"
@@ -575,7 +739,7 @@ $codecMetadata = @(
         triplet = "x64-windows"
         installedRow = [string]$libde265Row
         fileName = "libde265.dll"
-        sha256 = (Get-FileHash -LiteralPath (Join-Path $stageDirectory "libde265.dll") -Algorithm SHA256).Hash
+        sha256 = Get-Sha256Hex -Path (Join-Path $stageDirectory "libde265.dll")
     }
 )
 $msvcRuntimeMetadata = @(
@@ -587,16 +751,43 @@ $msvcRuntimeMetadata = @(
             [ordered]@{
                 fileName = $_.Name
                 fileVersion = [string]$fileVersion
-                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+                sha256 = Get-Sha256Hex -Path $_.FullName
             }
         }
 )
+$executableMetadata = @(
+    [ordered]@{
+        role = "main"
+        fileName = "ImgViewer.exe"
+        protocolVersion = $codecProtocolVersion
+        sha256 = Get-Sha256Hex -Path (
+            Join-Path $stageDirectory "ImgViewer.exe"
+        )
+    },
+    [ordered]@{
+        role = "codec-helper"
+        fileName = "ImgViewer.CodecHelper.exe"
+        protocolVersion = $codecProtocolVersion
+        sha256 = Get-Sha256Hex -Path (
+            Join-Path $stageDirectory "ImgViewer.CodecHelper.exe"
+        )
+    }
+)
 $buildMetadata = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 3
     application = [ordered]@{
         name = "ImgViewer"
         version = $version
         target = "windows-x64"
+    }
+    executables = $executableMetadata
+    codecIsolation = [ordered]@{
+        helperRole = "codec-helper"
+        protocolVersion = $codecProtocolVersion
+        isolatedFormats = @("heif", "tiff")
+        cargoFeatures = @("heic", "tiff")
+        memoryLimitBytes = $codecHelperMemoryLimitBytes
+        decodeDeadlineMs = $codecHelperDecodeDeadlineMs
     }
     artifact = [ordered]@{
         fileName = "$artifactName.zip"
@@ -624,6 +815,7 @@ $buildMetadata = [ordered]@{
             ConvertFrom-Json).devDependencies.'@tauri-apps/cli'
     }
     native = [ordered]@{
+        platformToolset = "v143"
         vcpkgReleaseTag = "2026.05.25"
         vcpkgTagObject = "baddcee32f29086c2c1c1f002df5078e371f7934"
         vcpkgBuiltinBaseline = [string]$vcpkgManifest.'builtin-baseline'
@@ -666,6 +858,7 @@ try {
     $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
     foreach ($requiredEntry in @(
         "$artifactName/ImgViewer.exe",
+        "$artifactName/ImgViewer.CodecHelper.exe",
         "$artifactName/heif.dll",
         "$artifactName/libde265.dll",
         "$artifactName/LICENSE",
@@ -681,17 +874,23 @@ try {
     }
     $forbiddenEntries = @(
         $entryNames | Where-Object {
-            [System.IO.Path]::GetFileName($_) -match '^(?:lib)?(x265|aom|avif|dav1d|rav1e|SvtAv1)[^\\/]*\.(dll|exe)$'
+            [System.IO.Path]::GetFileName($_) -match $forbiddenCodecFilePattern
         }
     )
     if ($forbiddenEntries.Count -gt 0) {
         throw "ZIP verification found a forbidden codec: $($forbiddenEntries -join ', ')"
     }
+    $forbiddenTestEntries = @(
+        $entryNames | Where-Object { $_ -match $forbiddenTestArtifactPattern }
+    )
+    if ($forbiddenTestEntries.Count -gt 0) {
+        throw "ZIP verification found a fault-helper or test-hooks artifact: $($forbiddenTestEntries -join ', ')"
+    }
 } finally {
     $archive.Dispose()
 }
 
-$artifactHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$artifactHash = (Get-Sha256Hex -Path $zipPath).ToLowerInvariant()
 $checksumLine = "$artifactHash  $([System.IO.Path]::GetFileName($zipPath))`n"
 [System.IO.File]::WriteAllText($checksumPath, $checksumLine, $utf8WithoutBom)
 

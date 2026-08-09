@@ -1,0 +1,11 @@
+[package]
+name = "imgviewer-codec-protocol"
+version = "0.4.0"
+description = "Private bounded IPC protocol for the ImgViewer codec helper"
+license = "MIT"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[lib]
+path = "src/lib.rs"

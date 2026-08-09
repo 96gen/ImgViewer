@@ -23,8 +23,8 @@ pnpm install --frozen-lockfile
 pnpm test
 pnpm build
 cargo fmt --manifest-path .\src-tauri\Cargo.toml --all -- --check
-cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --all-targets --no-default-features -- -D warnings
-cargo test --locked --manifest-path .\src-tauri\Cargo.toml --no-default-features
+cargo clippy --locked --manifest-path .\src-tauri\Cargo.toml --workspace --all-targets --no-default-features -- -D warnings
+cargo test --locked --manifest-path .\src-tauri\Cargo.toml --workspace --no-default-features
 ```
 
 涉及 UI、窗口、RAM、原生 codec 或發布內容時，另依

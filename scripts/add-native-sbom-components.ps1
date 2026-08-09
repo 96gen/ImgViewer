@@ -4,11 +4,136 @@
 param(
     [Parameter(Mandatory)] [string]$BaseSbomPath,
     [Parameter(Mandatory)] [string]$ArtifactPath,
-    [Parameter(Mandatory)] [string]$OutputPath
+    [Parameter(Mandatory)] [string]$OutputPath,
+    [string]$ManifestPath,
+    [string]$CargoExecutable
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            [System.IO.Path]::GetFullPath($Path),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            return [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
+function Get-ProductionTiffCargoComponent {
+    param(
+        [Parameter(Mandatory)] [string]$Manifest,
+        [Parameter(Mandatory)] [string]$Cargo
+    )
+
+    $featureSelection =
+        "imgviewer-codec-helper/heic,imgviewer-codec-helper/tiff"
+    $metadataOutput = @(
+        & $Cargo metadata --locked --manifest-path $Manifest `
+            --format-version 1 `
+            --filter-platform x86_64-pc-windows-msvc `
+            --no-default-features `
+            --features $featureSelection 2>$null
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo metadata failed while resolving the production helper graph with exit code $LASTEXITCODE."
+    }
+    try {
+        $cargoMetadata = $metadataOutput -join [Environment]::NewLine |
+            ConvertFrom-Json
+    } catch {
+        throw "cargo metadata returned invalid JSON for the production helper graph: $($_.Exception.Message)"
+    }
+
+    $helperPackages = @(
+        $cargoMetadata.packages |
+            Where-Object { [string]$_.name -ceq "imgviewer-codec-helper" }
+    )
+    if ($helperPackages.Count -ne 1) {
+        throw "The Cargo graph must contain exactly one imgviewer-codec-helper package."
+    }
+    $helperNodes = @(
+        $cargoMetadata.resolve.nodes |
+            Where-Object { [string]$_.id -ceq [string]$helperPackages[0].id }
+    )
+    if ($helperNodes.Count -ne 1) {
+        throw "The Cargo graph is missing the imgviewer-codec-helper resolve node."
+    }
+    $helperFeatures = @(
+        $helperNodes[0].features |
+            ForEach-Object { [string]$_ } |
+            Sort-Object -Unique
+    )
+    if (($helperFeatures -join ",") -cne "heic,tiff") {
+        throw "The production helper Cargo features must be exactly heic,tiff; found $($helperFeatures -join ',')."
+    }
+
+    $packagesById = @{}
+    foreach ($package in @($cargoMetadata.packages)) {
+        $packagesById[[string]$package.id] = $package
+    }
+    $nodesById = @{}
+    foreach ($node in @($cargoMetadata.resolve.nodes)) {
+        $nodesById[[string]$node.id] = $node
+    }
+
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $visited = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $pending.Enqueue([string]$helperPackages[0].id)
+    while ($pending.Count -gt 0) {
+        $packageId = $pending.Dequeue()
+        if (-not $visited.Add($packageId)) {
+            continue
+        }
+        if (-not $nodesById.ContainsKey($packageId)) {
+            throw "The Cargo graph is missing a resolve node for package '$packageId'."
+        }
+        foreach ($dependency in @($nodesById[$packageId].deps)) {
+            $normalDependencyKinds = @(
+                $dependency.dep_kinds |
+                    Where-Object { $null -eq $_.kind }
+            )
+            if ($normalDependencyKinds.Count -gt 0) {
+                $pending.Enqueue([string]$dependency.pkg)
+            }
+        }
+    }
+
+    $productionTiffPackages = @(
+        $visited |
+            ForEach-Object { $packagesById[$_] } |
+            Where-Object { [string]$_.name -ceq "tiff" }
+    )
+    if ($productionTiffPackages.Count -ne 1) {
+        throw "The production helper graph must reach exactly one tiff package; found $($productionTiffPackages.Count)."
+    }
+    $tiffVersion = [string]$productionTiffPackages[0].version
+    if ($tiffVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+        throw "The production helper graph reported an invalid tiff version: $tiffVersion"
+    }
+    return [pscustomobject]@{
+        name = "tiff"
+        version = $tiffVersion
+        purl = "pkg:cargo/tiff@$tiffVersion"
+    }
+}
 
 function Add-ComponentIfMissing {
     param(
@@ -24,7 +149,77 @@ function Add-ComponentIfMissing {
     [void]$Components.Add($Component)
 }
 
-function Get-VerifiedNativeHash {
+function Add-OrMergeWorkspaceComponent {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.ArrayList]$Components,
+        [Parameter(Mandatory)] [psobject]$Component
+    )
+
+    $existing = $null
+    foreach ($candidate in $Components) {
+        if ([string]$candidate.'bom-ref' -ceq [string]$Component.'bom-ref' -or
+            (
+                [string]$candidate.name -ceq [string]$Component.name -and
+                [string]$candidate.version -ceq [string]$Component.version -and
+                [string]$candidate.purl -ceq [string]$Component.purl
+            )) {
+            $existing = $candidate
+            break
+        }
+    }
+    if (-not $existing) {
+        [void]$Components.Add($Component)
+        return [string]$Component.'bom-ref'
+    }
+
+    $properties = @()
+    if ($existing.PSObject.Properties.Name -contains "properties") {
+        $properties = @($existing.properties)
+    }
+    foreach ($property in @($Component.properties)) {
+        $matched = @(
+            $properties | Where-Object {
+                [string]$_.name -ceq [string]$property.name -and
+                [string]$_.value -ceq [string]$property.value
+            }
+        )
+        if ($matched.Count -eq 0) {
+            $properties += $property
+        }
+    }
+    if ($existing.PSObject.Properties.Name -contains "properties") {
+        $existing.properties = $properties
+    } else {
+        $existing | Add-Member -NotePropertyName properties -NotePropertyValue $properties
+    }
+
+    if ($Component.PSObject.Properties.Name -contains "hashes") {
+        $hashes = @()
+        if ($existing.PSObject.Properties.Name -contains "hashes") {
+            $hashes = @($existing.hashes)
+        }
+        foreach ($hash in @($Component.hashes)) {
+            $matched = @(
+                $hashes | Where-Object {
+                    [string]$_.alg -ceq [string]$hash.alg -and
+                    [string]$_.content -ceq [string]$hash.content
+                }
+            )
+            if ($matched.Count -eq 0) {
+                $hashes += $hash
+            }
+        }
+        if ($existing.PSObject.Properties.Name -contains "hashes") {
+            $existing.hashes = $hashes
+        } else {
+            $existing | Add-Member -NotePropertyName hashes -NotePropertyValue $hashes
+        }
+    }
+
+    return [string]$existing.'bom-ref'
+}
+
+function Get-VerifiedPayloadHash {
     param(
         [Parameter(Mandatory)] [string]$PayloadRoot,
         [Parameter(Mandatory)] [psobject]$Item
@@ -32,22 +227,47 @@ function Get-VerifiedNativeHash {
 
     $fileName = [string]$Item.fileName
     if (-not $fileName -or [System.IO.Path]::GetFileName($fileName) -cne $fileName) {
-        throw "BUILD_METADATA contains an invalid native filename: $fileName"
+        throw "BUILD_METADATA contains an invalid payload filename: $fileName"
     }
     $metadataHash = ([string]$Item.sha256).ToUpperInvariant()
     if ($metadataHash -notmatch '^[0-9A-F]{64}$') {
-        throw "BUILD_METADATA contains an invalid native hash for $fileName"
+        throw "BUILD_METADATA contains an invalid payload hash for $fileName"
     }
     $payloadPath = Join-Path $PayloadRoot $fileName
     if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
-        throw "Native file named by BUILD_METADATA is missing from the ZIP: $fileName"
+        throw "File named by BUILD_METADATA is missing from the ZIP: $fileName"
     }
-    $actualHash = (Get-FileHash -LiteralPath $payloadPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    $actualHash = (Get-Sha256Hex -Path $payloadPath).ToUpperInvariant()
     if ($actualHash -cne $metadataHash) {
-        throw "Native file hash does not match BUILD_METADATA: $fileName"
+        throw "File hash does not match BUILD_METADATA: $fileName"
     }
     return $actualHash
 }
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
+    $ManifestPath = Join-Path $repoRoot "src-tauri\Cargo.toml"
+}
+$ManifestPath = [System.IO.Path]::GetFullPath($ManifestPath)
+if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+    throw "Cargo manifest does not exist: $ManifestPath"
+}
+if ([string]::IsNullOrWhiteSpace($CargoExecutable)) {
+    $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    if (-not $cargoCommand) {
+        $cargoCommand = Get-Command cargo -ErrorAction Stop
+    }
+    $CargoExecutable = $cargoCommand.Source
+} elseif (-not (Test-Path -LiteralPath $CargoExecutable -PathType Leaf)) {
+    $cargoCommand = Get-Command $CargoExecutable -ErrorAction SilentlyContinue
+    if (-not $cargoCommand) {
+        throw "Cargo executable was not found: $CargoExecutable"
+    }
+    $CargoExecutable = $cargoCommand.Source
+}
+$productionTiff = Get-ProductionTiffCargoComponent `
+    -Manifest $ManifestPath `
+    -Cargo $CargoExecutable
 
 $BaseSbomPath = [System.IO.Path]::GetFullPath($BaseSbomPath)
 $ArtifactPath = [System.IO.Path]::GetFullPath($ArtifactPath)
@@ -75,11 +295,164 @@ try {
     }
     $metadata = Get-Content -LiteralPath $metadataFile[0].FullName -Raw | ConvertFrom-Json
     $payloadRoot = Split-Path -Parent $metadataFile[0].FullName
+    if ([int]$metadata.schemaVersion -ne 3) {
+        throw "Unsupported BUILD_METADATA schemaVersion: $($metadata.schemaVersion)"
+    }
+    if ([string]$metadata.codecIsolation.helperRole -cne "codec-helper" -or
+        [int]$metadata.codecIsolation.protocolVersion -ne 3 -or
+        (@($metadata.codecIsolation.isolatedFormats) -join ",") -cne "heif,tiff" -or
+        (@($metadata.codecIsolation.cargoFeatures) -join ",") -cne "heic,tiff" -or
+        [long]$metadata.codecIsolation.memoryLimitBytes -ne 805306368 -or
+        [int]$metadata.codecIsolation.decodeDeadlineMs -ne 30000) {
+        throw "BUILD_METADATA codecIsolation does not match the schema 3 release contract."
+    }
+    if ([string]$metadata.native.platformToolset -cne "v143") {
+        throw "BUILD_METADATA native platform toolset is not the pinned v143."
+    }
 
     $components = [System.Collections.ArrayList]::new()
     foreach ($component in @($bom.components)) {
         if ($null -ne $component) {
             [void]$components.Add($component)
+        }
+    }
+    $tiffCargoComponents = @(
+        $components | Where-Object {
+            [string]$_.name -ceq "tiff" -and
+            [string]$_.version -ceq [string]$productionTiff.version -and
+            [string]$_.purl -ceq [string]$productionTiff.purl
+        }
+    )
+    if ($tiffCargoComponents.Count -ne 1) {
+        throw "Base CycloneDX SBOM is missing or duplicates the required tiff Cargo component '$($productionTiff.purl)' from the production helper graph."
+    }
+
+    $applicationVersion = [string]$metadata.application.version
+    if (-not $applicationVersion) {
+        throw "BUILD_METADATA does not contain an application version."
+    }
+    $executablesByRole = @{}
+    foreach ($executable in @($metadata.executables)) {
+        $role = [string]$executable.role
+        if ($role -notin @("main", "codec-helper") -or $executablesByRole.ContainsKey($role)) {
+            throw "BUILD_METADATA contains an invalid or duplicate executable role: $role"
+        }
+        if ([int]$executable.protocolVersion -ne [int]$metadata.codecIsolation.protocolVersion) {
+            throw "BUILD_METADATA executable '$role' protocol version does not match codecIsolation."
+        }
+        $executablesByRole[$role] = $executable
+    }
+    foreach ($requiredRole in @("main", "codec-helper")) {
+        if (-not $executablesByRole.ContainsKey($requiredRole)) {
+            throw "BUILD_METADATA is missing executable role: $requiredRole"
+        }
+    }
+
+    $workspaceRefs = [System.Collections.Generic.List[string]]::new()
+    $workspaceComponents = @(
+        [ordered]@{
+            name = "imgviewer"
+            type = "application"
+            executableRole = "main"
+        },
+        [ordered]@{
+            name = "imgviewer-codec-core"
+            type = "library"
+            executableRole = $null
+        },
+        [ordered]@{
+            name = "imgviewer-codec-helper"
+            type = "application"
+            executableRole = "codec-helper"
+        },
+        [ordered]@{
+            name = "imgviewer-codec-protocol"
+            type = "library"
+            executableRole = $null
+        }
+    )
+    foreach ($workspaceComponent in $workspaceComponents) {
+        $name = [string]$workspaceComponent.name
+        # Keep the evidence component distinct from a cdxgen metadata root that
+        # may use the Cargo purl itself as its bom-ref.
+        $bomRef = "urn:imgviewer:workspace:${name}:${applicationVersion}"
+        $properties = [System.Collections.ArrayList]::new()
+        [void]$properties.Add(
+            [pscustomobject]@{ name = "imgviewer:workspace-crate"; value = "true" }
+        )
+        $hashes = @()
+        $role = [string]$workspaceComponent.executableRole
+        if ($role) {
+            $executable = $executablesByRole[$role]
+            $hash = Get-VerifiedPayloadHash -PayloadRoot $payloadRoot -Item $executable
+            $hashes = @([pscustomobject]@{ alg = "SHA-256"; content = $hash })
+            [void]$properties.Add(
+                [pscustomobject]@{
+                    name = "imgviewer:bundled-file"
+                    value = [string]$executable.fileName
+                }
+            )
+            [void]$properties.Add(
+                [pscustomobject]@{
+                    name = "imgviewer:executable-role"
+                    value = $role
+                }
+            )
+            [void]$properties.Add(
+                [pscustomobject]@{
+                    name = "imgviewer:codec-protocol-version"
+                    value = [string]$executable.protocolVersion
+                }
+            )
+            if ($role -ceq [string]$metadata.codecIsolation.helperRole) {
+                foreach ($property in @(
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-helper-role"
+                        value = [string]$metadata.codecIsolation.helperRole
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-protocol-version"
+                        value = [string]$metadata.codecIsolation.protocolVersion
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-isolated-formats"
+                        value = (@($metadata.codecIsolation.isolatedFormats) -join ",")
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-cargo-features"
+                        value = (@($metadata.codecIsolation.cargoFeatures) -join ",")
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-memory-limit-bytes"
+                        value = [string]$metadata.codecIsolation.memoryLimitBytes
+                    },
+                    [pscustomobject]@{
+                        name = "imgviewer:codec-isolation-decode-deadline-ms"
+                        value = [string]$metadata.codecIsolation.decodeDeadlineMs
+                    }
+                )) {
+                    [void]$properties.Add($property)
+                }
+            }
+        }
+        $componentData = [ordered]@{
+            type = [string]$workspaceComponent.type
+            name = $name
+            version = $applicationVersion
+            scope = "required"
+            'bom-ref' = $bomRef
+            purl = "pkg:cargo/${name}@${applicationVersion}"
+            properties = @($properties)
+        }
+        if ($hashes.Count -gt 0) {
+            $componentData["hashes"] = $hashes
+        }
+        $component = [pscustomobject]$componentData
+        $resolvedBomRef = Add-OrMergeWorkspaceComponent `
+            -Components $components `
+            -Component $component
+        if (-not $workspaceRefs.Contains($resolvedBomRef)) {
+            $workspaceRefs.Add($resolvedBomRef)
         }
     }
 
@@ -89,7 +462,7 @@ try {
         $version = [string]$codec.version
         $bomRef = "pkg:generic/${name}@${version}?arch=x86_64&platform=windows"
         $nativeRefs.Add($bomRef)
-        $codecHash = Get-VerifiedNativeHash -PayloadRoot $payloadRoot -Item $codec
+        $codecHash = Get-VerifiedPayloadHash -PayloadRoot $payloadRoot -Item $codec
         $component = [pscustomobject][ordered]@{
             type = "library"
             name = $name
@@ -100,6 +473,7 @@ try {
             hashes = @([pscustomobject]@{ alg = "SHA-256"; content = $codecHash })
             properties = @(
                 [pscustomobject]@{ name = "imgviewer:vcpkg-triplet"; value = [string]$codec.triplet },
+                [pscustomobject]@{ name = "imgviewer:msvc-platform-toolset"; value = [string]$metadata.native.platformToolset },
                 [pscustomobject]@{ name = "imgviewer:bundled-file"; value = [string]$codec.fileName },
                 [pscustomobject]@{ name = "imgviewer:vcpkg-port-row"; value = [string]$codec.installedRow }
             )
@@ -113,7 +487,7 @@ try {
         if (-not $version) {
             $version = "unknown"
         }
-        $hash = Get-VerifiedNativeHash -PayloadRoot $payloadRoot -Item $runtime
+        $hash = Get-VerifiedPayloadHash -PayloadRoot $payloadRoot -Item $runtime
         $bomRef = "pkg:generic/microsoft/${name}@${version}?arch=x86_64&platform=windows"
         $nativeRefs.Add($bomRef)
         $component = [pscustomobject][ordered]@{
@@ -126,6 +500,7 @@ try {
             hashes = @([pscustomobject]@{ alg = "SHA-256"; content = $hash })
             properties = @(
                 [pscustomobject]@{ name = "imgviewer:distribution"; value = "bundled-msvc-runtime" },
+                [pscustomobject]@{ name = "imgviewer:msvc-platform-toolset"; value = [string]$metadata.native.platformToolset },
                 [pscustomobject]@{ name = "imgviewer:architecture"; value = "x86_64" }
             )
         }
@@ -151,7 +526,10 @@ try {
             [void]$dependencies.Add($rootDependency)
         }
         $dependsOn = [System.Collections.Generic.List[string]]::new()
-        foreach ($reference in @($rootDependency.dependsOn) + @($nativeRefs)) {
+        foreach ($reference in @($rootDependency.dependsOn) + @($workspaceRefs) + @($nativeRefs)) {
+            if ($reference -ceq $rootRef) {
+                continue
+            }
             if ($reference -and -not $dependsOn.Contains([string]$reference)) {
                 $dependsOn.Add([string]$reference)
             }
@@ -173,12 +551,26 @@ try {
 
     $roundTrip = Get-Content -LiteralPath $OutputPath -Raw | ConvertFrom-Json
     $names = @($roundTrip.components | ForEach-Object { [string]$_.name })
-    foreach ($requiredName in @("libheif", "libde265")) {
+    foreach ($requiredName in @(
+        "imgviewer",
+        "imgviewer-codec-core",
+        "imgviewer-codec-helper",
+        "imgviewer-codec-protocol",
+        "tiff",
+        "libheif",
+        "libde265"
+    )) {
         if ($names -cnotcontains $requiredName) {
-            throw "Merged CycloneDX SBOM is missing native component: $requiredName"
+            throw "Merged CycloneDX SBOM is missing required component: $requiredName"
         }
     }
-    Write-Host "CycloneDX SBOM enriched with ImgViewer native runtime components: $OutputPath"
+    foreach ($runtime in @($metadata.native.msvcRuntime)) {
+        $runtimeName = [string]$runtime.fileName
+        if ($names -cnotcontains $runtimeName) {
+            throw "Merged CycloneDX SBOM is missing MSVC runtime component: $runtimeName"
+        }
+    }
+    Write-Host "CycloneDX SBOM enriched with ImgViewer workspace and native runtime components: $OutputPath"
     Write-Output $OutputPath
 } finally {
     if (Test-Path -LiteralPath $temporaryRoot) {

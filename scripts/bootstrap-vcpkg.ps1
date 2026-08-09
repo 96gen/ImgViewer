@@ -15,6 +15,29 @@ $VcpkgCommit = "d015e31e90838a4c9dfa3eed45979bc70d9357fc"
 $VcpkgToolReleaseTag = "2026-04-08"
 $VcpkgToolSha256 = "f1edbf3a39de350e2bb065214fdc057111aa87a2e2ed9a7dcb8ddc86e17751b9"
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            [System.IO.Path]::GetFullPath($Path),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            return [System.BitConverter]::ToString(
+                $hasher.ComputeHash($stream)
+            ).Replace("-", "")
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Destination)) {
     $Destination = Join-Path (Split-Path -Parent $PSScriptRoot) ".tools\vcpkg"
 }
@@ -82,7 +105,7 @@ function Assert-VcpkgToolHash {
         throw "The pinned vcpkg executable is missing: $Executable"
     }
 
-    $actualHash = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualHash = (Get-Sha256Hex -Path $Executable).ToLowerInvariant()
     if ($actualHash -ne $VcpkgToolSha256) {
         throw @"
 vcpkg.exe hash mismatch for vcpkg-tool $VcpkgToolReleaseTag.
