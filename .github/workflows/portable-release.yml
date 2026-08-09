@@ -303,10 +303,11 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       inputs.operation == 'promote-draft' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    name: Verify UI-tested draft with a read-only token
+    name: Verify UI-tested tag artifact with a read-only token
     runs-on: windows-2025
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: read
       attestations: read
     outputs:
@@ -338,7 +339,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download the unchanged draft release assets
+      - name: Download the immutable successful tag workflow artifact
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -346,32 +347,50 @@ jobs:
         run: |
           $version = $env:RELEASE_TAG.Substring(1)
           $artifactName = "ImgViewer-$version-windows-x64"
+          $expectedCommit = (git rev-parse "$env:RELEASE_TAG^{commit}").Trim().ToLowerInvariant()
           $expectedAssets = @(
             "$artifactName.zip",
             "$artifactName.zip.sha256",
             "$artifactName.build.json",
             "$artifactName.cdx.json"
           ) | Sort-Object
-          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft,tagName,assets | ConvertFrom-Json
-          if (-not [bool]$release.isDraft -or [string]$release.tagName -cne $env:RELEASE_TAG) {
-            throw "The requested release is missing or is no longer a draft."
+          $workflowRunsJson = gh run list `
+            --repo $env:GITHUB_REPOSITORY `
+            --workflow portable-release.yml `
+            --event push `
+            --limit 100 `
+            --json databaseId,headBranch,headSha,status,conclusion
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to list tag workflow runs with the read-only Actions token."
           }
-          $actualAssets = @($release.assets | ForEach-Object { [string]$_.name }) | Sort-Object
+          $workflowRunId = (
+            $workflowRunsJson |
+              powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+              -File ./scripts/select-portable-tag-workflow-run.ps1 `
+              -ReleaseTag $env:RELEASE_TAG `
+              -ExpectedCommit $expectedCommit
+          )
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to select the immutable successful tag workflow."
+          }
+          $workflowRunId = ([string]$workflowRunId).Trim()
+          New-Item -ItemType Directory -Path ./release-assets -Force | Out-Null
+          gh run download $workflowRunId `
+            --repo $env:GITHUB_REPOSITORY `
+            --name ImgViewer-windows-x64 `
+            --dir ./release-assets
+          if ($LASTEXITCODE -ne 0) {
+            throw "Immutable tag workflow artifact download failed."
+          }
+          $actualAssets = @(
+            Get-ChildItem -LiteralPath ./release-assets -File |
+              ForEach-Object { [string]$_.Name }
+          ) | Sort-Object
           $assetDifference = @(Compare-Object -ReferenceObject $expectedAssets -DifferenceObject $actualAssets)
           if ($assetDifference.Count -gt 0) {
-            throw "Draft Release contains a missing or unexpected asset:`n$($assetDifference | Out-String)"
+            throw "Tag workflow artifact contains a missing or unexpected asset:`n$($assetDifference | Out-String)"
           }
-          New-Item -ItemType Directory -Path ./release-assets -Force | Out-Null
-          gh release download $env:RELEASE_TAG `
-            --repo $env:GITHUB_REPOSITORY `
-            --dir ./release-assets `
-            --pattern "$artifactName.zip" `
-            --pattern "$artifactName.zip.sha256" `
-            --pattern "$artifactName.build.json" `
-            --pattern "$artifactName.cdx.json"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Draft release asset download failed."
-          }
+          Write-Host "PASS promotion-source run=$workflowRunId tag=$env:RELEASE_TAG commit=$expectedCommit assets=4 token=read-only"
 
       - name: Verify exact UI-tested assets without write permission
         id: verify
@@ -383,7 +402,7 @@ jobs:
         run: |
           $zip = @(Get-ChildItem -LiteralPath ./release-assets -File -Filter "ImgViewer-*-windows-x64.zip")
           if ($zip.Count -ne 1) {
-            throw "Expected exactly one portable ZIP in the draft release."
+            throw "Expected exactly one portable ZIP in the immutable tag workflow artifact."
           }
           $version = $env:RELEASE_TAG.Substring(1)
           $artifactName = "ImgViewer-$version-windows-x64"
@@ -517,7 +536,7 @@ jobs:
           $actualAssetNames = @($release.assets | ForEach-Object { [string]$_.name }) | Sort-Object
           $assetDifference = @(Compare-Object -ReferenceObject $expectedAssetNames -DifferenceObject $actualAssetNames)
           if ($assetDifference.Count -gt 0) {
-            throw "Draft asset set changed after read-only verification:`n$($assetDifference | Out-String)"
+            throw "Draft asset set does not match the read-only verified tag artifact:`n$($assetDifference | Out-String)"
           }
           $assetDirectory = Join-Path $env:RUNNER_TEMP "publish-assets"
           New-Item -ItemType Directory -Path $assetDirectory -Force | Out-Null
@@ -539,7 +558,7 @@ jobs:
           }
           $downloaded = @(Get-ChildItem -LiteralPath $assetDirectory -File)
           if ($downloaded.Count -ne $expected.Count) {
-            throw "Draft asset set changed after read-only verification."
+            throw "Draft asset set does not match the read-only verified tag artifact."
           }
           foreach ($entry in $expected.GetEnumerator()) {
             if ($entry.Value -notmatch '^[0-9a-f]{64}$') {
@@ -551,7 +570,7 @@ jobs:
             }
             $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($actual -cne $entry.Value) {
-              throw "Draft asset changed after verification: $($entry.Key)"
+              throw "Draft asset does not match the verified tag artifact: $($entry.Key)"
             }
           }
           gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false --latest

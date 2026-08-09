@@ -83,13 +83,16 @@ metadata、禁止的 codec、必要檔案與完整 DLL closure。Portable stage 
 
 7. 在 workflow dispatch 選擇 `promote-draft`，輸入 tag 與剛通過 UI smoke 的
    64 字元 ZIP SHA-256。
-8. Promotion job 會從 draft Release 重新下載資產，驗證 digest、來源 commit、
-   metadata、attestation、錯誤來源 digest 負向案例及 DLL closure；全部通過才將
-   既有 draft 公開。驗證 job 只有 `contents: read` 與 `attestations: read`，
-   並執行 default branch 的 verifier；另一個 publish job 才有 `contents: write`，
-   不 checkout 或執行任何 repository script。兩個 job 都要求 Release 的完整資產
-   清單恰好是 ZIP、checksum、build metadata、SBOM 四個檔案，且 publish job 會
-   重查四個 digest 後才執行 `gh release edit`。
+8. Promotion 的唯讀 job 以 `actions: read` 從唯一成功的 tag workflow 下載 immutable
+   artifact，驗證 digest、來源 commit、metadata、attestation、錯誤來源 digest
+   負向案例及 DLL closure；它另只有 `contents: read` 與 `attestations: read`，並執行
+   default branch 的 verifier。另一個 publish job 才有 `contents: write`，且不
+   checkout 或執行任何 repository script；它從 draft Release 下載完整四檔資產，
+   逐一比對唯讀 job 輸出的 digest 後才執行 `gh release edit`。兩個 job 都要求資產
+   清單恰好是 ZIP、checksum、build metadata、SBOM 四個檔案。
+
+Tag workflow artifact 的保留期固定為 30 天；promotion 必須在到期前完成。若已到期，
+不可重跑或替換同一 tag 的資產，應修正流程並提升版本建立新 tag。
 
 如果 UI gate 失敗，禁止替換同版本資產。修正程式、提升版本並建立新 tag。
 
