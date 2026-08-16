@@ -30,10 +30,10 @@ tauri-build = { version = "=2.6.3", features = [] }
 [dependencies]
 imgviewer-codec-core = { version = "=0.4.0", path = "crates/codec-core" }
 imgviewer-codec-protocol = { version = "=0.4.0", path = "crates/codec-protocol" }
-parking_lot = "=0.12.4"
-rand = "=0.9.3"
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.150"
+parking_lot = "=0.12.5"
+rand = "=0.10.2"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.1"
 tauri-plugin-single-instance = "=2.4.3"
@@ -57,4 +57,4 @@ windows-sys = { version = "=0.61.2", features = [
 
 [dev-dependencies]
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
-tempfile = "=3.20.0"
+tempfile = "=3.27.0"
