@@ -16,6 +16,6 @@ These deliberately tiny files cover format dispatch without adding a large binar
 | `single.heif` | `.heif` extension and HEIF magic |
 | `oversize-width.png` | valid PNG signature/IHDR declaring width 32,769; must reject before allocation |
 | `corrupt.jpg` | truncated JPEG |
-| `disguised.jpg` | PNG bytes with a JPG extension; must reject as format disguise |
+| `disguised.jpg` | PNG bytes with a JPG extension; must decode from content as PNG |
 
 The 256 MiB file-size limit is tested with a temporary sparse file and is intentionally not committed. Deletion/handle-release cases copy a fixture into a temporary directory and delete it during the test.

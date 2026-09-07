@@ -20,6 +20,6 @@
   },
   "invalid": {
     "corrupt.jpg": "corrupt_image",
-    "disguised.jpg": "format_mismatch"
+    "disguised.jpg": "content_detected_as_png"
   }
 }
