@@ -12,6 +12,12 @@
   原始碼的 publish job 仍會逐檔比對 draft digest 後才公開；已處理的負向 attestation
   exit code 會明確清零，避免 PASS 案例誤判整個 step 失敗。
 
+## [0.4.1] - 2026-09-07
+
+### Fixed
+
+- 解碼改以內容 magic 判斷支援格式；副檔名與實際格式不一致時，仍會依內容顯示圖片。
+
 ## [0.4.0] - 2026-08-09
 
 ### Added

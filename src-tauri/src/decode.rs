@@ -21,7 +21,8 @@ impl ProductionDecoder {
         path: &Path,
         file: File,
     ) -> Result<imgviewer_codec_core::DecodedRender, ViewerError> {
-        match helper_format(path) {
+        let detected = imgviewer_codec_core::detect_format(&file)?;
+        match helper_format(detected) {
             Some(format) => self.helper.decode(format, file),
             None => self.local.decode(path, file),
         }
@@ -36,10 +37,10 @@ impl ProductionDecoder {
     }
 }
 
-fn helper_format(path: &Path) -> Option<CodecFormat> {
-    match SupportedFormat::from_path(path) {
-        Some(SupportedFormat::Heif) => Some(CodecFormat::Heif),
-        Some(SupportedFormat::Tiff) => Some(CodecFormat::Tiff),
+fn helper_format(format: SupportedFormat) -> Option<CodecFormat> {
+    match format {
+        SupportedFormat::Heif => Some(CodecFormat::Heif),
+        SupportedFormat::Tiff => Some(CodecFormat::Tiff),
         _ => None,
     }
 }
@@ -102,21 +103,21 @@ mod tests {
     #[test]
     fn heif_and_tiff_are_routed_to_the_codec_helper() {
         assert_eq!(
-            helper_format(Path::new("image.heic")),
+            helper_format(SupportedFormat::Heif),
             Some(CodecFormat::Heif)
         );
         assert_eq!(
-            helper_format(Path::new("image.HEIF")),
+            helper_format(SupportedFormat::Heif),
             Some(CodecFormat::Heif)
         );
         assert_eq!(
-            helper_format(Path::new("image.tif")),
+            helper_format(SupportedFormat::Tiff),
             Some(CodecFormat::Tiff)
         );
         assert_eq!(
-            helper_format(Path::new("image.TIFF")),
+            helper_format(SupportedFormat::Tiff),
             Some(CodecFormat::Tiff)
         );
-        assert_eq!(helper_format(Path::new("image.png")), None);
+        assert_eq!(helper_format(SupportedFormat::Png), None);
     }
 }

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Write};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -40,27 +40,19 @@ fn decode_file(path: &Path) -> Result<DecodedRender, ViewerError> {
     decode_open_file(path, file)
 }
 
-fn decode_open_file(path: &Path, file: File) -> Result<DecodedRender, ViewerError> {
-    let expected = SupportedFormat::from_path(path)
-        .ok_or_else(|| ViewerError::new("unsupported_extension", "不支援這個檔案的副檔名。"))?;
+fn decode_open_file(_path: &Path, file: File) -> Result<DecodedRender, ViewerError> {
     // The caller pins one read-only handle when the selection is scheduled.
     // Metadata and the bounded read use that exact handle; magic checks,
     // probes, color handling, and codec calls then operate only on the owned
-    // byte snapshot. `path` is used only for extension policy and display
-    // identity, never reopened here.
+    // byte snapshot. The content magic is authoritative; callers may use a
+    // non-standard or misleading extension without changing the decoder.
     let bytes = read_limited(file)?;
     let detected = sniff_format(&bytes).ok_or_else(|| {
         ViewerError::new(
             "format_mismatch",
-            "檔案內容與支援的格式不符，可能已損毀或被偽裝。",
+            "檔案內容不是支援的圖片格式，可能已損毀或被偽裝。",
         )
     })?;
-    if detected != expected {
-        return Err(ViewerError::new(
-            "format_mismatch",
-            "檔案內容與副檔名不一致。",
-        ));
-    }
 
     match detected {
         SupportedFormat::Jpeg => preserve_raster(bytes, ImageFormat::Jpeg, "image/jpeg", false),
@@ -76,6 +68,36 @@ fn decode_open_file(path: &Path, file: File) -> Result<DecodedRender, ViewerErro
         SupportedFormat::Tiff => decode_tiff(bytes),
         SupportedFormat::Heif => decode_heif(bytes),
     }
+}
+
+/// Detect a supported format from an already-open file without consuming the
+/// caller's handle. The original handle is then passed to the decoder/helper,
+/// so dispatch stays anchored to the same file object instead of reopening a
+/// path.
+pub fn detect_format(file: &File) -> Result<SupportedFormat, ViewerError> {
+    // Windows duplicated file handles share the current file pointer. Reset
+    // the probe clone and restore the shared pointer afterwards so the actual
+    // decoder still reads from byte zero.
+    let mut probe = file
+        .try_clone()
+        .map_err(|error| ViewerError::io(format!("無法複製圖片讀取 handle：{error}")))?;
+    probe
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| ViewerError::io(format!("無法定位圖片讀取 handle：{error}")))?;
+    let read_result = read_limited(probe);
+    let mut reset = file
+        .try_clone()
+        .map_err(|error| ViewerError::io(format!("無法重設圖片讀取 handle：{error}")))?;
+    reset
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| ViewerError::io(format!("無法重設圖片讀取位置：{error}")))?;
+    let bytes = read_result?;
+    sniff_format(&bytes).ok_or_else(|| {
+        ViewerError::new(
+            "format_mismatch",
+            "檔案內容不是支援的圖片格式，可能已損毀或被偽裝。",
+        )
+    })
 }
 
 /// Decodes a HEIC/HEIF image from an already-open, owned file handle.
@@ -2052,12 +2074,25 @@ mod tests {
     }
 
     #[test]
-    fn disguised_extension_is_rejected() {
+    fn detect_format_uses_content_and_preserves_file_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("content-is-png.jpg");
+        fs::write(&path, png_bytes([7, 8, 9, 255])).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(detect_format(&file).unwrap(), SupportedFormat::Png);
+        let mut signature = [0_u8; 8];
+        file.read_exact(&mut signature).unwrap();
+        assert_eq!(&signature, b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn disguised_extension_is_decoded_from_content() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fake.jpg");
         fs::write(&path, png_bytes([1, 2, 3, 255])).unwrap();
-        let error = decode_file(&path).unwrap_err();
-        assert_eq!(error.code, "format_mismatch");
+        let decoded = decode_file(&path).unwrap();
+        assert_eq!(decoded.mime_type, "image/png");
+        assert_eq!((decoded.width, decoded.height), (1, 1));
     }
 
     #[test]
@@ -2557,8 +2592,8 @@ mod tests {
             "corrupt_image"
         );
         assert_eq!(
-            decode_file(&fixture("disguised.jpg")).unwrap_err().code,
-            "format_mismatch"
+            decode_file(&fixture("disguised.jpg")).unwrap().mime_type,
+            "image/png"
         );
         assert_eq!(
             decode_file(&fixture("oversize-width.png"))
